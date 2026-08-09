@@ -90,6 +90,26 @@ Redis仍然不是权威写入端。PostgreSQL提交成功而Redis刷新失败时
 
 运维恢复也可以直接调用`TieredSnapshotStore::repair_cache(record)`：有权威记录就按Revision覆盖缓存，没有权威记录就删除对应缓存键。这个方法不产生新Revision、不执行游戏业务操作，适合启动修复、定时扫描和故障恢复队列。
 
+## 普通快照积压与优雅停机
+
+普通快照可以进入`SnapshotFlushQueue`。队列按`RecordKey`合并，同一玩家或同一业务记录在短时间内多次变更时只保留最后一份Payload；`SnapshotWrite.expected_revision`必须为空，因为被合并的旧请求不能再作为CAS顺序提交。货币、背包、交易和奖励等关键操作必须直接使用`AsyncTransactionalStore`，不能为了排队而丢掉`operation_id`或业务结果。
+
+排空分两层：
+
+```text
+SnapshotFlushQueue::flush(store, max_items)
+    -> 本轮最多写 max_items 条
+    -> 成功计入 Applied/Duplicate
+    -> 失败请求放回队首，返回 error + remaining
+
+SnapshotFlushQueue::flush_until_empty(store, per_round, max_rounds)
+    -> 停机窗口内重复执行有限轮
+    -> remaining == 0 才表示本次队列已排空
+    -> remaining > 0 必须记录告警并保留恢复信息
+```
+
+这套队列只在当前DBProxy进程内存中存在。它能覆盖“PostgreSQL短暂不可用、进程仍然存活、恢复后重试”的情况，但不能覆盖“DBProxy自己已经重启”的情况；后者需要Redis-backed durable backlog、队列版本和接管协议，不能把内存队列包装成可靠消息队列。
+
 当前表为`dbproxy_snapshots`、`dbproxy_idempotency`和`dbproxy_transactions`，迁移脚本位于`crates/dbproxy-storage/migrations/001_snapshot.sql`与`002_transactional.sql`。启动迁移使用PostgreSQL事务级advisory lock，多个DBProxy进程可以并发启动而不会竞争DDL。这是独立适配器契约，不等于TiangZ已经完成网络化DBProxy接入。
 
 本机依赖使用`deploy/local/docker-compose.yml`，固定为PostgreSQL 18.4 Bookworm和Redis 8.8.1 Trixie，数据使用Docker命名卷保存。
@@ -109,7 +129,8 @@ Redis仍然不是权威写入端。PostgreSQL提交成功而Redis刷新失败时
 - [x] 本地Docker Compose和外部依赖集成测试
 - [x] 单记录关键事务：operation_id、Revision/CAS、原始结果和Redis修复
 - [x] Redis读取故障回源、PostgreSQL写入故障拒绝成功、缓存修复和原操作ID重试
-- [ ] 积压恢复、下线Flush和长时间故障后的恢复矩阵
+- [x] 进程内普通快照积压合并、有界Flush和PostgreSQL恢复后重试
+- [ ] Redis-backed durable backlog、DBProxy重启后的积压恢复和长时间故障矩阵
 - [ ] 其他数据库Adapter；先不同时实现MongoDB、MySQL和PostgreSQL多套方言
 
 ### Phase 3：DBProxy 服务

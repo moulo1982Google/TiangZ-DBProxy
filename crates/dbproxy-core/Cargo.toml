@@ -1,6 +1,6 @@
 [package]
 name = "tiangz-dbproxy-core"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -11,3 +11,6 @@ description = "通用快照持久化、Revision 与幂等写入契约"
 async-trait.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

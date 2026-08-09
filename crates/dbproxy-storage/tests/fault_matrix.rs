@@ -2,8 +2,8 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tiangz_dbproxy_core::{
-    AsyncSnapshotStore, AsyncTransactionalStore, RecordKey, Revision, TransactionalWrite,
-    TransactionalWriteOutcome,
+    AsyncSnapshotStore, AsyncTransactionalStore, RecordKey, Revision, SnapshotFlushQueue,
+    SnapshotWrite, TransactionalWrite, TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_storage::{StorageError, TieredSnapshotStore};
 
@@ -108,6 +108,18 @@ fn transaction(
         expected_revision,
         payload: payload.to_vec(),
         result: result.to_vec(),
+        updated_at_unix_ms: 1,
+    }
+}
+
+fn snapshot(request_id: &str, record: RecordKey, payload: &[u8]) -> SnapshotWrite {
+    SnapshotWrite {
+        request_id: request_id.to_string(),
+        record,
+        schema: "fault-matrix.player.snapshot".to_string(),
+        schema_version: 1,
+        payload: payload.to_vec(),
+        expected_revision: None,
         updated_at_unix_ms: 1,
     }
 }
@@ -227,5 +239,48 @@ async fn postgres_outage_never_reports_a_successful_write() {
     assert_eq!(
         recovered.load(&key).await.unwrap().unwrap().revision,
         Revision(1)
+    );
+}
+
+#[tokio::test]
+#[ignore = "会停止并恢复本机 PostgreSQL；设置 DBPROXY_RUN_DOCKER_FAULTS=1 后显式运行"]
+async fn snapshot_queue_retries_after_postgres_recovers() {
+    if !require_opt_in() {
+        return;
+    }
+    let (postgres_url, redis_url) = env_urls();
+    let mut store = TieredSnapshotStore::connect(&postgres_url, &redis_url)
+        .await
+        .expect("PostgreSQL and Redis must be available");
+    let key = RecordKey::new("fault-matrix", test_suffix()).unwrap();
+    let mut queue = SnapshotFlushQueue::new();
+    queue
+        .enqueue(snapshot(
+            &format!("snapshot-{}", test_suffix()),
+            key.clone(),
+            b"queued-v1",
+        ))
+        .unwrap();
+
+    let mut postgres = RestartGuard::stop(POSTGRES_CONTAINER);
+    let error = tokio::time::timeout(Duration::from_secs(5), queue.flush(&mut store, 1))
+        .await
+        .expect("snapshot flush must not hang while PostgreSQL is down")
+        .unwrap_err();
+    assert_eq!(error.report.attempted, 1);
+    assert_eq!(error.report.remaining, 1);
+    assert_eq!(queue.len(), 1);
+
+    postgres.restart();
+    let mut recovered = TieredSnapshotStore::connect(&postgres_url, &redis_url)
+        .await
+        .unwrap();
+    let report = queue.flush(&mut recovered, 1).await.unwrap();
+    assert_eq!(report.applied, 1);
+    assert_eq!(report.remaining, 0);
+    assert!(queue.is_empty());
+    assert_eq!(
+        recovered.load(&key).await.unwrap().unwrap().payload,
+        b"queued-v1"
     );
 }

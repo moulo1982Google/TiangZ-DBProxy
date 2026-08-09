@@ -9,8 +9,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod flush;
 mod transaction;
 
+pub use flush::{SnapshotFlushError, SnapshotFlushQueue, SnapshotFlushReport};
 pub use transaction::{
     AsyncTransactionalStore, InMemoryTransactionalStore, TransactionStore, TransactionalWrite,
     TransactionalWriteOutcome,
@@ -100,6 +102,8 @@ pub enum StoreError {
     IdempotencyConflict { request_id: String },
     #[error("transaction operation {operation_id} was already used for another request")]
     OperationIdConflict { operation_id: String },
+    #[error("queued snapshot {record:?} must not carry an expected revision")]
+    QueuedSnapshotRequiresUnconditionalWrite { record: RecordKey },
     #[error("revision conflict for {record:?}: expected {expected:?}, actual {actual:?}")]
     RevisionConflict {
         record: RecordKey,
