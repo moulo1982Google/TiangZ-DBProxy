@@ -1,3 +1,17 @@
+[package]
+name = "TiangZ-DBProxy"
+version = "0.1.2"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["郑昕"]
+repository = "https://github.com/moulo1982Google/TiangZ-DBProxy"
+description = "TiangZ 独立持久化服务的公共门面包"
+publish = false
+
+[lib]
+name = "tiangz_dbproxy"
+path = "src/lib.rs"
+
 [workspace]
 resolver = "2"
 members = ["crates/dbproxy-core", "crates/dbproxy-storage"]
@@ -10,10 +24,14 @@ repository = "https://github.com/moulo1982Google/TiangZ-DBProxy"
 
 [workspace.dependencies]
 async-trait = "0.1"
-bincode = "1.3"
-redis = { version = "0.32", features = ["tokio-comp"] }
+bincode = { version = "2.0.1", features = ["serde"] }
+redis = { version = "1.5.0", features = ["tokio-comp"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tokio-postgres = "0.7"
 tracing = "0.1"
+
+[dependencies]
+tiangz-dbproxy-core = { path = "crates/dbproxy-core" }
+tiangz-dbproxy-storage = { path = "crates/dbproxy-storage" }

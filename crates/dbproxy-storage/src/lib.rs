@@ -320,7 +320,9 @@ impl RedisSnapshotCache {
             .await?;
         value
             .map(|bytes| {
-                bincode::deserialize(&bytes).map_err(|error| StorageError::Codec(error.to_string()))
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                    .map(|(snapshot, _)| snapshot)
+                    .map_err(|error| StorageError::Codec(error.to_string()))
             })
             .transpose()
     }
@@ -328,8 +330,8 @@ impl RedisSnapshotCache {
     /// 写入缓存；调用方必须在权威存储成功后调用。
     /// Write the cache; callers must invoke this only after the authoritative store succeeds.
     pub async fn put(&self, snapshot: &SnapshotEnvelope) -> Result<(), StorageError> {
-        let bytes =
-            bincode::serialize(snapshot).map_err(|error| StorageError::Codec(error.to_string()))?;
+        let bytes = bincode::serde::encode_to_vec(snapshot, bincode::config::standard())
+            .map_err(|error| StorageError::Codec(error.to_string()))?;
         let mut connection = self.connection.lock().await;
         let _: () = redis::cmd("SET")
             .arg(Self::cache_key(&snapshot.record))
