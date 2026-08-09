@@ -108,7 +108,28 @@ SnapshotFlushQueue::flush_until_empty(store, per_round, max_rounds)
     -> remaining > 0 必须记录告警并保留恢复信息
 ```
 
-这套队列只在当前DBProxy进程内存中存在。它能覆盖“PostgreSQL短暂不可用、进程仍然存活、恢复后重试”的情况，但不能覆盖“DBProxy自己已经重启”的情况；后者需要Redis-backed durable backlog、队列版本和接管协议，不能把内存队列包装成可靠消息队列。
+`SnapshotFlushQueue`只在当前DBProxy进程内存中存在。它能覆盖“PostgreSQL短暂不可用、进程仍然存活、恢复后重试”的情况，但不能覆盖“DBProxy自己已经重启”的情况。
+
+### Redis AOF 持久积压
+
+`RedisSnapshotBacklog`是独立于快照缓存的持久队列。入队使用一个Redis脚本同时写入Payload和pending索引；消费者领取时把记录移动到processing并设置lease。成功写入PostgreSQL后才调用ACK：
+
+```text
+RedisSnapshotBacklog::enqueue(snapshot)
+    -> Redis SET entry + ZADD pending
+
+claim(lease)
+    -> 回收过期 processing
+    -> 原子领取一条记录并设置 lease
+
+PostgreSQL SnapshotWrite(request_id)
+    -> 成功或 Duplicate
+    -> ack(lease)
+```
+
+ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧processing并把新记录留在pending，不会删除新Payload。消费者进程崩溃后，lease过期会自动回收；数据库写入失败时可以主动release，或者等待lease过期。数据库提交成功但ACK前崩溃时，重试仍复用原`request_id`，由PostgreSQL幂等记录返回Duplicate。
+
+这个backlog依赖Redis AOF和持久数据卷，Redis本身不是PostgreSQL的权威业务库。Redis数据卷损坏、AOF未持久化、单Redis节点故障和跨机复制仍不在本版本保证范围；后续网络服务阶段再增加backlog指标、死信处理、Redis高可用和多消费者容量控制。
 
 当前表为`dbproxy_snapshots`、`dbproxy_idempotency`和`dbproxy_transactions`，迁移脚本位于`crates/dbproxy-storage/migrations/001_snapshot.sql`与`002_transactional.sql`。启动迁移使用PostgreSQL事务级advisory lock，多个DBProxy进程可以并发启动而不会竞争DDL。这是独立适配器契约，不等于TiangZ已经完成网络化DBProxy接入。
 
@@ -130,7 +151,8 @@ SnapshotFlushQueue::flush_until_empty(store, per_round, max_rounds)
 - [x] 单记录关键事务：operation_id、Revision/CAS、原始结果和Redis修复
 - [x] Redis读取故障回源、PostgreSQL写入故障拒绝成功、缓存修复和原操作ID重试
 - [x] 进程内普通快照积压合并、有界Flush和PostgreSQL恢复后重试
-- [ ] Redis-backed durable backlog、DBProxy重启后的积压恢复和长时间故障矩阵
+- [x] Redis AOF 持久积压、lease/ACK、DBProxy重启后的重新领取和新快照替代旧快照
+- [ ] 长时间故障、死信/积压指标、Redis高可用和多消费者容量控制
 - [ ] 其他数据库Adapter；先不同时实现MongoDB、MySQL和PostgreSQL多套方言
 
 ### Phase 3：DBProxy 服务

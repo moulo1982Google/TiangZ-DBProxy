@@ -2,6 +2,8 @@
 
 这套 Compose 只启动本机开发使用的 PostgreSQL 和 Redis，不包含线上部署配置。
 
+Redis 使用 AOF 和 Docker 命名卷保存普通快照 backlog。AOF 只保证本机部署下的恢复边界，不等于 Redis 集群或跨机高可用。
+
 用户名：`tiangz`
 
 密码：`tiangz_dev`

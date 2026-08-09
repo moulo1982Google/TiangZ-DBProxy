@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "TiangZ-DBProxy"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "tiangz-dbproxy-core",
  "tiangz-dbproxy-storage",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "tiangz-dbproxy-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "serde",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "tiangz-dbproxy-storage"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "bincode",

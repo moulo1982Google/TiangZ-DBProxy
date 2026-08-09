@@ -67,7 +67,7 @@ pub struct SnapshotEnvelope {
 
 /// 一次快照写入请求。
 /// One snapshot write request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotWrite {
     /// 调用方生成并在重试时保持不变的幂等请求号。
     /// Caller-generated idempotency key; retries must reuse the same value.

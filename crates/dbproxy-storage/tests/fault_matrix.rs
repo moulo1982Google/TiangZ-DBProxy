@@ -5,7 +5,9 @@ use tiangz_dbproxy_core::{
     AsyncSnapshotStore, AsyncTransactionalStore, RecordKey, Revision, SnapshotFlushQueue,
     SnapshotWrite, TransactionalWrite, TransactionalWriteOutcome,
 };
-use tiangz_dbproxy_storage::{StorageError, TieredSnapshotStore};
+use tiangz_dbproxy_storage::{
+    RedisSnapshotBacklog, SnapshotBacklogAck, StorageError, TieredSnapshotStore,
+};
 
 const POSTGRES_CONTAINER: &str = "tiangz-dbproxy-postgres";
 const REDIS_CONTAINER: &str = "tiangz-dbproxy-redis";
@@ -283,4 +285,94 @@ async fn snapshot_queue_retries_after_postgres_recovers() {
         recovered.load(&key).await.unwrap().unwrap().payload,
         b"queued-v1"
     );
+}
+
+#[tokio::test]
+#[ignore = "会停止并恢复本机 Redis；设置 DBPROXY_RUN_DOCKER_FAULTS=1 后显式运行"]
+async fn durable_snapshot_backlog_survives_redis_restart() {
+    if !require_opt_in() {
+        return;
+    }
+    let (postgres_url, redis_url) = env_urls();
+    let key = RecordKey::new("fault-matrix", test_suffix()).unwrap();
+    let backlog = RedisSnapshotBacklog::connect(&redis_url)
+        .await
+        .expect("Redis must be available");
+    backlog
+        .enqueue(snapshot(
+            &format!("durable-{}", test_suffix()),
+            key.clone(),
+            b"durable-v1",
+        ))
+        .await
+        .unwrap();
+    drop(backlog);
+
+    let mut redis = RestartGuard::stop(REDIS_CONTAINER);
+    redis.restart();
+
+    let backlog = RedisSnapshotBacklog::connect(&redis_url).await.unwrap();
+    let lease = backlog
+        .claim(5_000)
+        .await
+        .unwrap()
+        .expect("AOF-backed backlog must survive Redis restart");
+    assert_eq!(lease.request.record, key);
+    assert_eq!(lease.request.payload, b"durable-v1");
+
+    let mut store = TieredSnapshotStore::connect(&postgres_url, &redis_url)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.save(lease.request.clone()).await.unwrap(),
+        tiangz_dbproxy_core::SnapshotWriteOutcome::Applied {
+            revision: Revision(1)
+        }
+    ));
+    assert_eq!(
+        backlog.ack(&lease).await.unwrap(),
+        SnapshotBacklogAck::Removed
+    );
+    assert!(backlog.claim(5_000).await.unwrap().is_none());
+}
+
+#[tokio::test]
+#[ignore = "需要本机 Redis；设置 DBPROXY_RUN_DOCKER_FAULTS=1 后显式运行"]
+async fn newer_snapshot_replaces_an_inflight_backlog_item() {
+    if !require_opt_in() {
+        return;
+    }
+    let (_, redis_url) = env_urls();
+    let key = RecordKey::new("fault-matrix", test_suffix()).unwrap();
+    let backlog = RedisSnapshotBacklog::connect(&redis_url).await.unwrap();
+    backlog
+        .enqueue(snapshot(
+            &format!("old-{}", test_suffix()),
+            key.clone(),
+            b"old",
+        ))
+        .await
+        .unwrap();
+    let old = backlog.claim(5_000).await.unwrap().unwrap();
+
+    backlog
+        .enqueue(snapshot(&format!("new-{}", test_suffix()), key, b"new"))
+        .await
+        .unwrap();
+    assert_eq!(
+        backlog.ack(&old).await.unwrap(),
+        SnapshotBacklogAck::Superseded
+    );
+
+    let new = backlog.claim(5_000).await.unwrap().unwrap();
+    assert_eq!(new.request.payload, b"new");
+    assert!(backlog.renew(&new, 5_000).await.unwrap());
+    assert!(backlog.release(&new).await.unwrap());
+    let retried = backlog.claim(5_000).await.unwrap().unwrap();
+    assert_eq!(retried.request.payload, b"new");
+    assert_eq!(
+        backlog.ack(&retried).await.unwrap(),
+        SnapshotBacklogAck::Removed
+    );
+    assert!(backlog.claim(5_000).await.unwrap().is_none());
 }

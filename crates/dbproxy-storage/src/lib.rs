@@ -15,6 +15,10 @@ use tiangz_dbproxy_core::{
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, Row};
 
+mod backlog;
+
+pub use backlog::{RedisSnapshotBacklog, SnapshotBacklogAck, SnapshotBacklogLease};
+
 const SNAPSHOT_MIGRATION: &str = include_str!("../migrations/001_snapshot.sql");
 const TRANSACTION_MIGRATION: &str = include_str!("../migrations/002_transactional.sql");
 const MIGRATION_LOCK_ID: i64 = 8_390_417_203;
@@ -45,6 +49,16 @@ pub enum StorageError {
     MissingAfterWrite { record: RecordKey },
     #[error("redis cache update failed after PostgreSQL commit: {0}")]
     CacheSync(String),
+    #[error("backlog clock error: {0}")]
+    BacklogClock(String),
+    #[error("backlog timestamp is too large")]
+    BacklogTimestampTooLarge,
+    #[error("backlog lease must be greater than zero")]
+    InvalidBacklogLease,
+    #[error("backlog lease duration is too large: {lease_ms}ms")]
+    BacklogLeaseTooLarge { lease_ms: u64 },
+    #[error("backlog protocol error: {0}")]
+    BacklogProtocol(String),
 }
 
 fn validate_request(request: &SnapshotWrite) -> Result<(), StorageError> {
