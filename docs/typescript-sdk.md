@@ -25,6 +25,8 @@ Transport负责：
 - 把服务端错误转换为`DbProxyRemoteError`；
 - 原样返回DBProxy确认的Revision和事务结果。
 
+TiangZ主仓库的`HostDbProxyTransport`是首个真实宿主实现：TCP连接池和网络I/O由Rust Host Runtime驱动，业务V8只等待Promise，不直接打开Socket，也不导入`dbproxy-storage`。玩家Payload编码、恢复顺序与Repository重试策略仍由TiangZ拥有。
+
 ## 重试约束
 
 SDK不会自动生成或替换`requestId`、`operationId`。超时表示请求结果未知，重试必须复用原ID和完全相同的Payload。Transport可以重连后重放同一个请求，但不能创建新幂等ID。

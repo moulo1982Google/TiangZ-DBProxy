@@ -94,9 +94,10 @@ expected_revision
 
 ## 当前未完成
 
-- TypeScript SDK和TiangZ Repository适配
 - 批量Load/Save，减少大量登录恢复时的RPC开销
 - Prometheus延迟、错误码、连接、存储分片和backlog指标
 - 客户端自动重连、健康检查和连接池熔断
 - 生产TLS/mTLS、令牌轮换、租户隔离和限流
 - 生产Docker镜像、滚动升级和协议双版本窗口
+
+运行时无关TypeScript SDK和TiangZ首个Player Snapshot Repository已经完成。后者位于TiangZ主仓库，只通过本协议与SDK接入，不让DBProxy反向依赖游戏领域代码；关键经济事务尚未接入。

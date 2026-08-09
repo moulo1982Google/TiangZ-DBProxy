@@ -168,11 +168,11 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 
 ### Phase 4：TiangZ 集成
 
-- 玩家快照 Repository
-- Item/Quest/Buff 持久化策略
-- 登录恢复
-- 正常下线保存
-- 进程崩溃后的恢复验收
+- [x] 首个玩家快照 Repository与Rust Host Transport
+- [x] Numeric、Item、Buff、Skill冷却和Quest快照策略
+- [x] 登录恢复、正常下线保存和服务重启恢复冒烟
+- [ ] 批量登录恢复与周期快照
+- [ ] 关键经济事务、崩溃窗口和节点接管验收
 
 多记录一致性、跨域事务和 Outbox 在单记录 Snapshot/Transactional 语义通过真实故障测试后再进入设计。
 

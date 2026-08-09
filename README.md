@@ -37,7 +37,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 - `fault_matrix.ps1`：显式停止/恢复本机容器，验证 Redis、PostgreSQL 和快照积压恢复边界
 - `network_smoke.ps1`：验证 Rust SDK -> TCP -> DBProxy -> Redis/PostgreSQL 完整闭环
 
-当前还没有 TiangZ Repository、批量 RPC、Prometheus 指标和生产容器编排。TypeScript SDK只冻结通用语义，物理I/O由各宿主Transport实现；不能因为SDK和TCP冒烟通过就宣称完成了线上接入。
+TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transport适配，并完成真实重启恢复冒烟；这些领域Payload与恢复逻辑不属于本仓库，DBProxy仍不依赖TiangZ。当前尚未完成批量RPC、Prometheus指标、生产容器编排和TiangZ关键经济事务接入，不能因为Snapshot恢复通过就宣称完成了线上持久化。
 
 ## 开发
 
