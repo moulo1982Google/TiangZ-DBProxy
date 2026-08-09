@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package tiangz.dbproxy.v1;
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_REQUEST = 1001;
+  ERROR_CODE_UNAUTHORIZED = 1002;
+  ERROR_CODE_PROTOCOL_MISMATCH = 1003;
+  ERROR_CODE_REVISION_CONFLICT = 2001;
+  ERROR_CODE_IDEMPOTENCY_CONFLICT = 2002;
+  ERROR_CODE_OPERATION_CONFLICT = 2003;
+  ERROR_CODE_STORAGE_UNAVAILABLE = 3001;
+  ERROR_CODE_INTERNAL = 9000;
+}
+
+enum WriteDisposition {
+  WRITE_DISPOSITION_UNSPECIFIED = 0;
+  WRITE_DISPOSITION_APPLIED = 1;
+  WRITE_DISPOSITION_DUPLICATE = 2;
+}
+
+message RpcError {
+  ErrorCode code = 1;
+  string message = 2;
+  optional uint64 actual_revision = 3;
+}
+
+message RecordKey {
+  string namespace = 1;
+  string key = 2;
+}
+
+message SnapshotEnvelope {
+  RecordKey record = 1;
+  string schema = 2;
+  uint32 schema_version = 3;
+  uint64 revision = 4;
+  bytes payload = 5;
+  uint64 updated_at_unix_ms = 6;
+}
+
+message LoadSnapshotRequest {
+  RecordKey record = 1;
+}
+
+message LoadSnapshotResponse {
+  SnapshotEnvelope snapshot = 1;
+}
+
+message SaveSnapshotRequest {
+  string request_id = 1;
+  RecordKey record = 2;
+  string schema = 3;
+  uint32 schema_version = 4;
+  bytes payload = 5;
+  optional uint64 expected_revision = 6;
+  uint64 updated_at_unix_ms = 7;
+}
+
+message SaveSnapshotResponse {
+  WriteDisposition disposition = 1;
+  uint64 revision = 2;
+}
+
+message EnqueueSnapshotRequest {
+  SaveSnapshotRequest write = 1;
+}
+
+message EnqueueSnapshotResponse {
+  bool accepted = 1;
+}
+
+message ApplyTransactionRequest {
+  string operation_id = 1;
+  RecordKey record = 2;
+  string schema = 3;
+  uint32 schema_version = 4;
+  uint64 expected_revision = 5;
+  bytes payload = 6;
+  bytes result = 7;
+  uint64 updated_at_unix_ms = 8;
+}
+
+message ApplyTransactionResponse {
+  WriteDisposition disposition = 1;
+  uint64 new_revision = 2;
+  bytes result = 3;
+}
+
+message RequestEnvelope {
+  uint64 rpc_id = 1;
+  oneof body {
+    LoadSnapshotRequest load_snapshot = 10;
+    SaveSnapshotRequest save_snapshot = 11;
+    EnqueueSnapshotRequest enqueue_snapshot = 12;
+    ApplyTransactionRequest apply_transaction = 13;
+  }
+}
+
+message ResponseEnvelope {
+  uint64 rpc_id = 1;
+  RpcError error = 2;
+  oneof body {
+    LoadSnapshotResponse load_snapshot = 10;
+    SaveSnapshotResponse save_snapshot = 11;
+    EnqueueSnapshotResponse enqueue_snapshot = 12;
+    ApplyTransactionResponse apply_transaction = 13;
+  }
+}
+
+message ClientHello {
+  uint32 protocol_version = 1;
+  string protocol_fingerprint = 2;
+  string auth_token = 3;
+  string client_name = 4;
+}
+
+message ServerHello {
+  uint32 protocol_version = 1;
+  string protocol_fingerprint = 2;
+  bool accepted = 3;
+  RpcError error = 4;
+}
+
+message ClientFrame {
+  oneof body {
+    ClientHello hello = 1;
+    RequestEnvelope request = 2;
+  }
+}
+
+message ServerFrame {
+  oneof body {
+    ServerHello hello = 1;
+    ResponseEnvelope response = 2;
+  }
+}

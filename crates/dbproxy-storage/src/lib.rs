@@ -572,6 +572,7 @@ impl RedisSnapshotCache {
 
 /// PostgreSQL + Redis 的读写组合；权威顺序固定为 PostgreSQL -> Redis。
 /// PostgreSQL + Redis composition; the authoritative order is always PostgreSQL -> Redis.
+#[derive(Clone)]
 pub struct TieredSnapshotStore {
     postgres: PostgresSnapshotStore,
     cache: RedisSnapshotCache,

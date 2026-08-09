@@ -14,7 +14,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 
 ## 当前状态
 
-`v0.1.6` 是当前工作版本；`v0.1.0` 首先冻结了第一版核心语义，`v0.1.1` 接入真实存储适配，`v0.1.2` 升级依赖并补齐根包门面，`v0.1.3` 增加单记录关键事务，`v0.1.4` 增加故障回源与修复矩阵，`v0.1.5` 增加进程内普通快照积压合并与有界排空，`v0.1.6` 增加 Redis AOF 持久积压：
+`v0.2.0` 是当前工作版本。`v0.1.x` 冻结核心语义、真实存储、关键事务和 Redis AOF 持久积压；`v0.2.0` 第一次把这些能力作为独立网络服务暴露：
 
 - `RecordKey`：`namespace + key`
 - `Revision`：由 DBProxy 生成的单调版本号
@@ -30,9 +30,13 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 - `SnapshotFlushQueue`：按 `RecordKey` 合并普通快照，只保留最新值；关键事务不进入该队列
 - `SnapshotFlushQueue::flush` 与 `flush_until_empty`：限制每轮写入量和最大轮数，失败保留请求并返回剩余积压
 - `RedisSnapshotBacklog`：把尚未落 PostgreSQL 的普通快照保存到独立 Redis backlog，支持 lease、ACK、释放、续租和过期回收
+- `dbproxy-protocol`：版本化 Protobuf、协议指纹和 8 MiB 默认有界帧
+- `dbproxy-server`：内部令牌握手、按 RecordKey 分片的真实存储连接和持久积压消费者
+- `dbproxy-client`：Rust 异步客户端及多连接池；TiangZ 不需要引用存储 crate
 - `fault_matrix.ps1`：显式停止/恢复本机容器，验证 Redis、PostgreSQL 和快照积压恢复边界
+- `network_smoke.ps1`：验证 Rust SDK -> TCP -> DBProxy -> Redis/PostgreSQL 完整闭环
 
-当前仍没有网络服务、鉴权、TiangZ Repository 或生产部署配置。Redis/PostgreSQL 适配只在独立 crate 中提供，避免业务代码直接依赖具体数据库。
+当前还没有 TypeScript SDK、TiangZ Repository、批量 RPC、Prometheus 指标和生产容器编排。这些仍属于后续阶段，不能因为 TCP 冒烟通过就宣称完成了线上接入。
 
 ## 开发
 
@@ -57,6 +61,18 @@ cargo test -p tiangz-dbproxy-storage --test postgres_redis --locked -- --ignored
 powershell -ExecutionPolicy Bypass -File tools/fault_matrix.ps1
 ```
 
+启动本机网络服务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/run_local.ps1
+```
+
+默认监听`127.0.0.1:7800`。运行真实网络闭环：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/network_smoke.ps1
+```
+
 本机开发账号只绑定回环地址：PostgreSQL 用户和数据库都是 `tiangz`，密码是 `tiangz_dev`；Redis 密码也是 `tiangz_dev`。这些凭据只适用于本地开发，不能复制到线上。
 
 ## 设计原则
@@ -66,6 +82,21 @@ powershell -ExecutionPolicy Bypass -File tools/fault_matrix.ps1
 3. Redis 不是最终一致性的替代品。缓存和持久库的责任、故障恢复顺序必须由适配器明确实现。
 4. 单记录关键事务与普通快照分开；多记录事务、事件 Outbox 和跨域一致性等更高阶能力，等故障矩阵和单记录语义稳定后再扩展。
 5. TiangZ 的主工程不直接依赖 DBProxy 的内部模块，只依赖版本化协议或客户端 SDK。
+
+## 网络边界
+
+`v0.2.0` 提供四类 RPC：
+
+```text
+LoadSnapshot       读取已提交权威快照
+SaveSnapshot       同步写 PostgreSQL，再刷新 Redis；成功才表示本次提交完成
+EnqueueSnapshot    写入 Redis AOF backlog；成功只表示已可靠接收，不表示 PostgreSQL 已落库
+ApplyTransaction   提交单记录关键事务并保存原始业务结果
+```
+
+每条连接先校验`protocol_version + protocol_fingerprint + auth_token`，之后才允许 RPC。帧使用大端四字节长度前缀，默认上限 8 MiB。客户端连接内按顺序执行请求；`DbProxyClientPool`按`RecordKey`稳定分配到多条连接。服务端存储连接也按相同原则分片，避免所有玩家共享一个事务锁。
+
+详细错误码、ACK语义和接入限制见[网络协议说明](docs/network-protocol.md)。
 
 `SnapshotFlushQueue`是 DBProxy 进程内的协调器；`RedisSnapshotBacklog`是独立的 Redis AOF 持久积压区。前者适合当前进程短暂排空，进程崩溃会丢失；后者保存尚未落 PostgreSQL 的普通快照，DBProxy 重启后可以重新领取。两者都只适合等级、任务进度、角色位置等允许小范围回退的数据，关键经济事务必须走 PostgreSQL 事务。Redis AOF、数据卷和故障监控属于部署责任，不能因为使用了 Redis backlog 就声称实现了完整多副本高可用。
 

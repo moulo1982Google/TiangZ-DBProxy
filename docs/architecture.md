@@ -157,11 +157,13 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 
 ### Phase 3：DBProxy 服务
 
-- Rust 网络服务
-- 鉴权与租户隔离
-- 批量读取和批量写入
+- [x] Rust TCP 网络服务、版本化 Protobuf 和协议指纹
+- [x] 内部共享令牌鉴权；租户级配额与隔离尚未实现
+- [x] Rust 异步客户端与按 RecordKey 分片的连接池
+- [x] Redis backlog 后台消费者和有限停机窗口
+- [ ] 批量读取和批量写入
 - Prometheus 指标
-- 优雅停机和未完成写入排空
+- [ ] 生产级优雅停机指标、死信处理和连接自动恢复
 
 ### Phase 4：TiangZ 集成
 
@@ -172,3 +174,20 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 - 进程崩溃后的恢复验收
 
 多记录一致性、跨域事务和 Outbox 在单记录 Snapshot/Transactional 语义通过真实故障测试后再进入设计。
+
+## 网络服务边界
+
+网络协议位于`crates/dbproxy-protocol/proto/dbproxy.proto`。服务端不会复用TiangZ Runtime的Actor帧，也不允许业务消息穿过DBProxy；两边只共享“大端四字节长度前缀 + 有界帧”的传输习惯。
+
+```text
+TiangZ Repository
+    -> DbProxyClientPool
+    -> ClientHello(version + fingerprint + token)
+    -> Load / Save / Enqueue / ApplyTransaction
+    -> StorageBackend(record shard)
+    -> PostgreSQL / Redis
+```
+
+`SaveSnapshot`和`ApplyTransaction`的响应代表PostgreSQL已经提交；`EnqueueSnapshot`响应只代表Redis AOF backlog接收。调用方必须根据数据等级选择接口，不能把`EnqueueSnapshot`用于货币、背包、交易或奖励确认。
+
+一个SDK连接内有且只有一个在途请求，避免超时后响应错位。需要并发时使用`DbProxyClientPool`；同一RecordKey稳定落在同一连接，不同记录可以并行。服务端同样按RecordKey选择独立`TieredSnapshotStore`分片，数据库仍负责跨连接的Revision、唯一键和事务一致性。

@@ -1,18 +1,15 @@
 [package]
-name = "tiangz-dbproxy-storage"
+name = "tiangz-dbproxy-client"
 version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "TiangZ DBProxy 的 PostgreSQL 权威存储与 Redis 缓存适配器"
+description = "TiangZ DBProxy 的异步 Rust 客户端 SDK"
 
 [dependencies]
 async-trait.workspace = true
-bincode.workspace = true
-redis.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
-tokio-postgres.workspace = true
-tracing.workspace = true
 tiangz-dbproxy-core = { path = "../dbproxy-core" }
+tiangz-dbproxy-protocol = { path = "../dbproxy-protocol" }
+tokio.workspace = true
