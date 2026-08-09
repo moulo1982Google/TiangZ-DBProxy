@@ -78,6 +78,13 @@ export interface DbProxyTransactionalWriteResult {
   readonly result: Uint8Array;
 }
 
+export interface DbProxyTransactionReceipt {
+  readonly operationId: string;
+  readonly record: DbProxyRecordKey;
+  readonly newRevision: bigint;
+  readonly result: Uint8Array;
+}
+
 /**
  * 每个宿主实现一个Transport。实现必须保留DBProxy的ACK语义，不能把Enqueue成功
  * 解释成PostgreSQL已经提交，也不能在超时后复用状态不明的连接。
@@ -93,6 +100,10 @@ export interface DbProxyTransport {
   applyTransaction(
     write: DbProxyTransactionalWrite,
   ): Promise<DbProxyTransactionalWriteResult>;
+  loadTransaction(
+    operationId: string,
+    record: DbProxyRecordKey,
+  ): Promise<DbProxyTransactionReceipt | undefined>;
 }
 
 export class DbProxyRemoteError extends Error {
@@ -143,6 +154,21 @@ export class DbProxyClient {
       newRevision: requireUint64(result.newRevision, "transaction.newRevision"),
       result: copyBytes(result.result),
     }));
+  }
+
+  LoadTransaction(
+    operationId: string,
+    record: DbProxyRecordKey,
+  ): Promise<DbProxyTransactionReceipt | undefined> {
+    const stableOperationId = requireText(
+      operationId,
+      "transaction.operationId",
+      MAX_IDEMPOTENCY_KEY_BYTES,
+    );
+    const stableRecord = cloneRecordKey(record);
+    return this.transport.loadTransaction(stableOperationId, stableRecord).then((receipt) =>
+      receipt ? cloneTransactionReceipt(receipt) : undefined
+    );
   }
 }
 
@@ -204,6 +230,24 @@ function cloneTransactionalWrite(
       write.updatedAtUnixMs,
       "transaction.updatedAtUnixMs",
     ),
+  };
+}
+
+function cloneTransactionReceipt(
+  receipt: DbProxyTransactionReceipt,
+): DbProxyTransactionReceipt {
+  return {
+    operationId: requireText(
+      receipt.operationId,
+      "transactionReceipt.operationId",
+      MAX_IDEMPOTENCY_KEY_BYTES,
+    ),
+    record: cloneRecordKey(receipt.record),
+    newRevision: requireUint64(
+      receipt.newRevision,
+      "transactionReceipt.newRevision",
+    ),
+    result: copyBytes(receipt.result),
   };
 }
 

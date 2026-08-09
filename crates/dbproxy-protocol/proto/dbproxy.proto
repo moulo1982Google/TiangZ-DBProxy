@@ -88,6 +88,22 @@ message ApplyTransactionResponse {
   bytes result = 3;
 }
 
+message LoadTransactionRequest {
+  string operation_id = 1;
+  RecordKey record = 2;
+}
+
+message TransactionReceipt {
+  string operation_id = 1;
+  RecordKey record = 2;
+  uint64 new_revision = 3;
+  bytes result = 4;
+}
+
+message LoadTransactionResponse {
+  TransactionReceipt receipt = 1;
+}
+
 message RequestEnvelope {
   uint64 rpc_id = 1;
   oneof body {
@@ -95,6 +111,7 @@ message RequestEnvelope {
     SaveSnapshotRequest save_snapshot = 11;
     EnqueueSnapshotRequest enqueue_snapshot = 12;
     ApplyTransactionRequest apply_transaction = 13;
+    LoadTransactionRequest load_transaction = 14;
   }
 }
 
@@ -106,6 +123,7 @@ message ResponseEnvelope {
     SaveSnapshotResponse save_snapshot = 11;
     EnqueueSnapshotResponse enqueue_snapshot = 12;
     ApplyTransactionResponse apply_transaction = 13;
+    LoadTransactionResponse load_transaction = 14;
   }
 }
 

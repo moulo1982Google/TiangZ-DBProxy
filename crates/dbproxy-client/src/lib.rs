@@ -16,7 +16,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tiangz_dbproxy_core::{
     AsyncSnapshotStore, AsyncTransactionalStore, RecordKey, Revision, SnapshotEnvelope,
-    SnapshotWrite, SnapshotWriteOutcome, TransactionalWrite, TransactionalWriteOutcome,
+    SnapshotWrite, SnapshotWriteOutcome, TransactionReceipt, TransactionalWrite,
+    TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_protocol::{
     DEFAULT_MAX_FRAME_BYTES, MAX_AUTH_TOKEN_BYTES, MAX_CLIENT_NAME_BYTES, PROTOCOL_FINGERPRINT,
@@ -162,6 +163,16 @@ impl DbProxyClientPool {
     ) -> Result<TransactionalWriteOutcome, ClientError> {
         self.client(&request.record)
             .apply_transaction(request)
+            .await
+    }
+
+    pub async fn load_transaction(
+        &self,
+        operation_id: &str,
+        record: &RecordKey,
+    ) -> Result<Option<TransactionReceipt>, ClientError> {
+        self.client(record)
+            .load_transaction(operation_id, record)
             .await
     }
 }
@@ -400,6 +411,49 @@ impl DbProxyClient {
             )),
         }
     }
+
+    /// 查询一次已经提交的事务结果；只用于恢复“提交成功但调用方未收到响应”的窄窗口。
+    /// Load a committed transaction result to recover the narrow window where
+    /// storage committed but the caller did not receive the response.
+    pub async fn load_transaction(
+        &self,
+        operation_id: &str,
+        record: &RecordKey,
+    ) -> Result<Option<TransactionReceipt>, ClientError> {
+        let response = self
+            .call(wire::request_envelope::Body::LoadTransaction(
+                wire::LoadTransactionRequest {
+                    operation_id: operation_id.to_string(),
+                    record: Some(record.into()),
+                },
+            ))
+            .await?;
+        let Some(wire::response_envelope::Body::LoadTransaction(result)) = response.body else {
+            return Err(ClientError::UnexpectedResponse(
+                "transaction lookup returned another response type",
+            ));
+        };
+        let Some(receipt) = result.receipt else {
+            return Ok(None);
+        };
+        let receipt_record: RecordKey = receipt
+            .record
+            .ok_or(ClientError::UnexpectedResponse(
+                "transaction receipt is missing its record",
+            ))?
+            .try_into()?;
+        if receipt.operation_id != operation_id || &receipt_record != record {
+            return Err(ClientError::UnexpectedResponse(
+                "transaction receipt identity mismatch",
+            ));
+        }
+        Ok(Some(TransactionReceipt {
+            operation_id: receipt.operation_id,
+            record: receipt_record,
+            new_revision: Revision(receipt.new_revision),
+            result: receipt.result,
+        }))
+    }
 }
 
 #[async_trait]
@@ -418,6 +472,14 @@ impl AsyncSnapshotStore for DbProxyClient {
 #[async_trait]
 impl AsyncTransactionalStore for DbProxyClient {
     type Error = ClientError;
+
+    async fn load_receipt(
+        &self,
+        operation_id: &str,
+        record: &RecordKey,
+    ) -> Result<Option<TransactionReceipt>, Self::Error> {
+        self.load_transaction(operation_id, record).await
+    }
 
     async fn apply(
         &mut self,
@@ -443,6 +505,14 @@ impl AsyncSnapshotStore for DbProxyClientPool {
 #[async_trait]
 impl AsyncTransactionalStore for DbProxyClientPool {
     type Error = ClientError;
+
+    async fn load_receipt(
+        &self,
+        operation_id: &str,
+        record: &RecordKey,
+    ) -> Result<Option<TransactionReceipt>, Self::Error> {
+        self.load_transaction(operation_id, record).await
+    }
 
     async fn apply(
         &mut self,

@@ -18,7 +18,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tiangz_dbproxy_core::{
     AsyncSnapshotStore, AsyncTransactionalStore, RecordKey, Revision, SnapshotEnvelope,
-    SnapshotWrite, SnapshotWriteOutcome, StoreError, TransactionalWrite, TransactionalWriteOutcome,
+    SnapshotWrite, SnapshotWriteOutcome, StoreError, TransactionReceipt, TransactionalWrite,
+    TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_protocol::{
     DEFAULT_MAX_FRAME_BYTES, MAX_AUTH_TOKEN_BYTES, MAX_CLIENT_NAME_BYTES, PROTOCOL_FINGERPRINT,
@@ -55,6 +56,11 @@ pub trait DbProxyBackend: Send + Sync + 'static {
         &self,
         request: TransactionalWrite,
     ) -> Result<TransactionalWriteOutcome, BackendError>;
+    async fn load_transaction(
+        &self,
+        operation_id: &str,
+        record: &RecordKey,
+    ) -> Result<Option<TransactionReceipt>, BackendError>;
 }
 
 /// 真实 PostgreSQL/Redis 后端。每个 shard 使用独立数据库连接，并按 RecordKey 稳定路由，
@@ -139,6 +145,17 @@ impl DbProxyBackend for StorageBackend {
     ) -> Result<TransactionalWriteOutcome, BackendError> {
         let mut store = self.shard(&request.record);
         Ok(store.apply(request).await?)
+    }
+
+    async fn load_transaction(
+        &self,
+        operation_id: &str,
+        record: &RecordKey,
+    ) -> Result<Option<TransactionReceipt>, BackendError> {
+        Ok(self
+            .shard(record)
+            .load_receipt(operation_id, record)
+            .await?)
     }
 }
 
@@ -532,6 +549,31 @@ async fn dispatch_body(
                 },
             ))
         }
+        wire::request_envelope::Body::LoadTransaction(request) => {
+            let record = request
+                .record
+                .ok_or_else(|| RpcFailure::invalid("load_transaction.record is missing"))?
+                .try_into()
+                .map_err(RpcFailure::from_protocol)?;
+            let receipt = backend
+                .load_transaction(&request.operation_id, &record)
+                .await
+                .map_err(RpcFailure::from_backend)?;
+            Ok(wire::response_envelope::Body::LoadTransaction(
+                wire::LoadTransactionResponse {
+                    receipt: receipt.map(transaction_receipt),
+                },
+            ))
+        }
+    }
+}
+
+fn transaction_receipt(receipt: TransactionReceipt) -> wire::TransactionReceipt {
+    wire::TransactionReceipt {
+        operation_id: receipt.operation_id,
+        record: Some((&receipt.record).into()),
+        new_revision: receipt.new_revision.0,
+        result: receipt.result,
     }
 }
 

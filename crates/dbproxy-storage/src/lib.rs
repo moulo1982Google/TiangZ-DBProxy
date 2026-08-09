@@ -10,7 +10,8 @@ use redis::aio::MultiplexedConnection;
 use thiserror::Error;
 use tiangz_dbproxy_core::{
     AsyncSnapshotStore, AsyncTransactionalStore, RecordKey, Revision, SnapshotEnvelope,
-    SnapshotWrite, SnapshotWriteOutcome, StoreError, TransactionalWrite, TransactionalWriteOutcome,
+    SnapshotWrite, SnapshotWriteOutcome, StoreError, TransactionReceipt, TransactionalWrite,
+    TransactionalWriteOutcome,
 };
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, Row};
@@ -82,6 +83,19 @@ fn validate_transaction_request(request: &TransactionalWrite) -> Result<(), Stor
         return Err(StoreError::InvalidKey("namespace is empty").into());
     }
     if request.record.key.trim().is_empty() {
+        return Err(StoreError::InvalidKey("key is empty").into());
+    }
+    Ok(())
+}
+
+fn validate_receipt_lookup(operation_id: &str, record: &RecordKey) -> Result<(), StorageError> {
+    if operation_id.trim().is_empty() {
+        return Err(StoreError::EmptyOperationId.into());
+    }
+    if record.namespace.trim().is_empty() {
+        return Err(StoreError::InvalidKey("namespace is empty").into());
+    }
+    if record.key.trim().is_empty() {
         return Err(StoreError::InvalidKey("key is empty").into());
     }
     Ok(())
@@ -343,6 +357,38 @@ impl AsyncSnapshotStore for PostgresSnapshotStore {
 #[async_trait]
 impl AsyncTransactionalStore for PostgresSnapshotStore {
     type Error = StorageError;
+
+    async fn load_receipt(
+        &self,
+        operation_id: &str,
+        record: &RecordKey,
+    ) -> Result<Option<TransactionReceipt>, Self::Error> {
+        validate_receipt_lookup(operation_id, record)?;
+        let client = self.client.lock().await;
+        let receipt = client
+            .query_opt(
+                "SELECT namespace, record_key, new_revision, result FROM dbproxy_transactions WHERE operation_id = $1",
+                &[&operation_id],
+            )
+            .await?;
+        let Some(receipt) = receipt else {
+            return Ok(None);
+        };
+        if receipt.get::<_, String>(0) != record.namespace
+            || receipt.get::<_, String>(1) != record.key
+        {
+            return Err(StoreError::OperationIdConflict {
+                operation_id: operation_id.to_string(),
+            }
+            .into());
+        }
+        Ok(Some(TransactionReceipt {
+            operation_id: operation_id.to_string(),
+            record: record.clone(),
+            new_revision: revision_from_i64(record, receipt.get(2))?,
+            result: receipt.get(3),
+        }))
+    }
 
     async fn apply(
         &mut self,
@@ -656,6 +702,14 @@ impl AsyncSnapshotStore for TieredSnapshotStore {
 #[async_trait]
 impl AsyncTransactionalStore for TieredSnapshotStore {
     type Error = StorageError;
+
+    async fn load_receipt(
+        &self,
+        operation_id: &str,
+        record: &RecordKey,
+    ) -> Result<Option<TransactionReceipt>, Self::Error> {
+        self.postgres.load_receipt(operation_id, record).await
+    }
 
     async fn apply(
         &mut self,

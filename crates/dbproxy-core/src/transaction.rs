@@ -34,6 +34,17 @@ pub struct TransactionalWrite {
     pub updated_at_unix_ms: u64,
 }
 
+/// 已提交事务的可恢复回执；只暴露调用方重试所需的版本和业务结果。
+/// Recoverable receipt for a committed transaction; only the revision and
+/// business result required by a retry are exposed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionReceipt {
+    pub operation_id: String,
+    pub record: RecordKey,
+    pub new_revision: Revision,
+    pub result: Vec<u8>,
+}
+
 /// 事务提交结果；Duplicate 返回第一次提交保存的原始结果。
 /// Transaction outcome; Duplicate returns the original committed result.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +62,12 @@ pub enum TransactionalWriteOutcome {
 /// 同步事务适配器，主要用于纯内存契约测试。
 /// Synchronous transaction adapter, primarily for in-memory contract tests.
 pub trait TransactionStore {
+    fn load_receipt(
+        &self,
+        operation_id: &str,
+        record: &RecordKey,
+    ) -> Result<Option<TransactionReceipt>, StoreError>;
+
     fn apply(
         &mut self,
         request: TransactionalWrite,
@@ -62,6 +79,12 @@ pub trait TransactionStore {
 #[async_trait]
 pub trait AsyncTransactionalStore {
     type Error: std::error::Error + Send + Sync + 'static;
+
+    async fn load_receipt(
+        &self,
+        operation_id: &str,
+        record: &RecordKey,
+    ) -> Result<Option<TransactionReceipt>, Self::Error>;
 
     async fn apply(
         &mut self,
@@ -95,7 +118,7 @@ impl TransactionFingerprint {
 }
 
 #[derive(Clone, Debug)]
-struct TransactionReceipt {
+struct StoredTransactionReceipt {
     fingerprint: TransactionFingerprint,
     new_revision: Revision,
     result: Vec<u8>,
@@ -106,7 +129,7 @@ struct TransactionReceipt {
 #[derive(Default)]
 pub struct InMemoryTransactionalStore {
     snapshots: HashMap<RecordKey, SnapshotEnvelope>,
-    receipts: HashMap<String, TransactionReceipt>,
+    receipts: HashMap<String, StoredTransactionReceipt>,
 }
 
 impl InMemoryTransactionalStore {
@@ -120,6 +143,30 @@ impl InMemoryTransactionalStore {
 }
 
 impl TransactionStore for InMemoryTransactionalStore {
+    fn load_receipt(
+        &self,
+        operation_id: &str,
+        record: &RecordKey,
+    ) -> Result<Option<TransactionReceipt>, StoreError> {
+        if operation_id.trim().is_empty() {
+            return Err(StoreError::EmptyOperationId);
+        }
+        let Some(receipt) = self.receipts.get(operation_id) else {
+            return Ok(None);
+        };
+        if &receipt.fingerprint.record != record {
+            return Err(StoreError::OperationIdConflict {
+                operation_id: operation_id.to_string(),
+            });
+        }
+        Ok(Some(TransactionReceipt {
+            operation_id: operation_id.to_string(),
+            record: record.clone(),
+            new_revision: receipt.new_revision,
+            result: receipt.result.clone(),
+        }))
+    }
+
     fn apply(
         &mut self,
         request: TransactionalWrite,
@@ -173,7 +220,7 @@ impl TransactionStore for InMemoryTransactionalStore {
         );
         self.receipts.insert(
             request.operation_id,
-            TransactionReceipt {
+            StoredTransactionReceipt {
                 fingerprint,
                 new_revision,
                 result: result.clone(),
@@ -279,6 +326,36 @@ mod tests {
         changed.result = b"coins=999".to_vec();
         assert!(matches!(
             store.apply(changed),
+            Err(StoreError::OperationIdConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn committed_receipt_can_be_loaded_after_the_caller_loses_its_response() {
+        let mut store = InMemoryTransactionalStore::new();
+        store
+            .apply(write("op-recover", Revision::ZERO, b"v1"))
+            .unwrap();
+
+        assert_eq!(
+            store.load_receipt("op-recover", &key()).unwrap(),
+            Some(TransactionReceipt {
+                operation_id: "op-recover".to_string(),
+                record: key(),
+                new_revision: Revision(1),
+                result: b"coins=100".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn receipt_lookup_rejects_an_operation_owned_by_another_record() {
+        let mut store = InMemoryTransactionalStore::new();
+        store.apply(write("op-1", Revision::ZERO, b"v1")).unwrap();
+        let other = RecordKey::new("player", "1002").unwrap();
+
+        assert!(matches!(
+            store.load_receipt("op-1", &other),
             Err(StoreError::OperationIdConflict { .. })
         ));
     }

@@ -122,6 +122,13 @@ async fn postgres_and_redis_preserve_transactional_semantics() {
             result: b"granted_gold=100;granted_item=1".to_vec(),
         }
     );
+    let receipt = store
+        .load_receipt(&first.operation_id, &key)
+        .await
+        .unwrap()
+        .expect("committed transaction receipt must be durable");
+    assert_eq!(receipt.new_revision, Revision(1));
+    assert_eq!(receipt.result, b"granted_gold=100;granted_item=1");
 
     let mut tampered_retry = first.clone();
     tampered_retry.result = b"granted_gold=999".to_vec();

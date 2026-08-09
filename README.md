@@ -14,7 +14,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 
 ## 当前状态
 
-`v0.3.1` 是当前工作版本。`v0.1.x` 冻结核心语义、真实存储、关键事务和 Redis AOF 持久积压；`v0.2.0` 第一次把这些能力作为独立网络服务暴露，`v0.3.0` 增加运行时无关的 TypeScript SDK，`v0.3.1` 移除SDK对`TextEncoder`等浏览器全局对象的隐式依赖：
+`v0.4.0` 是当前工作版本。`v0.1.x` 冻结核心语义、真实存储、关键事务和 Redis AOF 持久积压；`v0.2.0` 第一次把这些能力作为独立网络服务暴露，`v0.3.x` 增加运行时无关的 TypeScript SDK并适配裸V8，`v0.4.0` 增加已提交事务回执查询，用于恢复“数据库已提交但调用方未收到响应”的窄窗口：
 
 - `RecordKey`：`namespace + key`
 - `Revision`：由 DBProxy 生成的单调版本号
@@ -22,6 +22,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 - `request_id`：重试时必须保持不变的幂等键
 - `InMemorySnapshotStore`：只用于测试，不保证重启恢复
 - `TransactionalWrite`：带 `operation_id`、期望版本、完整快照和持久化操作结果
+- `TransactionReceipt`：按`operation_id + RecordKey`读取第一次提交保存的Revision和业务结果
 - `InMemoryTransactionalStore`：验证事务提交、CAS 冲突和原始结果重试语义
 - `PostgresSnapshotStore`：PostgreSQL 权威快照、CAS、幂等写入和关键事务收据
 - `RedisSnapshotCache`：只缓存 PostgreSQL 已提交的快照
@@ -87,7 +88,7 @@ powershell -ExecutionPolicy Bypass -File tools/network_smoke.ps1
 
 ## TypeScript SDK
 
-SDK以`DbProxyTransport`隔离宿主I/O。业务或框架适配层创建`DbProxyClient`后，只调用`Load`、`Save`、`EnqueueSnapshot`和`ApplyTransaction`；SDK不会生成幂等ID，也不会在失败后偷偷换ID重试。
+SDK以`DbProxyTransport`隔离宿主I/O。业务或框架适配层创建`DbProxyClient`后，只调用`Load`、`Save`、`EnqueueSnapshot`、`ApplyTransaction`和`LoadTransaction`；SDK不会生成幂等ID，也不会在失败后偷偷换ID重试。
 
 ```ts
 import { DbProxyClient, type DbProxyTransport } from "@tiangz/dbproxy-sdk";
@@ -101,13 +102,14 @@ const snapshot = await client.Load({ namespace: "player", key: "1001" });
 
 ## 网络边界
 
-`v0.2.0` 提供四类 RPC：
+当前协议提供五类 RPC：
 
 ```text
 LoadSnapshot       读取已提交权威快照
 SaveSnapshot       同步写 PostgreSQL，再刷新 Redis；成功才表示本次提交完成
 EnqueueSnapshot    写入 Redis AOF backlog；成功只表示已可靠接收，不表示 PostgreSQL 已落库
 ApplyTransaction   提交单记录关键事务并保存原始业务结果
+LoadTransaction    按operationId与RecordKey读取已提交事务回执
 ```
 
 每条连接先校验`protocol_version + protocol_fingerprint + auth_token`，之后才允许 RPC。帧使用大端四字节长度前缀，默认上限 8 MiB。客户端连接内按顺序执行请求；`DbProxyClientPool`按`RecordKey`稳定分配到多条连接。服务端存储连接也按相同原则分片，避免所有玩家共享一个事务锁。

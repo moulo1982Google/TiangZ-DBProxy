@@ -14,8 +14,8 @@ mod transaction;
 
 pub use flush::{SnapshotFlushError, SnapshotFlushQueue, SnapshotFlushReport};
 pub use transaction::{
-    AsyncTransactionalStore, InMemoryTransactionalStore, TransactionStore, TransactionalWrite,
-    TransactionalWriteOutcome,
+    AsyncTransactionalStore, InMemoryTransactionalStore, TransactionReceipt, TransactionStore,
+    TransactionalWrite, TransactionalWriteOutcome,
 };
 
 /// 持久化记录的逻辑地址；同一个 namespace 下的 key 必须唯一。

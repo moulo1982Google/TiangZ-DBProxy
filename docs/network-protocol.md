@@ -29,7 +29,7 @@ client_name           // 只用于日志，不参与授权
 
 版本或指纹不一致返回`PROTOCOL_MISMATCH`；令牌不一致返回`UNAUTHORIZED`。认证成功后再接受RPC。当前共享令牌只解决内部服务最小鉴权，尚不包含租户配额、证书轮换或mTLS。
 
-## 四类 RPC
+## 五类 RPC
 
 ### LoadSnapshot
 
@@ -72,6 +72,10 @@ expected_revision
 ```
 
 网络超时后用原`operation_id`重试，返回第一次保存的Revision和result，不会重复执行。
+
+### LoadTransaction
+
+按`operation_id + RecordKey`读取已经提交的事务回执，返回第一次提交保存的`new_revision/result`。它只用于恢复“PostgreSQL已提交，但调用方在收到响应或应用内存状态前崩溃”的窄窗口；记录不匹配返回`OPERATION_CONFLICT`，不存在返回`None`。DBProxy不会解释result，也不会替业务判断是否应该继续执行操作。
 
 ## 错误码
 

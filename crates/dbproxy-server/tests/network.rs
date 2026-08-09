@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use tiangz_dbproxy_client::{ClientConfig, ClientError, DbProxyClient};
 use tiangz_dbproxy_core::{
     InMemorySnapshotStore, InMemoryTransactionalStore, RecordKey, Revision, SnapshotEnvelope,
-    SnapshotStore, SnapshotWrite, SnapshotWriteOutcome, TransactionStore, TransactionalWrite,
-    TransactionalWriteOutcome,
+    SnapshotStore, SnapshotWrite, SnapshotWriteOutcome, TransactionReceipt, TransactionStore,
+    TransactionalWrite, TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_protocol::{
     DEFAULT_MAX_FRAME_BYTES, PROTOCOL_FINGERPRINT, read_message, wire, write_message,
@@ -48,6 +48,18 @@ impl DbProxyBackend for MemoryBackend {
         request: TransactionalWrite,
     ) -> Result<TransactionalWriteOutcome, BackendError> {
         Ok(self.transactions.lock().await.apply(request)?)
+    }
+
+    async fn load_transaction(
+        &self,
+        operation_id: &str,
+        record: &RecordKey,
+    ) -> Result<Option<TransactionReceipt>, BackendError> {
+        Ok(self
+            .transactions
+            .lock()
+            .await
+            .load_receipt(operation_id, record)?)
     }
 }
 
@@ -159,6 +171,18 @@ async fn client_server_round_trip_preserves_persistence_semantics() {
             new_revision: Revision(1),
             result: b"granted=100".to_vec()
         }
+    );
+    assert_eq!(
+        client
+            .load_transaction("operation-1", &RecordKey::new("wallet", "1001").unwrap(),)
+            .await
+            .unwrap(),
+        Some(TransactionReceipt {
+            operation_id: "operation-1".to_string(),
+            record: RecordKey::new("wallet", "1001").unwrap(),
+            new_revision: Revision(1),
+            result: b"granted=100".to_vec(),
+        })
     );
 
     client

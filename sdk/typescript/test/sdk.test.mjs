@@ -26,6 +26,7 @@ test("snapshot writes cross the transport boundary as defensive copies", async (
       newRevision: 1n,
       result: new Uint8Array(),
     }),
+    loadTransaction: async () => undefined,
   };
   const payload = Uint8Array.from([1, 2, 3]);
   const client = new DbProxyClient(transport);
@@ -55,6 +56,7 @@ test("queued snapshots reject CAS because ACK only means backlog accepted", () =
       newRevision: 1n,
       result: new Uint8Array(),
     }),
+    loadTransaction: async () => undefined,
   });
 
   assert.throws(() => client.EnqueueSnapshot({
@@ -66,6 +68,35 @@ test("queued snapshots reject CAS because ACK only means backlog accepted", () =
     expectedRevision: 1n,
     updatedAtUnixMs: 123n,
   }), /cannot carry expectedRevision/);
+});
+
+test("transaction receipt lookup validates identity and returns defensive bytes", async () => {
+  const source = Uint8Array.from([7, 8, 9]);
+  const client = new DbProxyClient({
+    load: async () => undefined,
+    save: async () => ({ disposition: "applied", revision: 1n }),
+    enqueueSnapshot: async () => undefined,
+    applyTransaction: async () => ({
+      disposition: "applied",
+      newRevision: 1n,
+      result: new Uint8Array(),
+    }),
+    loadTransaction: async (operationId, record) => ({
+      operationId,
+      record,
+      newRevision: 3n,
+      result: source,
+    }),
+  });
+
+  const receipt = await client.LoadTransaction(
+    "quest-reward:player-1:5001",
+    { namespace: "player", key: "player-1" },
+  );
+  source[0] = 99;
+
+  assert.equal(receipt?.newRevision, 3n);
+  assert.deepEqual([...(receipt?.result ?? [])], [7, 8, 9]);
 });
 
 test("SDK validation works in a bare V8 without TextEncoder", async () => {
@@ -81,6 +112,7 @@ test("SDK validation works in a bare V8 without TextEncoder", async () => {
         newRevision: 1n,
         result: new Uint8Array(),
       }),
+      loadTransaction: async () => undefined,
     });
     const result = await client.Save({
       requestId: "裸V8-save-1",
