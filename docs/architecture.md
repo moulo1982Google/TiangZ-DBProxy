@@ -68,7 +68,27 @@ SnapshotWrite
 
 PostgreSQL 是唯一权威写入端。Redis写入失败时，PostgreSQL事务不会回滚；调用方收到缓存同步错误后，可以使用原`request_id`重试，DBProxy会返回Duplicate并再次修复缓存。读取优先读Redis，未命中再读PostgreSQL并回填缓存；缓存预热失败不影响这次数据库读取。
 
-当前表为`dbproxy_snapshots`和`dbproxy_idempotency`，迁移脚本位于`crates/dbproxy-storage/migrations/001_snapshot.sql`。这是独立适配器契约，不等于TiangZ已经完成网络化DBProxy接入。
+## 关键事务写入
+
+关键经济操作不使用普通`SnapshotWrite`覆盖快照，而使用`TransactionalWrite`：
+
+```text
+Wallet/Inventory/Reward
+    -> operation_id + expected_revision + new snapshot + business result
+    -> PostgreSQL transaction
+       1. claim operation_id
+       2. lock and compare current revision
+       3. write snapshot with new revision
+       4. save the exact business result
+       5. commit
+    -> Redis refresh
+```
+
+`operation_id`只在快照和操作结果同时提交时才生效。CAS失败会回滚操作收据，业务可以读取新版本后重新生成请求；数据库提交后如果网络超时，使用原`operation_id`重试会得到`Duplicate`和第一次的原始结果，不会再次发放奖励或递增Revision。
+
+Redis仍然不是权威写入端。PostgreSQL提交成功而Redis刷新失败时，调用方会收到缓存同步错误；用同一个`operation_id`重试会命中已提交收据，并再次把最新快照写入Redis。
+
+当前表为`dbproxy_snapshots`、`dbproxy_idempotency`和`dbproxy_transactions`，迁移脚本位于`crates/dbproxy-storage/migrations/001_snapshot.sql`与`002_transactional.sql`。启动迁移使用PostgreSQL事务级advisory lock，多个DBProxy进程可以并发启动而不会竞争DDL。这是独立适配器契约，不等于TiangZ已经完成网络化DBProxy接入。
 
 本机依赖使用`deploy/local/docker-compose.yml`，固定为PostgreSQL 18.4 Bookworm和Redis 8.8.1 Trixie，数据使用Docker命名卷保存。
 
@@ -85,6 +105,7 @@ PostgreSQL 是唯一权威写入端。Redis写入失败时，PostgreSQL事务不
 - [x] Redis缓存与PostgreSQL权威快照适配器
 - [x] 读缓存、写入顺序、Revision/CAS和幂等重试
 - [x] 本地Docker Compose和外部依赖集成测试
+- [x] 单记录关键事务：operation_id、Revision/CAS、原始结果和Redis修复
 - [ ] Redis故障、PostgreSQL故障、缓存修复和积压恢复矩阵
 - [ ] 其他数据库Adapter；先不同时实现MongoDB、MySQL和PostgreSQL多套方言
 
@@ -104,4 +125,4 @@ PostgreSQL 是唯一权威写入端。Redis写入失败时，PostgreSQL事务不
 - 正常下线保存
 - 进程崩溃后的恢复验收
 
-事务、多记录一致性和 Outbox 在单记录 Snapshot 语义通过真实故障测试后再进入设计。
+多记录一致性、跨域事务和 Outbox 在单记录 Snapshot/Transactional 语义通过真实故障测试后再进入设计。

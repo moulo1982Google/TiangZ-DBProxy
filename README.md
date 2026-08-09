@@ -14,16 +14,18 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 
 ## 当前状态
 
-`v0.1.2` 是当前工作版本；`v0.1.0` 首先冻结了第一版核心语义，`v0.1.1` 接入真实存储适配，当前继续升级依赖并补齐根包门面：
+`v0.1.3` 是当前工作版本；`v0.1.0` 首先冻结了第一版核心语义，`v0.1.1` 接入真实存储适配，`v0.1.2` 升级依赖并补齐根包门面，`v0.1.3` 增加单记录关键事务：
 
 - `RecordKey`：`namespace + key`
 - `Revision`：由 DBProxy 生成的单调版本号
 - `SnapshotWrite`：带 `expected_revision` 的条件写入
 - `request_id`：重试时必须保持不变的幂等键
 - `InMemorySnapshotStore`：只用于测试，不保证重启恢复
-- `PostgresSnapshotStore`：PostgreSQL 权威快照、CAS 和幂等写入
+- `TransactionalWrite`：带 `operation_id`、期望版本、完整快照和持久化操作结果
+- `InMemoryTransactionalStore`：验证事务提交、CAS 冲突和原始结果重试语义
+- `PostgresSnapshotStore`：PostgreSQL 权威快照、CAS、幂等写入和关键事务收据
 - `RedisSnapshotCache`：只缓存 PostgreSQL 已提交的快照
-- `TieredSnapshotStore`：固定按照 PostgreSQL -> Redis 的顺序写入
+- `TieredSnapshotStore`：固定按照 PostgreSQL -> Redis 的顺序写入，并在事务重试后修复缓存
 
 当前仍没有网络服务、鉴权、TiangZ Repository 或生产部署配置。Redis/PostgreSQL 适配只在独立 crate 中提供，避免业务代码直接依赖具体数据库。
 
@@ -51,7 +53,7 @@ cargo test -p tiangz-dbproxy-storage --test postgres_redis --locked -- --ignored
 1. DBProxy 只理解记录地址、Schema、Revision 和二进制 Payload，不理解游戏业务字段。
 2. 快照写入必须支持重试，重试不能导致重复扣物品、重复发奖励或重复保存。
 3. Redis 不是最终一致性的替代品。缓存和持久库的责任、故障恢复顺序必须由适配器明确实现。
-4. 事务、多记录写入和事件 Outbox 不放进第一版 Snapshot API，等单记录语义稳定后再扩展。
+4. 单记录关键事务与普通快照分开；多记录事务、事件 Outbox 和跨域一致性等更高阶能力，等单记录语义稳定后再扩展。
 5. TiangZ 的主工程不直接依赖 DBProxy 的内部模块，只依赖版本化协议或客户端 SDK。
 
 ## 许可证

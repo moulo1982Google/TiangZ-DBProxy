@@ -9,6 +9,13 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod transaction;
+
+pub use transaction::{
+    AsyncTransactionalStore, InMemoryTransactionalStore, TransactionStore, TransactionalWrite,
+    TransactionalWriteOutcome,
+};
+
 /// 持久化记录的逻辑地址；同一个 namespace 下的 key 必须唯一。
 /// Logical address of one persisted record; keys are unique within a namespace.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -87,8 +94,12 @@ pub enum StoreError {
     InvalidKey(&'static str),
     #[error("idempotency request is empty")]
     EmptyRequestId,
+    #[error("transaction operation id is empty")]
+    EmptyOperationId,
     #[error("idempotency request {request_id} was already used for another record")]
     IdempotencyConflict { request_id: String },
+    #[error("transaction operation {operation_id} was already used for another request")]
+    OperationIdConflict { operation_id: String },
     #[error("revision conflict for {record:?}: expected {expected:?}, actual {actual:?}")]
     RevisionConflict {
         record: RecordKey,

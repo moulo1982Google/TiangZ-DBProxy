@@ -9,13 +9,15 @@ use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
 use thiserror::Error;
 use tiangz_dbproxy_core::{
-    AsyncSnapshotStore, RecordKey, Revision, SnapshotEnvelope, SnapshotWrite, SnapshotWriteOutcome,
-    StoreError,
+    AsyncSnapshotStore, AsyncTransactionalStore, RecordKey, Revision, SnapshotEnvelope,
+    SnapshotWrite, SnapshotWriteOutcome, StoreError, TransactionalWrite, TransactionalWriteOutcome,
 };
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, Row};
 
 const SNAPSHOT_MIGRATION: &str = include_str!("../migrations/001_snapshot.sql");
+const TRANSACTION_MIGRATION: &str = include_str!("../migrations/002_transactional.sql");
+const MIGRATION_LOCK_ID: i64 = 8_390_417_203;
 
 /// 存储适配器错误；PostgreSQL 错误不会被包装成“保存成功”。
 /// Adapter error; PostgreSQL failures are never reported as successful writes.
@@ -58,6 +60,19 @@ fn validate_request(request: &SnapshotWrite) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn validate_transaction_request(request: &TransactionalWrite) -> Result<(), StorageError> {
+    if request.operation_id.trim().is_empty() {
+        return Err(StoreError::EmptyOperationId.into());
+    }
+    if request.record.namespace.trim().is_empty() {
+        return Err(StoreError::InvalidKey("namespace is empty").into());
+    }
+    if request.record.key.trim().is_empty() {
+        return Err(StoreError::InvalidKey("key is empty").into());
+    }
+    Ok(())
+}
+
 fn revision_to_i64(
     record: &RecordKey,
     revision: Option<Revision>,
@@ -69,6 +84,12 @@ fn revision_to_i64(
             })
         })
         .transpose()
+}
+
+fn required_revision_to_i64(record: &RecordKey, revision: Revision) -> Result<i64, StorageError> {
+    i64::try_from(revision.0).map_err(|_| StorageError::RevisionTooLarge {
+        record: record.clone(),
+    })
 }
 
 fn schema_version_to_i64(version: u32) -> i64 {
@@ -134,6 +155,23 @@ fn idempotency_matches(
         && row.get::<_, Option<i64>>(5) == expected
 }
 
+fn transaction_matches(
+    row: &Row,
+    request: &TransactionalWrite,
+    schema_version: i64,
+    expected_revision: i64,
+    updated_at_unix_ms: i64,
+) -> bool {
+    row.get::<_, String>(0) == request.record.namespace
+        && row.get::<_, String>(1) == request.record.key
+        && row.get::<_, String>(2) == request.schema
+        && row.get::<_, i64>(3) == schema_version
+        && row.get::<_, i64>(4) == expected_revision
+        && row.get::<_, Vec<u8>>(5) == request.payload
+        && row.get::<_, Vec<u8>>(6) == request.result
+        && row.get::<_, i64>(8) == updated_at_unix_ms
+}
+
 /// PostgreSQL 快照存储。
 /// PostgreSQL snapshot store.
 ///
@@ -164,8 +202,16 @@ impl PostgresSnapshotStore {
     /// 执行幂等的建表脚本；重复执行不会破坏已有数据。
     /// Apply an idempotent schema migration without modifying existing data.
     pub async fn migrate(&self) -> Result<(), StorageError> {
-        let client = self.client.lock().await;
-        client.batch_execute(SNAPSHOT_MIGRATION).await?;
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await?;
+        // 多个DBProxy进程可能同时启动；事务级 advisory lock 防止DDL在 PostgreSQL 系统目录上竞争。
+        // Multiple DBProxy processes may start together; a transaction advisory lock serializes DDL.
+        transaction
+            .execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])
+            .await?;
+        transaction.batch_execute(SNAPSHOT_MIGRATION).await?;
+        transaction.batch_execute(TRANSACTION_MIGRATION).await?;
+        transaction.commit().await?;
         Ok(())
     }
 }
@@ -280,6 +326,163 @@ impl AsyncSnapshotStore for PostgresSnapshotStore {
     }
 }
 
+#[async_trait]
+impl AsyncTransactionalStore for PostgresSnapshotStore {
+    type Error = StorageError;
+
+    async fn apply(
+        &mut self,
+        request: TransactionalWrite,
+    ) -> Result<TransactionalWriteOutcome, Self::Error> {
+        validate_transaction_request(&request)?;
+        let schema_version = schema_version_to_i64(request.schema_version);
+        let expected_revision =
+            required_revision_to_i64(&request.record, request.expected_revision)?;
+        let updated_at_unix_ms = timestamp_to_i64(&request.record, request.updated_at_unix_ms)?;
+
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await?;
+
+        // 操作收据和快照必须在同一个数据库事务内提交；失败的 CAS 会回滚收据，允许业务修正版本后重试。
+        // The operation receipt and snapshot commit together; a failed CAS rolls the receipt back.
+        let claimed = transaction
+            .query_opt(
+                "INSERT INTO dbproxy_transactions (operation_id, namespace, record_key, schema_name, schema_version, expected_revision, payload, result, new_revision, updated_at_unix_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9) ON CONFLICT (operation_id) DO NOTHING RETURNING operation_id",
+                &[
+                    &request.operation_id,
+                    &request.record.namespace,
+                    &request.record.key,
+                    &request.schema,
+                    &schema_version,
+                    &expected_revision,
+                    &request.payload,
+                    &request.result,
+                    &updated_at_unix_ms,
+                ],
+            )
+            .await?;
+
+        if claimed.is_none() {
+            let receipt = transaction
+                .query_one(
+                    "SELECT namespace, record_key, schema_name, schema_version, expected_revision, payload, result, new_revision, updated_at_unix_ms FROM dbproxy_transactions WHERE operation_id = $1",
+                    &[&request.operation_id],
+                )
+                .await?;
+            if !transaction_matches(
+                &receipt,
+                &request,
+                schema_version,
+                expected_revision,
+                updated_at_unix_ms,
+            ) {
+                return Err(StoreError::OperationIdConflict {
+                    operation_id: request.operation_id,
+                }
+                .into());
+            }
+            let new_revision = revision_from_i64(&request.record, receipt.get(7))?;
+            let result: Vec<u8> = receipt.get(6);
+            transaction.commit().await?;
+            return Ok(TransactionalWriteOutcome::Duplicate {
+                new_revision,
+                result,
+            });
+        }
+
+        let current = transaction
+            .query_opt(
+                "SELECT revision FROM dbproxy_snapshots WHERE namespace = $1 AND record_key = $2 FOR UPDATE",
+                &[&request.record.namespace, &request.record.key],
+            )
+            .await?;
+        let actual_revision = match &current {
+            Some(row) => revision_from_i64(&request.record, row.get(0))?,
+            None => Revision::ZERO,
+        };
+        if actual_revision != request.expected_revision {
+            return Err(StoreError::RevisionConflict {
+                record: request.record,
+                expected: Some(request.expected_revision),
+                actual: actual_revision,
+            }
+            .into());
+        }
+
+        let new_revision = Revision(actual_revision.0.checked_add(1).ok_or_else(|| {
+            StoreError::RevisionExhausted {
+                record: request.record.clone(),
+            }
+        })?);
+        let new_revision_i64 = required_revision_to_i64(&request.record, new_revision)?;
+
+        // 已存在的记录已经被 FOR UPDATE 锁住；首次创建使用 ON CONFLICT DO NOTHING，避免两个创建请求产生唯一键错误。
+        // Existing rows are locked by FOR UPDATE; first creation uses ON CONFLICT DO NOTHING to avoid a PK race.
+        let snapshot = if current.is_none() {
+            transaction
+                .query_opt(
+                    "INSERT INTO dbproxy_snapshots (namespace, record_key, schema_name, schema_version, revision, payload, updated_at_unix_ms) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (namespace, record_key) DO NOTHING RETURNING revision",
+                    &[
+                        &request.record.namespace,
+                        &request.record.key,
+                        &request.schema,
+                        &schema_version,
+                        &new_revision_i64,
+                        &request.payload,
+                        &updated_at_unix_ms,
+                    ],
+                )
+                .await?
+        } else {
+            transaction
+                .query_opt(
+                    "UPDATE dbproxy_snapshots SET schema_name = $3, schema_version = $4, revision = $5, payload = $6, updated_at_unix_ms = $7 WHERE namespace = $1 AND record_key = $2 RETURNING revision",
+                    &[
+                        &request.record.namespace,
+                        &request.record.key,
+                        &request.schema,
+                        &schema_version,
+                        &new_revision_i64,
+                        &request.payload,
+                        &updated_at_unix_ms,
+                    ],
+                )
+                .await?
+        };
+
+        let Some(snapshot) = snapshot else {
+            let actual = transaction
+                .query_opt(
+                    "SELECT revision FROM dbproxy_snapshots WHERE namespace = $1 AND record_key = $2",
+                    &[&request.record.namespace, &request.record.key],
+                )
+                .await?
+                .map(|row| revision_from_i64(&request.record, row.get(0)))
+                .transpose()?
+                .unwrap_or(Revision::ZERO);
+            return Err(StoreError::RevisionConflict {
+                record: request.record,
+                expected: Some(request.expected_revision),
+                actual,
+            }
+            .into());
+        };
+
+        let committed_revision = revision_from_i64(&request.record, snapshot.get(0))?;
+        transaction
+            .execute(
+                "UPDATE dbproxy_transactions SET new_revision = $2 WHERE operation_id = $1",
+                &[&request.operation_id, &new_revision_i64],
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(TransactionalWriteOutcome::Applied {
+            new_revision: committed_revision,
+            result: request.result,
+        })
+    }
+}
+
 /// Redis 快照缓存；只缓存 PostgreSQL 已提交的 `SnapshotEnvelope`。
 /// Redis snapshot cache; it only caches PostgreSQL-committed envelopes.
 #[derive(Clone)]
@@ -381,6 +584,30 @@ impl AsyncSnapshotStore for TieredSnapshotStore {
     async fn save(&mut self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, Self::Error> {
         let record = request.record.clone();
         let outcome = self.postgres.save(request).await?;
+        let snapshot =
+            self.postgres
+                .load(&record)
+                .await?
+                .ok_or_else(|| StorageError::MissingAfterWrite {
+                    record: record.clone(),
+                })?;
+        if let Err(error) = self.cache.put(&snapshot).await {
+            return Err(StorageError::CacheSync(error.to_string()));
+        }
+        Ok(outcome)
+    }
+}
+
+#[async_trait]
+impl AsyncTransactionalStore for TieredSnapshotStore {
+    type Error = StorageError;
+
+    async fn apply(
+        &mut self,
+        request: TransactionalWrite,
+    ) -> Result<TransactionalWriteOutcome, Self::Error> {
+        let record = request.record.clone();
+        let outcome = self.postgres.apply(request).await?;
         let snapshot =
             self.postgres
                 .load(&record)
