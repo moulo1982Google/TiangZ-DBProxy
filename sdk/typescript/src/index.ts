@@ -211,10 +211,43 @@ function requireText(value: string, name: string, maximumBytes: number): string 
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new TypeError(`${name} must be a non-empty string`);
   }
-  if (new TextEncoder().encode(value).byteLength > maximumBytes) {
+  if (utf8ByteLength(value) > maximumBytes) {
     throw new RangeError(`${name} exceeds ${maximumBytes} UTF-8 bytes`);
   }
   return value;
+}
+
+/**
+ * 在裸V8、Node和浏览器中计算一致的UTF-8字节数，不依赖TextEncoder全局对象。
+ * 这里只计算协议限长，不能用它代替真正的字符串编码器。
+ *
+ * Computes a consistent UTF-8 byte length in bare V8, Node, and browsers
+ * without requiring a global TextEncoder. This only validates protocol limits
+ * and must not be used as a replacement for an actual string encoder.
+ */
+function utf8ByteLength(value: string): number {
+  let length = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit <= 0x7f) {
+      length += 1;
+      continue;
+    }
+    if (codeUnit <= 0x7ff) {
+      length += 2;
+      continue;
+    }
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        length += 4;
+        index += 1;
+        continue;
+      }
+    }
+    length += 3;
+  }
+  return length;
 }
 
 function requireUint32(value: number, name: string): number {

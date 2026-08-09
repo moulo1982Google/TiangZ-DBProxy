@@ -14,7 +14,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 
 ## 当前状态
 
-`v0.3.0` 是当前工作版本。`v0.1.x` 冻结核心语义、真实存储、关键事务和 Redis AOF 持久积压；`v0.2.0` 第一次把这些能力作为独立网络服务暴露，`v0.3.0` 增加运行时无关的 TypeScript SDK：
+`v0.3.1` 是当前工作版本。`v0.1.x` 冻结核心语义、真实存储、关键事务和 Redis AOF 持久积压；`v0.2.0` 第一次把这些能力作为独立网络服务暴露，`v0.3.0` 增加运行时无关的 TypeScript SDK，`v0.3.1` 移除SDK对`TextEncoder`等浏览器全局对象的隐式依赖：
 
 - `RecordKey`：`namespace + key`
 - `Revision`：由 DBProxy 生成的单调版本号

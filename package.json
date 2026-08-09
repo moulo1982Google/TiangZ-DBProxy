@@ -1,6 +1,6 @@
 {
   "name": "@tiangz/dbproxy-sdk",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "TiangZ DBProxy 的运行时无关 TypeScript SDK",
   "license": "Apache-2.0",
   "author": "郑昕",

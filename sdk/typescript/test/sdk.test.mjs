@@ -67,3 +67,32 @@ test("queued snapshots reject CAS because ACK only means backlog accepted", () =
     updatedAtUnixMs: 123n,
   }), /cannot carry expectedRevision/);
 });
+
+test("SDK validation works in a bare V8 without TextEncoder", async () => {
+  const original = globalThis.TextEncoder;
+  globalThis.TextEncoder = undefined;
+  try {
+    const client = new DbProxyClient({
+      load: async () => undefined,
+      save: async () => ({ disposition: "applied", revision: 1n }),
+      enqueueSnapshot: async () => undefined,
+      applyTransaction: async () => ({
+        disposition: "applied",
+        newRevision: 1n,
+        result: new Uint8Array(),
+      }),
+    });
+    const result = await client.Save({
+      requestId: "裸V8-save-1",
+      record: { namespace: "玩家", key: "1001" },
+      schema: "tiangz.player",
+      schemaVersion: 1,
+      payload: new Uint8Array(),
+      expectedRevision: 0n,
+      updatedAtUnixMs: 123n,
+    });
+    assert.equal(result.revision, 1n);
+  } finally {
+    globalThis.TextEncoder = original;
+  }
+});
