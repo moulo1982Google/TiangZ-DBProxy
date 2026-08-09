@@ -33,3 +33,9 @@ docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml d
 ```powershell
 docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml down -v
 ```
+
+运行故障矩阵（会短暂停止并恢复容器，不会删除数据卷）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/fault_matrix.ps1
+```

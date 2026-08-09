@@ -160,4 +160,12 @@ async fn postgres_and_redis_preserve_transactional_semantics() {
         .expect("successful transactional write must warm Redis");
     assert_eq!(cached.revision, Revision(1));
     assert_eq!(cached.payload, b"wallet=100;item=1001:51");
+
+    assert_eq!(store.repair_cache(&key).await.unwrap(), Some(Revision(1)));
+    let missing = RecordKey::new(
+        "transactional-integration",
+        format!("missing-{}", test_suffix()),
+    )
+    .unwrap();
+    assert_eq!(store.repair_cache(&missing).await.unwrap(), None);
 }

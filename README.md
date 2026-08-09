@@ -14,7 +14,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 
 ## 当前状态
 
-`v0.1.3` 是当前工作版本；`v0.1.0` 首先冻结了第一版核心语义，`v0.1.1` 接入真实存储适配，`v0.1.2` 升级依赖并补齐根包门面，`v0.1.3` 增加单记录关键事务：
+`v0.1.4` 是当前工作版本；`v0.1.0` 首先冻结了第一版核心语义，`v0.1.1` 接入真实存储适配，`v0.1.2` 升级依赖并补齐根包门面，`v0.1.3` 增加单记录关键事务，`v0.1.4` 增加故障回源与修复矩阵：
 
 - `RecordKey`：`namespace + key`
 - `Revision`：由 DBProxy 生成的单调版本号
@@ -26,6 +26,8 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 - `PostgresSnapshotStore`：PostgreSQL 权威快照、CAS、幂等写入和关键事务收据
 - `RedisSnapshotCache`：只缓存 PostgreSQL 已提交的快照
 - `TieredSnapshotStore`：固定按照 PostgreSQL -> Redis 的顺序写入，并在事务重试后修复缓存
+- `TieredSnapshotStore::repair_cache`：从 PostgreSQL 重建缓存，或删除数据库中已不存在的旧缓存
+- `fault_matrix.ps1`：显式停止/恢复本机容器，验证 Redis 和 PostgreSQL 故障边界
 
 当前仍没有网络服务、鉴权、TiangZ Repository 或生产部署配置。Redis/PostgreSQL 适配只在独立 crate 中提供，避免业务代码直接依赖具体数据库。
 
@@ -46,6 +48,12 @@ $env:DBPROXY_REDIS_URL = "redis://:tiangz_dev@127.0.0.1:6379/0"
 cargo test -p tiangz-dbproxy-storage --test postgres_redis --locked -- --ignored --nocapture
 ```
 
+运行故障矩阵。该命令会短暂停止并恢复本机 PostgreSQL/Redis 容器，但不会删除数据卷：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/fault_matrix.ps1
+```
+
 本机开发账号只绑定回环地址：PostgreSQL 用户和数据库都是 `tiangz`，密码是 `tiangz_dev`；Redis 密码也是 `tiangz_dev`。这些凭据只适用于本地开发，不能复制到线上。
 
 ## 设计原则
@@ -53,7 +61,7 @@ cargo test -p tiangz-dbproxy-storage --test postgres_redis --locked -- --ignored
 1. DBProxy 只理解记录地址、Schema、Revision 和二进制 Payload，不理解游戏业务字段。
 2. 快照写入必须支持重试，重试不能导致重复扣物品、重复发奖励或重复保存。
 3. Redis 不是最终一致性的替代品。缓存和持久库的责任、故障恢复顺序必须由适配器明确实现。
-4. 单记录关键事务与普通快照分开；多记录事务、事件 Outbox 和跨域一致性等更高阶能力，等单记录语义稳定后再扩展。
+4. 单记录关键事务与普通快照分开；多记录事务、事件 Outbox 和跨域一致性等更高阶能力，等故障矩阵和单记录语义稳定后再扩展。
 5. TiangZ 的主工程不直接依赖 DBProxy 的内部模块，只依赖版本化协议或客户端 SDK。
 
 ## 许可证

@@ -543,6 +543,17 @@ impl RedisSnapshotCache {
             .await?;
         Ok(())
     }
+
+    /// 删除指定快照缓存；数据库没有记录时由修复流程调用，避免保留幽灵快照。
+    /// Delete one snapshot cache entry; repair uses this when the durable record is absent.
+    pub async fn delete(&self, record: &RecordKey) -> Result<(), StorageError> {
+        let mut connection = self.connection.lock().await;
+        let _: u64 = redis::cmd("DEL")
+            .arg(Self::cache_key(record))
+            .query_async(&mut *connection)
+            .await?;
+        Ok(())
+    }
 }
 
 /// PostgreSQL + Redis 的读写组合；权威顺序固定为 PostgreSQL -> Redis。
@@ -561,6 +572,26 @@ impl TieredSnapshotStore {
             cache: RedisSnapshotCache::connect(redis_url).await?,
         })
     }
+
+    /// 从 PostgreSQL 重建一个记录的 Redis 缓存；没有权威记录时删除旧缓存。
+    /// Rebuild one Redis entry from PostgreSQL; delete stale cache if no durable record exists.
+    ///
+    /// 该方法不改变 Revision，也不执行任何业务写入，适合启动恢复、定时修复和故障排空。
+    /// It never changes Revision or business state and is suitable for recovery and repair jobs.
+    pub async fn repair_cache(&self, record: &RecordKey) -> Result<Option<Revision>, StorageError> {
+        let snapshot = self.postgres.load(record).await?;
+        match snapshot {
+            Some(snapshot) => {
+                let revision = snapshot.revision;
+                self.cache.put(&snapshot).await?;
+                Ok(Some(revision))
+            }
+            None => {
+                self.cache.delete(record).await?;
+                Ok(None)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -568,7 +599,16 @@ impl AsyncSnapshotStore for TieredSnapshotStore {
     type Error = StorageError;
 
     async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, Self::Error> {
-        if let Some(snapshot) = self.cache.get(record).await? {
+        // Redis是加速层；读取失败必须回源权威PostgreSQL，不能把缓存故障扩大成数据不可用。
+        // Redis is an acceleration layer; read failures must fall back to authoritative PostgreSQL.
+        let cached = match self.cache.get(record).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, namespace = %record.namespace, key = %record.key, "snapshot cache read failed; falling back to postgres");
+                None
+            }
+        };
+        if let Some(snapshot) = cached {
             return Ok(Some(snapshot));
         }
 
