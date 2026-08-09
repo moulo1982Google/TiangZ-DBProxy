@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/dbproxy-core"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+authors = ["郑昕"]
+repository = "https://github.com/moulo1982Google/TiangZ-DBProxy"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
