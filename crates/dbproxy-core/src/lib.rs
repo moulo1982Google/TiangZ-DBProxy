@@ -107,6 +107,22 @@ pub trait SnapshotStore {
     fn save(&mut self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, StoreError>;
 }
 
+/// 真实存储适配器使用的异步快照接口。
+/// Async snapshot contract used by real storage adapters.
+///
+/// `SnapshotStore` 保留给同步测试和纯内存实现；网络或数据库适配器必须使用本接口，
+/// 避免把阻塞 I/O 带入 TiangZ 的业务线程。
+/// `SnapshotStore` remains for synchronous tests and memory-only implementations;
+/// network and database adapters use this contract so blocking I/O stays out of the game thread.
+#[async_trait::async_trait]
+pub trait AsyncSnapshotStore {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, Self::Error>;
+
+    async fn save(&mut self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, Self::Error>;
+}
+
 #[derive(Clone, Debug)]
 struct IdempotencyReceipt {
     record: RecordKey,

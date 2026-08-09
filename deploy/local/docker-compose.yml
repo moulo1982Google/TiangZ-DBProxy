@@ -1,0 +1,48 @@
+name: tiangz-dbproxy-local
+
+services:
+  postgres:
+    image: postgres:18.4-bookworm
+    container_name: tiangz-dbproxy-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DBPROXY_POSTGRES_USER:?DBPROXY_POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${DBPROXY_POSTGRES_PASSWORD:?DBPROXY_POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${DBPROXY_POSTGRES_DB:?DBPROXY_POSTGRES_DB is required}
+    ports:
+      - "127.0.0.1:${DBPROXY_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # PostgreSQL 18 使用按大版本划分的子目录，必须挂载整个父目录。
+      # PostgreSQL 18 stores data below a major-version directory; mount the parent volume.
+      - tiangz-dbproxy-postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:8.8.1-trixie
+    container_name: tiangz-dbproxy-redis
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${DBPROXY_REDIS_PASSWORD:?DBPROXY_REDIS_PASSWORD is required}
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${DBPROXY_REDIS_PASSWORD:?DBPROXY_REDIS_PASSWORD is required}
+    ports:
+      - "127.0.0.1:${DBPROXY_REDIS_PORT:-6379}:6379"
+    volumes:
+      - tiangz-dbproxy-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  tiangz-dbproxy-postgres-data:
+  tiangz-dbproxy-redis-data:

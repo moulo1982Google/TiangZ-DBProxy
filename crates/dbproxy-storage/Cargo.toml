@@ -1,0 +1,18 @@
+[package]
+name = "tiangz-dbproxy-storage"
+version = "0.1.1"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "TiangZ DBProxy 的 PostgreSQL 权威存储与 Redis 缓存适配器"
+
+[dependencies]
+async-trait.workspace = true
+bincode.workspace = true
+redis.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tracing.workspace = true
+tiangz-dbproxy-core = { path = "../dbproxy-core" }

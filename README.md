@@ -14,15 +14,18 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 
 ## 当前状态
 
-`v0.1.0` 只冻结第一版核心语义：
+`v0.1.1` 是当前工作版本；`v0.1.0` 首先冻结了第一版核心语义，当前已继续接入真实存储适配：
 
 - `RecordKey`：`namespace + key`
 - `Revision`：由 DBProxy 生成的单调版本号
 - `SnapshotWrite`：带 `expected_revision` 的条件写入
 - `request_id`：重试时必须保持不变的幂等键
 - `InMemorySnapshotStore`：只用于测试，不保证重启恢复
+- `PostgresSnapshotStore`：PostgreSQL 权威快照、CAS 和幂等写入
+- `RedisSnapshotCache`：只缓存 PostgreSQL 已提交的快照
+- `TieredSnapshotStore`：固定按照 PostgreSQL -> Redis 的顺序写入
 
-Redis、真实数据库和网络服务尚未加入，避免在核心语义未验证前绑定具体数据库方案。
+当前仍没有网络服务、鉴权、TiangZ Repository 或生产部署配置。Redis/PostgreSQL 适配只在独立 crate 中提供，避免业务代码直接依赖具体数据库。
 
 ## 开发
 
@@ -31,6 +34,17 @@ cargo test --workspace --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked
 ```
+
+本机启动 PostgreSQL 和 Redis：
+
+```powershell
+docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml up -d
+$env:DBPROXY_POSTGRES_URL = "postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz"
+$env:DBPROXY_REDIS_URL = "redis://:tiangz_dev@127.0.0.1:6379/0"
+cargo test -p tiangz-dbproxy-storage --test postgres_redis --locked -- --ignored --nocapture
+```
+
+本机开发账号只绑定回环地址：PostgreSQL 用户和数据库都是 `tiangz`，密码是 `tiangz_dev`；Redis 密码也是 `tiangz_dev`。这些凭据只适用于本地开发，不能复制到线上。
 
 ## 设计原则
 
