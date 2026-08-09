@@ -1,4 +1,6 @@
 /target/
+/node_modules/
+/sdk/typescript/dist/
 /.idea/
 .vscode/
 *.swp

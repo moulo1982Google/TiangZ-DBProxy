@@ -1,0 +1,34 @@
+{
+  "name": "@tiangz/dbproxy-sdk",
+  "version": "0.3.0",
+  "description": "TiangZ DBProxy 的运行时无关 TypeScript SDK",
+  "license": "Apache-2.0",
+  "author": "郑昕",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/moulo1982Google/TiangZ-DBProxy.git"
+  },
+  "type": "module",
+  "main": "./sdk/typescript/dist/index.js",
+  "types": "./sdk/typescript/dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./sdk/typescript/dist/index.d.ts",
+      "import": "./sdk/typescript/dist/index.js"
+    }
+  },
+  "files": [
+    "sdk/typescript/dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "codegen:typescript": "node tools/generate_typescript_protocol_lock.mjs",
+    "build:typescript": "npm run codegen:typescript && tsc -p sdk/typescript/tsconfig.json",
+    "test:typescript": "npm run build:typescript && node --test sdk/typescript/test/*.test.mjs",
+    "prepare": "npm run build:typescript"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.0"
+  }
+}

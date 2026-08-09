@@ -160,6 +160,7 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 - [x] Rust TCP 网络服务、版本化 Protobuf 和协议指纹
 - [x] 内部共享令牌鉴权；租户级配额与隔离尚未实现
 - [x] Rust 异步客户端与按 RecordKey 分片的连接池
+- [x] 运行时无关TypeScript SDK、协议指纹锁和可插拔Transport
 - [x] Redis backlog 后台消费者和有限停机窗口
 - [ ] 批量读取和批量写入
 - Prometheus 指标
@@ -191,3 +192,5 @@ TiangZ Repository
 `SaveSnapshot`和`ApplyTransaction`的响应代表PostgreSQL已经提交；`EnqueueSnapshot`响应只代表Redis AOF backlog接收。调用方必须根据数据等级选择接口，不能把`EnqueueSnapshot`用于货币、背包、交易或奖励确认。
 
 一个SDK连接内有且只有一个在途请求，避免超时后响应错位。需要并发时使用`DbProxyClientPool`；同一RecordKey稳定落在同一连接，不同记录可以并行。服务端同样按RecordKey选择独立`TieredSnapshotStore`分片，数据库仍负责跨连接的Revision、唯一键和事务一致性。
+
+TypeScript SDK不直接假定Node或Deno网络API，而是定义`DbProxyTransport`。宿主Transport负责真实TCP、连接池、超时和重连，SDK负责参数校验、Payload所有权与四种RPC的ACK语义。这样TiangZ嵌入式V8、Node工具和未来其他TS宿主可以共用同一业务接口，而不把某个运行时能力带进DBProxy核心。

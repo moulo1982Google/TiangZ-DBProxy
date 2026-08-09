@@ -14,7 +14,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 
 ## 当前状态
 
-`v0.2.0` 是当前工作版本。`v0.1.x` 冻结核心语义、真实存储、关键事务和 Redis AOF 持久积压；`v0.2.0` 第一次把这些能力作为独立网络服务暴露：
+`v0.3.0` 是当前工作版本。`v0.1.x` 冻结核心语义、真实存储、关键事务和 Redis AOF 持久积压；`v0.2.0` 第一次把这些能力作为独立网络服务暴露，`v0.3.0` 增加运行时无关的 TypeScript SDK：
 
 - `RecordKey`：`namespace + key`
 - `Revision`：由 DBProxy 生成的单调版本号
@@ -33,10 +33,11 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 - `dbproxy-protocol`：版本化 Protobuf、协议指纹和 8 MiB 默认有界帧
 - `dbproxy-server`：内部令牌握手、按 RecordKey 分片的真实存储连接和持久积压消费者
 - `dbproxy-client`：Rust 异步客户端及多连接池；TiangZ 不需要引用存储 crate
+- `@tiangz/dbproxy-sdk`：TypeScript稳定类型、参数校验、防御性Payload复制和可插拔Transport；不绑定Node、Deno或TiangZ
 - `fault_matrix.ps1`：显式停止/恢复本机容器，验证 Redis、PostgreSQL 和快照积压恢复边界
 - `network_smoke.ps1`：验证 Rust SDK -> TCP -> DBProxy -> Redis/PostgreSQL 完整闭环
 
-当前还没有 TypeScript SDK、TiangZ Repository、批量 RPC、Prometheus 指标和生产容器编排。这些仍属于后续阶段，不能因为 TCP 冒烟通过就宣称完成了线上接入。
+当前还没有 TiangZ Repository、批量 RPC、Prometheus 指标和生产容器编排。TypeScript SDK只冻结通用语义，物理I/O由各宿主Transport实现；不能因为SDK和TCP冒烟通过就宣称完成了线上接入。
 
 ## 开发
 
@@ -44,6 +45,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 cargo test --workspace --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked
+npm run test:typescript
 ```
 
 本机启动 PostgreSQL 和 Redis：
@@ -82,6 +84,20 @@ powershell -ExecutionPolicy Bypass -File tools/network_smoke.ps1
 3. Redis 不是最终一致性的替代品。缓存和持久库的责任、故障恢复顺序必须由适配器明确实现。
 4. 单记录关键事务与普通快照分开；多记录事务、事件 Outbox 和跨域一致性等更高阶能力，等故障矩阵和单记录语义稳定后再扩展。
 5. TiangZ 的主工程不直接依赖 DBProxy 的内部模块，只依赖版本化协议或客户端 SDK。
+
+## TypeScript SDK
+
+SDK以`DbProxyTransport`隔离宿主I/O。业务或框架适配层创建`DbProxyClient`后，只调用`Load`、`Save`、`EnqueueSnapshot`和`ApplyTransaction`；SDK不会生成幂等ID，也不会在失败后偷偷换ID重试。
+
+```ts
+import { DbProxyClient, type DbProxyTransport } from "@tiangz/dbproxy-sdk";
+
+const transport: DbProxyTransport = createHostTransport();
+const client = new DbProxyClient(transport);
+const snapshot = await client.Load({ namespace: "player", key: "1001" });
+```
+
+协议版本和SHA-256指纹由`tools/generate_typescript_protocol_lock.mjs`从权威`dbproxy.proto`生成。修改协议后必须同时运行Rust测试和`npm run test:typescript`，禁止手工维护两份指纹。
 
 ## 网络边界
 
