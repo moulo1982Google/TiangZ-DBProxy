@@ -30,8 +30,15 @@ docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml p
 powershell -ExecutionPolicy Bypass -File tools/run_local.ps1
 ```
 
+普通启动参数位于`configs/local.json`，`configs/dbproxy.schema.json`提供字段提示；连接串和认证令牌仍从`.env`引用的环境变量读取。
 默认监听`127.0.0.1:7800`，本机 SDK 使用的开发令牌是
 `tiangz-dbproxy-local-token-2026`。该令牌只用于回环地址开发，生产环境必须替换并通过密钥系统注入。
+
+指定另一份配置时使用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/run_local.ps1 -ConfigFile configs/local.json
+```
 
 停止容器但保留数据：
 

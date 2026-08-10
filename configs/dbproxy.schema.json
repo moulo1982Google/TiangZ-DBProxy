@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/moulo1982Google/TiangZ-DBProxy/configs/dbproxy.schema.json",
+  "title": "TiangZ DBProxy Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["configVersion", "server", "storage"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "configVersion": { "const": 1 },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["listenAddr", "authTokenEnv"],
+      "properties": {
+        "listenAddr": { "type": "string", "description": "单个DBProxy实例的监听地址。" },
+        "authTokenEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "认证令牌所在的环境变量名。" },
+        "maxFrameBytes": { "type": "integer", "minimum": 1, "default": 8388608 },
+        "handshakeTimeoutMs": { "type": "integer", "minimum": 1, "default": 5000 },
+        "shutdownGraceMs": { "type": "integer", "minimum": 1, "default": 5000 }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["postgresUrlEnv", "redisUrlEnv"],
+      "properties": {
+        "postgresUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+        "redisUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+        "shards": { "type": "integer", "minimum": 1, "default": 4 }
+      }
+    },
+    "backlog": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workers": { "type": "integer", "minimum": 1, "default": 1 },
+        "leaseMs": { "type": "integer", "minimum": 1, "default": 30000 },
+        "idleDelayMs": { "type": "integer", "minimum": 1, "default": 20 },
+        "failureDelayMs": { "type": "integer", "minimum": 1, "default": 1000 }
+      }
+    },
+    "logging": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "filterEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "default": "RUST_LOG" },
+        "defaultFilter": { "type": "string", "minLength": 1, "default": "info" }
+      }
+    }
+  }
+}

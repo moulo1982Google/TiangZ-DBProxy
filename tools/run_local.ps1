@@ -1,5 +1,6 @@
 param(
-    [string]$EnvironmentFile = "deploy/local/.env"
+    [string]$EnvironmentFile = "deploy/local/.env",
+    [string]$ConfigFile = "configs/local.json"
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,7 +22,7 @@ try {
         [Environment]::SetEnvironmentVariable($name, $content, "Process")
     }
 
-    cargo run -p tiangz-dbproxy-server --locked
+    cargo run -p tiangz-dbproxy-server --locked -- --config $ConfigFile
     if ($LASTEXITCODE -ne 0) {
         throw "DBProxy exited with code $LASTEXITCODE"
     }

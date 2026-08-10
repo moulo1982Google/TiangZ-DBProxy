@@ -1,0 +1,26 @@
+{
+  "$schema": "./dbproxy.schema.json",
+  "configVersion": 1,
+  "server": {
+    "listenAddr": "127.0.0.1:7800",
+    "authTokenEnv": "DBPROXY_AUTH_TOKEN",
+    "maxFrameBytes": 8388608,
+    "handshakeTimeoutMs": 5000,
+    "shutdownGraceMs": 5000
+  },
+  "storage": {
+    "postgresUrlEnv": "DBPROXY_POSTGRES_URL",
+    "redisUrlEnv": "DBPROXY_REDIS_URL",
+    "shards": 4
+  },
+  "backlog": {
+    "workers": 1,
+    "leaseMs": 30000,
+    "idleDelayMs": 20,
+    "failureDelayMs": 1000
+  },
+  "logging": {
+    "filterEnv": "RUST_LOG",
+    "defaultFilter": "info"
+  }
+}

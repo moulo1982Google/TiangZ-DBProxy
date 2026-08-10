@@ -40,6 +40,16 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 
 TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transport适配，并完成真实重启恢复冒烟；这些领域Payload与恢复逻辑不属于本仓库，DBProxy仍不依赖TiangZ。当前尚未完成批量RPC、Prometheus指标、生产容器编排和TiangZ关键经济事务接入，不能因为Snapshot恢复通过就宣称完成了线上持久化。
 
+## 启动配置
+
+DBProxy使用带`configVersion: 1`的严格JSON保存普通启动参数，默认读取`configs/local.json`，并由`configs/dbproxy.schema.json`提供编辑器提示。连接串和认证令牌不能写进JSON；配置文件只记录环境变量名，由部署环境注入实际密钥：
+
+```powershell
+cargo run -p tiangz-dbproxy-server --locked -- --config configs/local.json
+```
+
+未知字段、零worker、零lease、空密钥变量会在建立网络连接前直接报错。当前服务端配置只有一个监听地址；未来的多Endpoint属于TiangZ客户端故障切换能力，不在本轮实现。
+
 ## 开发
 
 ```powershell
@@ -85,6 +95,7 @@ powershell -ExecutionPolicy Bypass -File tools/network_smoke.ps1
 3. Redis 不是最终一致性的替代品。缓存和持久库的责任、故障恢复顺序必须由适配器明确实现。
 4. 单记录关键事务与普通快照分开；多记录事务、事件 Outbox 和跨域一致性等更高阶能力，等故障矩阵和单记录语义稳定后再扩展。
 5. TiangZ 的主工程不直接依赖 DBProxy 的内部模块，只依赖版本化协议或客户端 SDK。
+6. 普通Entity可以由TiangZ的`.native`生成版本化Codec和通用Repository；DBProxy仍只维护固定通用表。复杂查询、二级索引和跨玩家事务必须使用专门的领域存储设计。
 
 ## TypeScript SDK
 

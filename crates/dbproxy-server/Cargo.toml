@@ -9,6 +9,8 @@ description = "TiangZ DBProxy 的独立 TCP 服务"
 
 [dependencies]
 async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tiangz-dbproxy-core = { path = "../dbproxy-core" }
 tiangz-dbproxy-protocol = { path = "../dbproxy-protocol" }

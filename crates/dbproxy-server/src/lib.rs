@@ -5,6 +5,8 @@
 //! 必须留在 TiangZ。The server only dispatches generic snapshots and single-record transactions;
 //! game repositories, entity lifecycle, and business validation stay in TiangZ.
 
+pub mod config;
+
 use std::{
     fmt,
     hash::{Hash, Hasher},

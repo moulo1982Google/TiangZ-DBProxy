@@ -5,6 +5,8 @@
 DBProxy 不是游戏逻辑服务器，也不是把所有业务对象搬进数据库的 ORM。
 它是一个独立的持久化边界：业务服务提交已经序列化好的快照，DBProxy 负责版本、幂等、缓存和最终存储。
 
+普通Entity不需要开发者为每一种类型设计PostgreSQL表。TiangZ在`.native`中声明版本化结构并生成Codec/Repository，DBProxy统一写入`dbproxy_snapshots`等固定通用表。这个便利只覆盖“按稳定Key读写完整记录”；需要按业务字段检索、排行榜、拍卖行、跨玩家交易或多记录原子提交时，仍要建立专门的领域表、索引和事务边界。
+
 ```text
 TiangZ Map/Login/其他业务服务
         |
@@ -152,7 +154,7 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 - [x] Redis读取故障回源、PostgreSQL写入故障拒绝成功、缓存修复和原操作ID重试
 - [x] 进程内普通快照积压合并、有界Flush和PostgreSQL恢复后重试
 - [x] Redis AOF 持久积压、lease/ACK、DBProxy重启后的重新领取和新快照替代旧快照
-- [ ] 长时间故障、死信/积压指标、Redis高可用和多消费者容量控制
+- [ ] 长时间故障、死信/积压指标和多消费者容量控制；Redis/PostgreSQL高可用由云厂商提供，不在本项目实现
 - [ ] 其他数据库Adapter；先不同时实现MongoDB、MySQL和PostgreSQL多套方言
 
 ### Phase 3：DBProxy 服务
@@ -162,6 +164,8 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 - [x] Rust 异步客户端与按 RecordKey 分片的连接池
 - [x] 运行时无关TypeScript SDK、协议指纹锁和可插拔Transport
 - [x] Redis backlog 后台消费者和有限停机窗口
+- [ ] 多Endpoint客户端：按RecordKey稳定选择、实例熔断、保留原幂等ID故障切换和恢复探测
+- [ ] 两个对等DBProxy实例共享云Redis/PostgreSQL，并完成请求中断、提交后丢响应、Backlog lease接管和全实例不可用测试
 - [ ] 批量读取和批量写入
 - Prometheus 指标
 - [ ] 生产级优雅停机指标、死信处理和连接自动恢复
