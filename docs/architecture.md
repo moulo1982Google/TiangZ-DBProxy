@@ -1,5 +1,9 @@
 # DBProxy 架构说明
 
+## 开发与发布锁定
+
+当前是持续开发阶段。Cargo依赖、工作区版本和实现细节允许迭代，开发命令不强制`--locked`；只有准备发布正式Tag时，才统一审查`Cargo.lock`、版本、协议指纹，并使用`cargo test --workspace --locked`和`cargo clippy --workspace --all-targets --locked`完成发布验证。Protobuf版本与协议指纹属于运行时兼容性契约，即使开发阶段也不能让客户端和服务端静默使用不匹配的协议。
+
 ## 世界观
 
 DBProxy 不是游戏逻辑服务器，也不是把所有业务对象搬进数据库的 ORM。
@@ -10,16 +14,15 @@ DBProxy 不是游戏逻辑服务器，也不是把所有业务对象搬进数据
 ```text
 TiangZ Map/Login/其他业务服务
         |
-        | Snapshot Payload + Schema + Revision + RequestId
+        | [DBProxy-1, DBProxy-2]：同一套客户端候选地址
         v
-     DBProxy
+  两个无状态 DBProxy 对等实例
         |
-        +-- Redis：已提交快照缓存
-        +-- PostgreSQL：权威快照、Revision 和幂等记录
-        +-- 其他数据库：后续适配
-        +-- MongoDB：文档快照
-        +-- 文件/对象存储：备份与迁移
+        +-- Redis：已提交快照缓存、普通快照持久 backlog
+        +-- PostgreSQL：权威快照、Revision、幂等记录和跨记录事务
 ```
+
+DBProxy 实例之间不复制内存状态，也不互相转发请求。任意实例都可以处理任意请求；共享状态在 PostgreSQL 和 Redis 中。这样故障切换不需要 Leader 选举，客户端只要保持同一幂等 ID 即可安全重放。
 
 ## 第一阶段冻结的语义
 
@@ -133,7 +136,24 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 
 这个backlog依赖Redis AOF和持久数据卷，Redis本身不是PostgreSQL的权威业务库。Redis数据卷损坏、AOF未持久化、单Redis节点故障和跨机复制仍不在本版本保证范围；后续网络服务阶段再增加backlog指标、死信处理、Redis高可用和多消费者容量控制。
 
-当前表为`dbproxy_snapshots`、`dbproxy_idempotency`和`dbproxy_transactions`，迁移脚本位于`crates/dbproxy-storage/migrations/001_snapshot.sql`与`002_transactional.sql`。启动迁移使用PostgreSQL事务级advisory lock，多个DBProxy进程可以并发启动而不会竞争DDL。这是独立适配器契约，不等于TiangZ已经完成网络化DBProxy接入。
+当前表为`dbproxy_snapshots`、`dbproxy_idempotency`、`dbproxy_transactions`和`dbproxy_multi_transactions/dbproxy_multi_transaction_records`，迁移脚本位于`crates/dbproxy-storage/migrations/001_snapshot.sql`、`002_transactional.sql`与`003_multi_transactional.sql`。启动迁移使用PostgreSQL事务级advisory lock，多个DBProxy进程可以并发启动而不会竞争DDL。这是独立适配器契约，不等于TiangZ已经完成网络化DBProxy接入。
+
+### 跨记录原子事务
+
+`MultiRecordTransactionalWrite` 用一个 `operation_id` 描述一组记录更新：
+
+```text
+业务 Repository
+    -> 校验所有玩家/记录，生成完整的新 Payload
+    -> ApplyMultiTransaction(operationId, writes[], result)
+    -> DBProxy 按 RecordKey 排序加锁
+    -> 一次 PostgreSQL transaction 完成全部 CAS 和全部快照写入
+    -> 保存整组回执
+```
+
+其中任何一条记录的 Revision 不匹配，整个事务回滚，前面的记录也不会改变。重复 `operation_id` 必须携带完全相同的记录集合、版本、Payload 和 result，否则返回 `OPERATION_CONFLICT`。跨玩家交易、玩家转账、共享奖励转移可以使用它；DBProxy 不负责判断“玩家是否有钱”或“交易是否合法”，这些规则必须在业务侧先生成纯数据计划。
+
+该事务要求所有记录共享同一个 PostgreSQL 权威存储。它不是跨数据库的两阶段提交；如果未来不同领域必须落到不同数据库，需要单独设计 Outbox/补偿，不能把这个 API 当成万能分布式事务。
 
 本机依赖使用`deploy/local/docker-compose.yml`，固定为PostgreSQL 18.4 Bookworm和Redis 8.8.1 Trixie，数据使用Docker命名卷保存。
 
@@ -164,8 +184,9 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 - [x] Rust 异步客户端与按 RecordKey 分片的连接池
 - [x] 运行时无关TypeScript SDK、协议指纹锁和可插拔Transport
 - [x] Redis backlog 后台消费者和有限停机窗口
-- [ ] 多Endpoint客户端：按RecordKey稳定选择、实例熔断、保留原幂等ID故障切换和恢复探测
-- [ ] 两个对等DBProxy实例共享云Redis/PostgreSQL，并完成请求中断、提交后丢响应、Backlog lease接管和全实例不可用测试
+- [x] 多Endpoint客户端：首选地址、备用地址、连接失效后的顺序切换，并保留原幂等ID重放
+- [x] 两个对等DBProxy实例共享云Redis/PostgreSQL；网络测试覆盖请求中断、同ID重放和全候选失败
+- [x] 跨记录原子事务：固定排序加锁、整组CAS、整组回执和重复提交恢复
 - [ ] 批量读取和批量写入
 - Prometheus 指标
 - [ ] 生产级优雅停机指标、死信处理和连接自动恢复
@@ -178,7 +199,7 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 - [ ] 批量登录恢复与周期快照
 - [ ] 关键经济事务、崩溃窗口和节点接管验收
 
-多记录一致性、跨域事务和 Outbox 在单记录 Snapshot/Transactional 语义通过真实故障测试后再进入设计。
+批量读取/写入、Outbox、跨数据库补偿和生产节点接管仍是后续阶段；本版本的跨记录事务只覆盖同一 PostgreSQL 权威库内的整组快照提交。
 
 ## 网络服务边界
 
@@ -188,8 +209,9 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 TiangZ Repository
     -> DbProxyClientPool
     -> ClientHello(version + fingerprint + token)
-    -> Load / Save / Enqueue / ApplyTransaction
-    -> StorageBackend(record shard)
+    -> Load / Save / Enqueue / ApplyTransaction / LoadTransaction
+    -> ApplyMultiTransaction / LoadMultiTransaction
+    -> StorageBackend(record or operation shard)
     -> PostgreSQL / Redis
 ```
 
