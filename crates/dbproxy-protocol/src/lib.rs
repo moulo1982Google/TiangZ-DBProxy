@@ -11,7 +11,7 @@ use prost::Message;
 use thiserror::Error;
 use tiangz_dbproxy_core::{
     RecordKey as CoreRecordKey, Revision, SnapshotEnvelope as CoreSnapshotEnvelope, SnapshotWrite,
-    StoreError, TransactionalWrite,
+    StoreError, TransactionalRecordWrite, TransactionalWrite,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -34,6 +34,7 @@ pub const MAX_NAMESPACE_BYTES: usize = 128;
 pub const MAX_RECORD_KEY_BYTES: usize = 512;
 pub const MAX_SCHEMA_BYTES: usize = 256;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+pub const MAX_TRANSACTION_RECORDS: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -227,6 +228,42 @@ impl TryFrom<wire::ApplyTransactionRequest> for TransactionalWrite {
             expected_revision: Revision(value.expected_revision),
             payload: value.payload,
             result: value.result,
+            updated_at_unix_ms: value.updated_at_unix_ms,
+        })
+    }
+}
+
+impl From<&TransactionalRecordWrite> for wire::TransactionalRecordWrite {
+    fn from(value: &TransactionalRecordWrite) -> Self {
+        Self {
+            record: Some((&value.record).into()),
+            schema: value.schema.clone(),
+            schema_version: value.schema_version,
+            expected_revision: value.expected_revision.0,
+            payload: value.payload.clone(),
+            updated_at_unix_ms: value.updated_at_unix_ms,
+        }
+    }
+}
+
+impl TryFrom<wire::TransactionalRecordWrite> for TransactionalRecordWrite {
+    type Error = ProtocolError;
+
+    fn try_from(value: wire::TransactionalRecordWrite) -> Result<Self, Self::Error> {
+        validate_text(
+            &value.schema,
+            "transactional_record.schema",
+            MAX_SCHEMA_BYTES,
+        )?;
+        Ok(Self {
+            record: value
+                .record
+                .ok_or(ProtocolError::MissingField("transactional_record.record"))?
+                .try_into()?,
+            schema: value.schema,
+            schema_version: value.schema_version,
+            expected_revision: Revision(value.expected_revision),
+            payload: value.payload,
             updated_at_unix_ms: value.updated_at_unix_ms,
         })
     }

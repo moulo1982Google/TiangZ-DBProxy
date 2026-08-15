@@ -40,6 +40,16 @@ powershell -ExecutionPolicy Bypass -File tools/run_local.ps1
 powershell -ExecutionPolicy Bypass -File tools/run_local.ps1 -ConfigFile configs/local.json
 ```
 
+本机启动两个对等 DBProxy：
+
+```powershell
+$env:DBPROXY_AUTH_TOKEN = "tiangz-dbproxy-local-token-2026"
+Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File tools/run_local.ps1 -ConfigFile configs/local-1.json" -WindowStyle Hidden
+Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File tools/run_local.ps1 -ConfigFile configs/local-2.json" -WindowStyle Hidden
+```
+
+客户端把 `127.0.0.1:7800` 配为首选，把 `127.0.0.1:7801` 配为备用。两份配置必须继续指向同一 PostgreSQL/Redis；停掉其中一个只验证客户端切换，不应删除共享数据卷。
+
 停止容器但保留数据：
 
 ```powershell

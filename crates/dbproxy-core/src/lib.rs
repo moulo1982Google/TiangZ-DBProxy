@@ -10,9 +10,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod flush;
+mod multi_transaction;
 mod transaction;
 
 pub use flush::{SnapshotFlushError, SnapshotFlushQueue, SnapshotFlushReport};
+pub use multi_transaction::{
+    AsyncMultiRecordTransactionStore, InMemoryMultiRecordTransactionStore,
+    MultiRecordTransactionReceipt, MultiRecordTransactionalWrite,
+    MultiRecordTransactionalWriteOutcome, TransactionRecordReceipt, TransactionalRecordWrite,
+};
 pub use transaction::{
     AsyncTransactionalStore, InMemoryTransactionalStore, TransactionReceipt, TransactionStore,
     TransactionalWrite, TransactionalWriteOutcome,
@@ -112,6 +118,10 @@ pub enum StoreError {
     },
     #[error("revision exhausted for {record:?}")]
     RevisionExhausted { record: RecordKey },
+    #[error("multi-record transaction must contain at least one record")]
+    EmptyTransactionRecords,
+    #[error("multi-record transaction contains duplicate record {record:?}")]
+    DuplicateTransactionRecord { record: RecordKey },
 }
 
 /// DBProxy 适配器必须实现的最小快照接口。

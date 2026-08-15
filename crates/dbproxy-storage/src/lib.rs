@@ -9,9 +9,11 @@ use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
 use thiserror::Error;
 use tiangz_dbproxy_core::{
-    AsyncSnapshotStore, AsyncTransactionalStore, RecordKey, Revision, SnapshotEnvelope,
-    SnapshotWrite, SnapshotWriteOutcome, StoreError, TransactionReceipt, TransactionalWrite,
-    TransactionalWriteOutcome,
+    AsyncMultiRecordTransactionStore, AsyncSnapshotStore, AsyncTransactionalStore,
+    MultiRecordTransactionReceipt, MultiRecordTransactionalWrite,
+    MultiRecordTransactionalWriteOutcome, RecordKey, Revision, SnapshotEnvelope, SnapshotWrite,
+    SnapshotWriteOutcome, StoreError, TransactionReceipt, TransactionRecordReceipt,
+    TransactionalRecordWrite, TransactionalWrite, TransactionalWriteOutcome,
 };
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, Row};
@@ -22,6 +24,7 @@ pub use backlog::{RedisSnapshotBacklog, SnapshotBacklogAck, SnapshotBacklogLease
 
 const SNAPSHOT_MIGRATION: &str = include_str!("../migrations/001_snapshot.sql");
 const TRANSACTION_MIGRATION: &str = include_str!("../migrations/002_transactional.sql");
+const MULTI_TRANSACTION_MIGRATION: &str = include_str!("../migrations/003_multi_transactional.sql");
 const MIGRATION_LOCK_ID: i64 = 8_390_417_203;
 
 /// 存储适配器错误；PostgreSQL 错误不会被包装成“保存成功”。
@@ -97,6 +100,47 @@ fn validate_receipt_lookup(operation_id: &str, record: &RecordKey) -> Result<(),
     }
     if record.key.trim().is_empty() {
         return Err(StoreError::InvalidKey("key is empty").into());
+    }
+    Ok(())
+}
+
+fn validate_multi_transaction_request(
+    request: &MultiRecordTransactionalWrite,
+) -> Result<(), StorageError> {
+    if request.operation_id.trim().is_empty() {
+        return Err(StoreError::EmptyOperationId.into());
+    }
+    if request.writes.is_empty() {
+        return Err(StoreError::EmptyTransactionRecords.into());
+    }
+    let mut records = request
+        .writes
+        .iter()
+        .map(|write| write.record.clone())
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        left.namespace
+            .cmp(&right.namespace)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    for pair in records.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(StoreError::DuplicateTransactionRecord {
+                record: pair[0].clone(),
+            }
+            .into());
+        }
+    }
+    for write in &request.writes {
+        if write.record.namespace.trim().is_empty() {
+            return Err(StoreError::InvalidKey("namespace is empty").into());
+        }
+        if write.record.key.trim().is_empty() {
+            return Err(StoreError::InvalidKey("key is empty").into());
+        }
+        if write.schema.trim().is_empty() {
+            return Err(StoreError::InvalidKey("schema is empty").into());
+        }
     }
     Ok(())
 }
@@ -239,6 +283,9 @@ impl PostgresSnapshotStore {
             .await?;
         transaction.batch_execute(SNAPSHOT_MIGRATION).await?;
         transaction.batch_execute(TRANSACTION_MIGRATION).await?;
+        transaction
+            .batch_execute(MULTI_TRANSACTION_MIGRATION)
+            .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -543,6 +590,276 @@ impl AsyncTransactionalStore for PostgresSnapshotStore {
     }
 }
 
+#[async_trait]
+impl AsyncMultiRecordTransactionStore for PostgresSnapshotStore {
+    type Error = StorageError;
+
+    async fn load_multi_receipt(
+        &self,
+        operation_id: &str,
+        records: &[RecordKey],
+    ) -> Result<Option<MultiRecordTransactionReceipt>, Self::Error> {
+        if operation_id.trim().is_empty() {
+            return Err(StoreError::EmptyOperationId.into());
+        }
+        if records.is_empty() {
+            return Err(StoreError::EmptyTransactionRecords.into());
+        }
+        let expected_records = sorted_unique_records(records)?;
+        let client = self.client.lock().await;
+        let header = client
+            .query_opt(
+                "SELECT result, record_count FROM dbproxy_multi_transactions WHERE operation_id = $1",
+                &[&operation_id],
+            )
+            .await?;
+        let Some(header) = header else {
+            return Ok(None);
+        };
+        let rows = client
+            .query(
+                "SELECT namespace, record_key, new_revision FROM dbproxy_multi_transaction_records WHERE operation_id = $1 ORDER BY namespace, record_key",
+                &[&operation_id],
+            )
+            .await?;
+        let expected_count: i64 = header.get(1);
+        if expected_count < 0
+            || rows.len() != expected_records.len()
+            || rows.len() as i64 != expected_count
+        {
+            return Err(StoreError::OperationIdConflict {
+                operation_id: operation_id.to_string(),
+            }
+            .into());
+        }
+        let mut receipts = Vec::with_capacity(rows.len());
+        for (row, expected) in rows.iter().zip(expected_records.iter()) {
+            if row.get::<_, String>(0) != expected.namespace
+                || row.get::<_, String>(1) != expected.key
+            {
+                return Err(StoreError::OperationIdConflict {
+                    operation_id: operation_id.to_string(),
+                }
+                .into());
+            }
+            receipts.push(TransactionRecordReceipt {
+                record: expected.clone(),
+                new_revision: revision_from_i64(expected, row.get(2))?,
+            });
+        }
+        Ok(Some(MultiRecordTransactionReceipt {
+            operation_id: operation_id.to_string(),
+            records: receipts,
+            result: header.get(0),
+        }))
+    }
+
+    async fn apply_multi(
+        &mut self,
+        request: MultiRecordTransactionalWrite,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, Self::Error> {
+        validate_multi_transaction_request(&request)?;
+        let mut request = request;
+        request.writes.sort_by(|left, right| {
+            left.record
+                .namespace
+                .cmp(&right.record.namespace)
+                .then_with(|| left.record.key.cmp(&right.record.key))
+        });
+
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await?;
+        let operation_id = request.operation_id.clone();
+        let claimed = transaction
+            .query_opt(
+                "INSERT INTO dbproxy_multi_transactions (operation_id, result, record_count, updated_at_unix_ms) VALUES ($1, $2, $3, $4) ON CONFLICT (operation_id) DO NOTHING RETURNING operation_id",
+                &[
+                    &operation_id,
+                    &request.result,
+                    &(request.writes.len() as i64),
+                    &timestamp_to_i64(&request.writes[0].record, request.writes[0].updated_at_unix_ms)?,
+                ],
+            )
+            .await?;
+
+        if claimed.is_none() {
+            let header = transaction
+                .query_one(
+                    "SELECT result, record_count FROM dbproxy_multi_transactions WHERE operation_id = $1",
+                    &[&operation_id],
+                )
+                .await?;
+            let rows = transaction
+                .query(
+                    "SELECT namespace, record_key, schema_name, schema_version, expected_revision, payload, updated_at_unix_ms, new_revision FROM dbproxy_multi_transaction_records WHERE operation_id = $1 ORDER BY namespace, record_key",
+                    &[&operation_id],
+                )
+                .await?;
+            let same_header = header.get::<_, i64>(1) == request.writes.len() as i64
+                && header.get::<_, Vec<u8>>(0) == request.result;
+            let same_records = rows.len() == request.writes.len()
+                && rows
+                    .iter()
+                    .zip(request.writes.iter())
+                    .all(|(row, write)| multi_transaction_row_matches(row, write));
+            if !same_header || !same_records {
+                return Err(StoreError::OperationIdConflict { operation_id }.into());
+            }
+            let records = rows
+                .iter()
+                .zip(request.writes.iter())
+                .map(|(row, write)| {
+                    Ok(TransactionRecordReceipt {
+                        record: write.record.clone(),
+                        new_revision: revision_from_i64(&write.record, row.get(7))?,
+                    })
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?;
+            transaction.commit().await?;
+            return Ok(MultiRecordTransactionalWriteOutcome::Duplicate {
+                records,
+                result: header.get(0),
+            });
+        }
+
+        let mut revisions = Vec::with_capacity(request.writes.len());
+        for write in &request.writes {
+            // 用同一个数据库事务锁住每个逻辑记录，且始终按排序后的顺序加锁，避免跨玩家交易死锁。
+            // Lock records in deterministic order inside one database transaction to avoid trade deadlocks.
+            let lock_key = format!("{}:{}", write.record.namespace, write.record.key);
+            transaction
+                .query_one(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    &[&lock_key],
+                )
+                .await?;
+            let current = transaction
+                .query_opt(
+                    "SELECT revision FROM dbproxy_snapshots WHERE namespace = $1 AND record_key = $2 FOR UPDATE",
+                    &[&write.record.namespace, &write.record.key],
+                )
+                .await?;
+            let actual = current
+                .map(|row| revision_from_i64(&write.record, row.get(0)))
+                .transpose()?
+                .unwrap_or(Revision::ZERO);
+            if actual != write.expected_revision {
+                return Err(StoreError::RevisionConflict {
+                    record: write.record.clone(),
+                    expected: Some(write.expected_revision),
+                    actual,
+                }
+                .into());
+            }
+            let next =
+                Revision(
+                    actual
+                        .0
+                        .checked_add(1)
+                        .ok_or_else(|| StoreError::RevisionExhausted {
+                            record: write.record.clone(),
+                        })?,
+                );
+            revisions.push(next);
+        }
+
+        for (write, revision) in request.writes.iter().zip(revisions.iter()) {
+            let schema_version = schema_version_to_i64(write.schema_version);
+            let updated_at = timestamp_to_i64(&write.record, write.updated_at_unix_ms)?;
+            let new_revision = required_revision_to_i64(&write.record, *revision)?;
+            transaction
+                .execute(
+                    "INSERT INTO dbproxy_snapshots (namespace, record_key, schema_name, schema_version, revision, payload, updated_at_unix_ms) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (namespace, record_key) DO UPDATE SET schema_name = EXCLUDED.schema_name, schema_version = EXCLUDED.schema_version, revision = EXCLUDED.revision, payload = EXCLUDED.payload, updated_at_unix_ms = EXCLUDED.updated_at_unix_ms",
+                    &[
+                        &write.record.namespace,
+                        &write.record.key,
+                        &write.schema,
+                        &schema_version,
+                        &new_revision,
+                        &write.payload,
+                        &updated_at,
+                    ],
+                )
+                .await?;
+            transaction
+                .execute(
+                    "INSERT INTO dbproxy_multi_transaction_records (operation_id, namespace, record_key, schema_name, schema_version, expected_revision, payload, updated_at_unix_ms, new_revision) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    &[
+                        &operation_id,
+                        &write.record.namespace,
+                        &write.record.key,
+                        &write.schema,
+                        &schema_version,
+                        &required_revision_to_i64(&write.record, write.expected_revision)?,
+                        &write.payload,
+                        &updated_at,
+                        &new_revision,
+                    ],
+                )
+                .await?;
+        }
+        transaction.commit().await?;
+        let records = request
+            .writes
+            .iter()
+            .zip(revisions)
+            .map(|(write, new_revision)| TransactionRecordReceipt {
+                record: write.record.clone(),
+                new_revision,
+            })
+            .collect();
+        Ok(MultiRecordTransactionalWriteOutcome::Applied {
+            records,
+            result: request.result,
+        })
+    }
+}
+
+fn sorted_unique_records(records: &[RecordKey]) -> Result<Vec<RecordKey>, StorageError> {
+    if records.is_empty() {
+        return Err(StoreError::EmptyTransactionRecords.into());
+    }
+    let mut sorted = records.to_vec();
+    sorted.sort_by(|left, right| {
+        left.namespace
+            .cmp(&right.namespace)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    for record in &sorted {
+        if record.namespace.trim().is_empty() {
+            return Err(StoreError::InvalidKey("namespace is empty").into());
+        }
+        if record.key.trim().is_empty() {
+            return Err(StoreError::InvalidKey("key is empty").into());
+        }
+    }
+    for pair in sorted.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(StoreError::DuplicateTransactionRecord {
+                record: pair[0].clone(),
+            }
+            .into());
+        }
+    }
+    Ok(sorted)
+}
+
+fn multi_transaction_row_matches(row: &Row, write: &TransactionalRecordWrite) -> bool {
+    let Ok(expected_revision) = i64::try_from(write.expected_revision.0) else {
+        return false;
+    };
+    let Ok(updated_at_unix_ms) = i64::try_from(write.updated_at_unix_ms) else {
+        return false;
+    };
+    row.get::<_, String>(0) == write.record.namespace
+        && row.get::<_, String>(1) == write.record.key
+        && row.get::<_, String>(2) == write.schema
+        && row.get::<_, i64>(3) == i64::from(write.schema_version)
+        && row.get::<_, i64>(4) == expected_revision
+        && row.get::<_, Vec<u8>>(5) == write.payload
+        && row.get::<_, i64>(6) == updated_at_unix_ms
+}
+
 /// Redis 快照缓存；只缓存 PostgreSQL 已提交的 `SnapshotEnvelope`。
 /// Redis snapshot cache; it only caches PostgreSQL-committed envelopes.
 #[derive(Clone)]
@@ -726,6 +1043,44 @@ impl AsyncTransactionalStore for TieredSnapshotStore {
                 })?;
         if let Err(error) = self.cache.put(&snapshot).await {
             return Err(StorageError::CacheSync(error.to_string()));
+        }
+        Ok(outcome)
+    }
+}
+
+#[async_trait]
+impl AsyncMultiRecordTransactionStore for TieredSnapshotStore {
+    type Error = StorageError;
+
+    async fn load_multi_receipt(
+        &self,
+        operation_id: &str,
+        records: &[RecordKey],
+    ) -> Result<Option<MultiRecordTransactionReceipt>, Self::Error> {
+        self.postgres
+            .load_multi_receipt(operation_id, records)
+            .await
+    }
+
+    async fn apply_multi(
+        &mut self,
+        request: MultiRecordTransactionalWrite,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, Self::Error> {
+        let records = request
+            .writes
+            .iter()
+            .map(|write| write.record.clone())
+            .collect::<Vec<_>>();
+        let outcome = self.postgres.apply_multi(request).await?;
+        for record in records {
+            let snapshot = self.postgres.load(&record).await?.ok_or_else(|| {
+                StorageError::MissingAfterWrite {
+                    record: record.clone(),
+                }
+            })?;
+            if let Err(error) = self.cache.put(&snapshot).await {
+                return Err(StorageError::CacheSync(error.to_string()));
+            }
         }
         Ok(outcome)
     }

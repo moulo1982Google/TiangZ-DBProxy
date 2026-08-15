@@ -27,6 +27,8 @@ test("snapshot writes cross the transport boundary as defensive copies", async (
       result: new Uint8Array(),
     }),
     loadTransaction: async () => undefined,
+    applyMultiTransaction: async () => ({ disposition: "applied", records: [], result: new Uint8Array() }),
+    loadMultiTransaction: async () => undefined,
   };
   const payload = Uint8Array.from([1, 2, 3]);
   const client = new DbProxyClient(transport);
@@ -57,6 +59,8 @@ test("queued snapshots reject CAS because ACK only means backlog accepted", () =
       result: new Uint8Array(),
     }),
     loadTransaction: async () => undefined,
+    applyMultiTransaction: async () => ({ disposition: "applied", records: [], result: new Uint8Array() }),
+    loadMultiTransaction: async () => undefined,
   });
 
   assert.throws(() => client.EnqueueSnapshot({
@@ -87,6 +91,8 @@ test("transaction receipt lookup validates identity and returns defensive bytes"
       newRevision: 3n,
       result: source,
     }),
+    applyMultiTransaction: async () => ({ disposition: "applied", records: [], result: new Uint8Array() }),
+    loadMultiTransaction: async () => undefined,
   });
 
   const receipt = await client.LoadTransaction(
@@ -97,6 +103,61 @@ test("transaction receipt lookup validates identity and returns defensive bytes"
 
   assert.equal(receipt?.newRevision, 3n);
   assert.deepEqual([...(receipt?.result ?? [])], [7, 8, 9]);
+});
+
+test("multi-record transaction keeps all records and result defensive", async () => {
+  let captured;
+  const result = Uint8Array.from([4, 5]);
+  const client = new DbProxyClient({
+    load: async () => undefined,
+    save: async () => ({ disposition: "applied", revision: 1n }),
+    enqueueSnapshot: async () => undefined,
+    applyTransaction: async () => ({
+      disposition: "applied",
+      newRevision: 1n,
+      result: new Uint8Array(),
+    }),
+    loadTransaction: async () => undefined,
+    applyMultiTransaction: async (write) => {
+      captured = write;
+      return {
+        disposition: "applied",
+        records: write.writes.map((item, index) => ({ record: item.record, newRevision: BigInt(index + 1) })),
+        result,
+      };
+    },
+    loadMultiTransaction: async () => undefined,
+  });
+  const payload = Uint8Array.from([9]);
+  const returned = await client.ApplyMultiTransaction({
+    operationId: "trade-1",
+    writes: [
+      {
+        record: { namespace: "wallet", key: "buyer" },
+        schema: "wallet.snapshot",
+        schemaVersion: 1,
+        expectedRevision: 0n,
+        payload,
+        updatedAtUnixMs: 1n,
+      },
+      {
+        record: { namespace: "wallet", key: "seller" },
+        schema: "wallet.snapshot",
+        schemaVersion: 1,
+        expectedRevision: 2n,
+        payload: new Uint8Array([8]),
+        updatedAtUnixMs: 1n,
+      },
+    ],
+    result: new Uint8Array([1]),
+  });
+  payload[0] = 0;
+  result[0] = 0;
+  assert.equal(captured.operationId, "trade-1");
+  assert.equal(captured.writes.length, 2);
+  assert.equal(captured.writes[0].payload[0], 9);
+  assert.deepEqual([...returned.result], [4, 5]);
+  assert.deepEqual([...returned.records[1].record.key], [..."seller"]);
 });
 
 test("SDK validation works in a bare V8 without TextEncoder", async () => {
@@ -113,6 +174,8 @@ test("SDK validation works in a bare V8 without TextEncoder", async () => {
         result: new Uint8Array(),
       }),
       loadTransaction: async () => undefined,
+      applyMultiTransaction: async () => ({ disposition: "applied", records: [], result: new Uint8Array() }),
+      loadMultiTransaction: async () => undefined,
     });
     const result = await client.Save({
       requestId: "裸V8-save-1",

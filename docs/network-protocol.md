@@ -29,7 +29,7 @@ client_name           // 只用于日志，不参与授权
 
 版本或指纹不一致返回`PROTOCOL_MISMATCH`；令牌不一致返回`UNAUTHORIZED`。认证成功后再接受RPC。当前共享令牌只解决内部服务最小鉴权，尚不包含租户配额、证书轮换或mTLS。
 
-## 五类 RPC
+## 七类 RPC
 
 ### LoadSnapshot
 
@@ -77,6 +77,26 @@ expected_revision
 
 按`operation_id + RecordKey`读取已经提交的事务回执，返回第一次提交保存的`new_revision/result`。它只用于恢复“PostgreSQL已提交，但调用方在收到响应或应用内存状态前崩溃”的窄窗口；记录不匹配返回`OPERATION_CONFLICT`，不存在返回`None`。DBProxy不会解释result，也不会替业务判断是否应该继续执行操作。
 
+### ApplyMultiTransaction
+
+用于同一 PostgreSQL 权威库内的跨记录关键事务。请求携带一个 `operation_id`、最多 256 条不重复的 `TransactionalRecordWrite` 和不透明的业务 `result`：
+
+```text
+1. 按 namespace + key 排序
+2. 按固定顺序获取 PostgreSQL transaction advisory lock
+3. 锁定并校验全部记录的 expected_revision
+4. 任意一条冲突则整组回滚
+5. 全部通过后一次性写入全部快照和回执
+```
+
+客户端在第一个 Endpoint 断开后会切到下一个 Endpoint，并复用同一个 `operation_id`。如果第一次已经提交，备用实例会返回 `Duplicate` 和原始 result；如果第一次尚未提交，备用实例会正常完成提交。两个实例不需要互相同步，必须共享同一个 PostgreSQL 和 Redis。
+
+这个接口适合跨玩家交易、玩家转账、共享奖励转移等“同库多记录”场景；业务层仍负责余额、背包、权限和任务条件校验。DBProxy 只负责整组 CAS 与持久化，不负责业务补偿。
+
+### LoadMultiTransaction
+
+按 `operation_id + 记录集合`读取跨记录事务回执。记录集合必须与原提交完全一致，顺序不影响比较；集合不同或回执损坏返回 `OPERATION_CONFLICT`。不存在时返回 `None`。它用于应用在提交后崩溃、只留下 operationId 的恢复流程。
+
 ## 错误码
 
 | 错误码 | 含义 | 调用方处理 |
@@ -96,12 +116,23 @@ expected_revision
 
 `DbProxyClientPool`创建多条真实连接，并按`RecordKey`稳定路由。同一记录自然串行，不同玩家或领域记录可以并行。服务端`DBPROXY_STORAGE_SHARDS`控制独立PostgreSQL/Redis连接分片数；它是启动配置，不支持热更。
 
+### Endpoint 故障切换
+
+Rust 客户端 `ClientConfig::with_endpoints` 接收有序地址列表，主地址由 `endpoint` 指定，备用地址放在 `failover_endpoints`：
+
+```rust
+let config = ClientConfig::new("127.0.0.1:7800", token, "map-1")
+    .with_endpoints(["127.0.0.1:7801".to_string()]);
+```
+
+连接建立失败、读取超时或连接关闭时，客户端按顺序尝试下一个地址；远程 `REVISION_CONFLICT`、`OPERATION_CONFLICT` 等业务错误不会触发切换。写操作切换时必须使用原 `request_id`/`operation_id`，不能在 Transport 层生成新 ID。所有候选地址都不可用时，才把最后一个连接错误返回给业务。
+
 ## 当前未完成
 
 - 批量Load/Save，减少大量登录恢复时的RPC开销
 - Prometheus延迟、错误码、连接、存储分片和backlog指标
-- 客户端自动重连、健康检查和连接池熔断
+- 健康检查、熔断窗口和恢复探测指标（当前已有连接失效后的顺序切换）
 - 生产TLS/mTLS、令牌轮换、租户隔离和限流
 - 生产Docker镜像、滚动升级和协议双版本窗口
 
-运行时无关TypeScript SDK和TiangZ首个Player Snapshot Repository已经完成。后者位于TiangZ主仓库，只通过本协议与SDK接入，不让DBProxy反向依赖游戏领域代码；关键经济事务尚未接入。
+运行时无关 TypeScript SDK 已支持多记录事务，TiangZ首个Player Snapshot Repository仍通过单记录通用 Repository 接入；跨玩家交易等领域 Repository 应显式调用多记录接口，不应把它偷偷塞进普通Entity Repository。

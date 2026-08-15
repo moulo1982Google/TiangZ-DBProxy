@@ -104,6 +104,47 @@ message LoadTransactionResponse {
   TransactionReceipt receipt = 1;
 }
 
+message TransactionalRecordWrite {
+  RecordKey record = 1;
+  string schema = 2;
+  uint32 schema_version = 3;
+  uint64 expected_revision = 4;
+  bytes payload = 5;
+  uint64 updated_at_unix_ms = 6;
+}
+
+message ApplyMultiTransactionRequest {
+  string operation_id = 1;
+  repeated TransactionalRecordWrite writes = 2;
+  bytes result = 3;
+}
+
+message MultiTransactionRecordReceipt {
+  RecordKey record = 1;
+  uint64 new_revision = 2;
+}
+
+message ApplyMultiTransactionResponse {
+  WriteDisposition disposition = 1;
+  repeated MultiTransactionRecordReceipt records = 2;
+  bytes result = 3;
+}
+
+message LoadMultiTransactionRequest {
+  string operation_id = 1;
+  repeated RecordKey records = 2;
+}
+
+message MultiTransactionReceipt {
+  string operation_id = 1;
+  repeated MultiTransactionRecordReceipt records = 2;
+  bytes result = 3;
+}
+
+message LoadMultiTransactionResponse {
+  MultiTransactionReceipt receipt = 1;
+}
+
 message RequestEnvelope {
   uint64 rpc_id = 1;
   oneof body {
@@ -112,6 +153,8 @@ message RequestEnvelope {
     EnqueueSnapshotRequest enqueue_snapshot = 12;
     ApplyTransactionRequest apply_transaction = 13;
     LoadTransactionRequest load_transaction = 14;
+    ApplyMultiTransactionRequest apply_multi_transaction = 15;
+    LoadMultiTransactionRequest load_multi_transaction = 16;
   }
 }
 
@@ -124,6 +167,8 @@ message ResponseEnvelope {
     EnqueueSnapshotResponse enqueue_snapshot = 12;
     ApplyTransactionResponse apply_transaction = 13;
     LoadTransactionResponse load_transaction = 14;
+    ApplyMultiTransactionResponse apply_multi_transaction = 15;
+    LoadMultiTransactionResponse load_multi_transaction = 16;
   }
 }
 

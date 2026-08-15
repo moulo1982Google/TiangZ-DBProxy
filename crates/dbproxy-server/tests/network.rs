@@ -3,9 +3,11 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use tiangz_dbproxy_client::{ClientConfig, ClientError, DbProxyClient};
 use tiangz_dbproxy_core::{
-    InMemorySnapshotStore, InMemoryTransactionalStore, RecordKey, Revision, SnapshotEnvelope,
-    SnapshotStore, SnapshotWrite, SnapshotWriteOutcome, TransactionReceipt, TransactionStore,
-    TransactionalWrite, TransactionalWriteOutcome,
+    AsyncMultiRecordTransactionStore, InMemoryMultiRecordTransactionStore, InMemorySnapshotStore,
+    InMemoryTransactionalStore, MultiRecordTransactionReceipt, MultiRecordTransactionalWrite,
+    MultiRecordTransactionalWriteOutcome, RecordKey, Revision, SnapshotEnvelope, SnapshotStore,
+    SnapshotWrite, SnapshotWriteOutcome, TransactionReceipt, TransactionStore, TransactionalWrite,
+    TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_protocol::{
     DEFAULT_MAX_FRAME_BYTES, PROTOCOL_FINGERPRINT, read_message, wire, write_message,
@@ -17,6 +19,7 @@ use tokio::{net::TcpStream, sync::Mutex, sync::watch, task::JoinHandle};
 struct MemoryBackend {
     snapshots: Mutex<InMemorySnapshotStore>,
     transactions: Mutex<InMemoryTransactionalStore>,
+    multi_transactions: Mutex<InMemoryMultiRecordTransactionStore>,
     queued: Mutex<Vec<SnapshotWrite>>,
 }
 
@@ -61,6 +64,31 @@ impl DbProxyBackend for MemoryBackend {
             .await
             .load_receipt(operation_id, record)?)
     }
+
+    async fn apply_multi_transaction(
+        &self,
+        request: MultiRecordTransactionalWrite,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, BackendError> {
+        Ok(self
+            .multi_transactions
+            .lock()
+            .await
+            .apply_multi(request)
+            .await?)
+    }
+
+    async fn load_multi_transaction(
+        &self,
+        operation_id: &str,
+        records: &[RecordKey],
+    ) -> Result<Option<MultiRecordTransactionReceipt>, BackendError> {
+        Ok(self
+            .multi_transactions
+            .lock()
+            .await
+            .load_multi_receipt(operation_id, records)
+            .await?)
+    }
 }
 
 struct TestServer {
@@ -69,9 +97,19 @@ struct TestServer {
     task: JoinHandle<()>,
 }
 
+fn unused_endpoint() -> String {
+    // 绑定后立即释放端口，只用于模拟首个 Endpoint 尚未启动。
+    // Bind and release a port immediately to simulate an unavailable primary Endpoint.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
 impl TestServer {
     async fn start(token: &str) -> Self {
-        let backend: Arc<dyn DbProxyBackend> = Arc::new(MemoryBackend::default());
+        Self::start_with_backend(token, Arc::new(MemoryBackend::default())).await
+    }
+
+    async fn start_with_backend(token: &str, backend: Arc<dyn DbProxyBackend>) -> Self {
         let config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), token);
         let server = DbProxyServer::bind(config, backend).await.unwrap();
         let endpoint = server.local_addr().unwrap().to_string();
@@ -114,6 +152,31 @@ fn transaction(operation_id: &str) -> TransactionalWrite {
         payload: b"coins=100".to_vec(),
         result: b"granted=100".to_vec(),
         updated_at_unix_ms: 100,
+    }
+}
+
+fn multi_transaction(operation_id: &str) -> MultiRecordTransactionalWrite {
+    MultiRecordTransactionalWrite {
+        operation_id: operation_id.to_string(),
+        writes: vec![
+            tiangz_dbproxy_core::TransactionalRecordWrite {
+                record: RecordKey::new("wallet", "buyer").unwrap(),
+                schema: "wallet.snapshot".to_string(),
+                schema_version: 1,
+                expected_revision: Revision::ZERO,
+                payload: b"coins=0".to_vec(),
+                updated_at_unix_ms: 100,
+            },
+            tiangz_dbproxy_core::TransactionalRecordWrite {
+                record: RecordKey::new("wallet", "seller").unwrap(),
+                schema: "wallet.snapshot".to_string(),
+                schema_version: 1,
+                expected_revision: Revision::ZERO,
+                payload: b"coins=100".to_vec(),
+                updated_at_unix_ms: 100,
+            },
+        ],
+        result: b"trade-complete".to_vec(),
     }
 }
 
@@ -244,5 +307,107 @@ async fn protocol_fingerprint_mismatch_is_rejected_before_rpc() {
         wire::ErrorCode::try_from(hello.error.unwrap().code).unwrap(),
         wire::ErrorCode::ProtocolMismatch
     );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn client_fails_over_to_the_second_endpoint_and_replays_the_same_write() {
+    const TOKEN: &str = "network-failover-test-token";
+    let backend: Arc<dyn DbProxyBackend> = Arc::new(MemoryBackend::default());
+    let primary = TestServer::start_with_backend(TOKEN, Arc::clone(&backend)).await;
+    let secondary = TestServer::start_with_backend(TOKEN, Arc::clone(&backend)).await;
+    let config = ClientConfig::new(&primary.endpoint, TOKEN, "failover-test")
+        .with_endpoints(vec![secondary.endpoint.clone()]);
+    let client = DbProxyClient::connect(config).await.unwrap();
+
+    assert_eq!(
+        client
+            .save(snapshot("failover-first", Some(Revision::ZERO)))
+            .await
+            .unwrap(),
+        SnapshotWriteOutcome::Applied {
+            revision: Revision(1)
+        }
+    );
+    primary.stop().await;
+
+    let second = SnapshotWrite {
+        request_id: "failover-second".to_string(),
+        record: RecordKey::new("player", "1001").unwrap(),
+        schema: "player.snapshot".to_string(),
+        schema_version: 1,
+        payload: b"hp=90".to_vec(),
+        expected_revision: Some(Revision(1)),
+        updated_at_unix_ms: 200,
+    };
+    assert_eq!(
+        client.save(second.clone()).await.unwrap(),
+        SnapshotWriteOutcome::Applied {
+            revision: Revision(2)
+        }
+    );
+    assert_eq!(
+        client.save(second).await.unwrap(),
+        SnapshotWriteOutcome::Duplicate {
+            revision: Revision(2)
+        }
+    );
+    secondary.stop().await;
+}
+
+#[tokio::test]
+async fn client_connects_to_backup_when_primary_endpoint_is_unavailable() {
+    const TOKEN: &str = "network-initial-failover-token";
+    let server = TestServer::start(TOKEN).await;
+    let config = ClientConfig::new(unused_endpoint(), TOKEN, "initial-failover-test")
+        .with_endpoints(vec![server.endpoint.clone()]);
+    let client = DbProxyClient::connect(config).await.unwrap();
+
+    assert_eq!(
+        client
+            .save(snapshot("initial-failover", Some(Revision::ZERO)))
+            .await
+            .unwrap(),
+        SnapshotWriteOutcome::Applied {
+            revision: Revision(1)
+        }
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn multi_record_transaction_is_atomic_idempotent_and_recoverable() {
+    const TOKEN: &str = "network-multi-transaction-token";
+    let server = TestServer::start(TOKEN).await;
+    let client = DbProxyClient::connect(ClientConfig::new(
+        &server.endpoint,
+        TOKEN,
+        "multi-transaction-test",
+    ))
+    .await
+    .unwrap();
+    let request = multi_transaction("trade-network-1");
+    assert!(matches!(
+        client.apply_multi_transaction(request.clone()).await.unwrap(),
+        MultiRecordTransactionalWriteOutcome::Applied { records, result }
+            if records.len() == 2 && result == b"trade-complete"
+    ));
+    assert!(matches!(
+        client.apply_multi_transaction(request).await.unwrap(),
+        MultiRecordTransactionalWriteOutcome::Duplicate { records, result }
+            if records.len() == 2 && result == b"trade-complete"
+    ));
+    let records = vec![
+        RecordKey::new("wallet", "buyer").unwrap(),
+        RecordKey::new("wallet", "seller").unwrap(),
+    ];
+    let receipt = client
+        .load_multi_transaction("trade-network-1", &records)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.operation_id, "trade-network-1");
+    assert_eq!(receipt.records.len(), 2);
+    assert_eq!(receipt.result, b"trade-complete");
     server.stop().await;
 }

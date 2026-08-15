@@ -17,6 +17,7 @@ const MAX_NAMESPACE_BYTES = 128;
 const MAX_RECORD_KEY_BYTES = 512;
 const MAX_SCHEMA_BYTES = 256;
 const MAX_IDEMPOTENCY_KEY_BYTES = 256;
+const MAX_TRANSACTION_RECORDS = 256;
 
 export enum DbProxyErrorCode {
   InvalidRequest = 1001,
@@ -85,6 +86,38 @@ export interface DbProxyTransactionReceipt {
   readonly result: Uint8Array;
 }
 
+export interface DbProxyTransactionalRecordWrite {
+  readonly record: DbProxyRecordKey;
+  readonly schema: string;
+  readonly schemaVersion: number;
+  readonly expectedRevision: bigint;
+  readonly payload: Uint8Array;
+  readonly updatedAtUnixMs: bigint;
+}
+
+export interface DbProxyMultiTransactionalWrite {
+  readonly operationId: string;
+  readonly writes: readonly DbProxyTransactionalRecordWrite[];
+  readonly result: Uint8Array;
+}
+
+export interface DbProxyMultiTransactionRecordReceipt {
+  readonly record: DbProxyRecordKey;
+  readonly newRevision: bigint;
+}
+
+export interface DbProxyMultiTransactionalWriteResult {
+  readonly disposition: DbProxyWriteDisposition;
+  readonly records: readonly DbProxyMultiTransactionRecordReceipt[];
+  readonly result: Uint8Array;
+}
+
+export interface DbProxyMultiTransactionReceipt {
+  readonly operationId: string;
+  readonly records: readonly DbProxyMultiTransactionRecordReceipt[];
+  readonly result: Uint8Array;
+}
+
 /**
  * 每个宿主实现一个Transport。实现必须保留DBProxy的ACK语义，不能把Enqueue成功
  * 解释成PostgreSQL已经提交，也不能在超时后复用状态不明的连接。
@@ -104,6 +137,13 @@ export interface DbProxyTransport {
     operationId: string,
     record: DbProxyRecordKey,
   ): Promise<DbProxyTransactionReceipt | undefined>;
+  applyMultiTransaction(
+    write: DbProxyMultiTransactionalWrite,
+  ): Promise<DbProxyMultiTransactionalWriteResult>;
+  loadMultiTransaction(
+    operationId: string,
+    records: readonly DbProxyRecordKey[],
+  ): Promise<DbProxyMultiTransactionReceipt | undefined>;
 }
 
 export class DbProxyRemoteError extends Error {
@@ -169,6 +209,32 @@ export class DbProxyClient {
     return this.transport.loadTransaction(stableOperationId, stableRecord).then((receipt) =>
       receipt ? cloneTransactionReceipt(receipt) : undefined
     );
+  }
+
+  ApplyMultiTransaction(
+    write: DbProxyMultiTransactionalWrite,
+  ): Promise<DbProxyMultiTransactionalWriteResult> {
+    const stable = cloneMultiTransactionalWrite(write);
+    return this.transport.applyMultiTransaction(stable).then((result) => ({
+      disposition: result.disposition,
+      records: result.records.map(cloneMultiTransactionRecordReceipt),
+      result: copyBytes(result.result),
+    }));
+  }
+
+  LoadMultiTransaction(
+    operationId: string,
+    records: readonly DbProxyRecordKey[],
+  ): Promise<DbProxyMultiTransactionReceipt | undefined> {
+    const stableOperationId = requireText(
+      operationId,
+      "multiTransaction.operationId",
+      MAX_IDEMPOTENCY_KEY_BYTES,
+    );
+    const stableRecords = cloneMultiTransactionRecords(records);
+    return this.transport
+      .loadMultiTransaction(stableOperationId, stableRecords)
+      .then((receipt) => receipt ? cloneMultiTransactionReceipt(receipt) : undefined);
   }
 }
 
@@ -247,6 +313,87 @@ function cloneTransactionReceipt(
       receipt.newRevision,
       "transactionReceipt.newRevision",
     ),
+    result: copyBytes(receipt.result),
+  };
+}
+
+function cloneMultiTransactionalWrite(
+  write: DbProxyMultiTransactionalWrite,
+): DbProxyMultiTransactionalWrite {
+  const operationId = requireText(
+    write.operationId,
+    "multiTransaction.operationId",
+    MAX_IDEMPOTENCY_KEY_BYTES,
+  );
+  if (!Array.isArray(write.writes) || write.writes.length === 0 || write.writes.length > MAX_TRANSACTION_RECORDS) {
+    throw new RangeError(`multiTransaction.writes must contain 1..${MAX_TRANSACTION_RECORDS} records`);
+  }
+  const writes = write.writes.map((item) => cloneMultiTransactionalRecordWrite(item));
+  const recordNames = new Set(writes.map((item) => `${item.record.namespace}\u0000${item.record.key}`));
+  if (recordNames.size !== writes.length) {
+    throw new TypeError("multiTransaction.writes cannot contain duplicate records");
+  }
+  return {
+    operationId,
+    writes,
+    result: copyBytes(write.result),
+  };
+}
+
+function cloneMultiTransactionalRecordWrite(
+  write: DbProxyTransactionalRecordWrite,
+): DbProxyTransactionalRecordWrite {
+  return {
+    record: cloneRecordKey(write.record),
+    schema: requireText(write.schema, "transactionalRecord.schema", MAX_SCHEMA_BYTES),
+    schemaVersion: requireUint32(write.schemaVersion, "transactionalRecord.schemaVersion"),
+    expectedRevision: requireUint64(
+      write.expectedRevision,
+      "transactionalRecord.expectedRevision",
+    ),
+    payload: copyBytes(write.payload),
+    updatedAtUnixMs: requireUint64(
+      write.updatedAtUnixMs,
+      "transactionalRecord.updatedAtUnixMs",
+    ),
+  };
+}
+
+function cloneMultiTransactionRecords(
+  records: readonly DbProxyRecordKey[],
+): DbProxyRecordKey[] {
+  if (!Array.isArray(records) || records.length === 0 || records.length > MAX_TRANSACTION_RECORDS) {
+    throw new RangeError(`multiTransaction.records must contain 1..${MAX_TRANSACTION_RECORDS} records`);
+  }
+  const cloned = records.map(cloneRecordKey);
+  const names = new Set(cloned.map((item) => `${item.namespace}\u0000${item.key}`));
+  if (names.size !== cloned.length) throw new TypeError("multiTransaction.records contain duplicates");
+  return cloned;
+}
+
+function cloneMultiTransactionRecordReceipt(
+  receipt: DbProxyMultiTransactionRecordReceipt,
+): DbProxyMultiTransactionRecordReceipt {
+  return {
+    record: cloneRecordKey(receipt.record),
+    newRevision: requireUint64(receipt.newRevision, "multiTransactionRecord.newRevision"),
+  };
+}
+
+function cloneMultiTransactionReceipt(
+  receipt: DbProxyMultiTransactionReceipt,
+): DbProxyMultiTransactionReceipt {
+  const operationId = requireText(
+    receipt.operationId,
+    "multiTransactionReceipt.operationId",
+    MAX_IDEMPOTENCY_KEY_BYTES,
+  );
+  if (!Array.isArray(receipt.records) || receipt.records.length === 0 || receipt.records.length > MAX_TRANSACTION_RECORDS) {
+    throw new RangeError(`multiTransactionReceipt.records must contain 1..${MAX_TRANSACTION_RECORDS} records`);
+  }
+  return {
+    operationId,
+    records: receipt.records.map(cloneMultiTransactionRecordReceipt),
     result: copyBytes(receipt.result),
   };
 }

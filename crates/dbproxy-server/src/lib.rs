@@ -1,8 +1,8 @@
 //! DBProxy 网络服务实现。
 //! DBProxy network service implementation.
 //!
-//! 服务端只调度通用快照和单记录事务。游戏 Repository、Entity 生命周期与业务校验
-//! 必须留在 TiangZ。The server only dispatches generic snapshots and single-record transactions;
+//! 服务端只调度通用快照和记录事务。游戏 Repository、Entity 生命周期与业务校验
+//! 必须留在 TiangZ。The server only dispatches generic snapshots and record transactions;
 //! game repositories, entity lifecycle, and business validation stay in TiangZ.
 
 pub mod config;
@@ -19,9 +19,10 @@ use std::{
 use async_trait::async_trait;
 use thiserror::Error;
 use tiangz_dbproxy_core::{
-    AsyncSnapshotStore, AsyncTransactionalStore, RecordKey, Revision, SnapshotEnvelope,
-    SnapshotWrite, SnapshotWriteOutcome, StoreError, TransactionReceipt, TransactionalWrite,
-    TransactionalWriteOutcome,
+    AsyncMultiRecordTransactionStore, AsyncSnapshotStore, AsyncTransactionalStore,
+    MultiRecordTransactionalWrite, MultiRecordTransactionalWriteOutcome, RecordKey, Revision,
+    SnapshotEnvelope, SnapshotWrite, SnapshotWriteOutcome, StoreError, TransactionReceipt,
+    TransactionalWrite, TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_protocol::{
     DEFAULT_MAX_FRAME_BYTES, MAX_AUTH_TOKEN_BYTES, MAX_CLIENT_NAME_BYTES, PROTOCOL_FINGERPRINT,
@@ -63,6 +64,25 @@ pub trait DbProxyBackend: Send + Sync + 'static {
         operation_id: &str,
         record: &RecordKey,
     ) -> Result<Option<TransactionReceipt>, BackendError>;
+    async fn apply_multi_transaction(
+        &self,
+        request: MultiRecordTransactionalWrite,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, BackendError> {
+        let _ = request;
+        Err(BackendError::InvalidConfig(
+            "multi-record transactions are not supported by this backend",
+        ))
+    }
+    async fn load_multi_transaction(
+        &self,
+        operation_id: &str,
+        records: &[RecordKey],
+    ) -> Result<Option<tiangz_dbproxy_core::MultiRecordTransactionReceipt>, BackendError> {
+        let _ = (operation_id, records);
+        Err(BackendError::InvalidConfig(
+            "multi-record transactions are not supported by this backend",
+        ))
+    }
 }
 
 /// 真实 PostgreSQL/Redis 后端。每个 shard 使用独立数据库连接，并按 RecordKey 稳定路由，
@@ -99,6 +119,12 @@ impl StorageBackend {
         record.hash(&mut hasher);
         let index = (hasher.finish() as usize) % self.shards.len();
         self.shards[index].clone()
+    }
+
+    fn shard_for_operation(&self, operation_id: &str) -> TieredSnapshotStore {
+        let mut hasher = StableHasher::default();
+        operation_id.hash(&mut hasher);
+        self.shards[(hasher.finish() as usize) % self.shards.len()].clone()
     }
 
     /// 处理一条 Redis backlog。数据库成功但 ACK 失败时不能伪装成完全成功；lease 到期后
@@ -157,6 +183,25 @@ impl DbProxyBackend for StorageBackend {
         Ok(self
             .shard(record)
             .load_receipt(operation_id, record)
+            .await?)
+    }
+
+    async fn apply_multi_transaction(
+        &self,
+        request: MultiRecordTransactionalWrite,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, BackendError> {
+        let mut store = self.shard_for_operation(&request.operation_id);
+        Ok(store.apply_multi(request).await?)
+    }
+
+    async fn load_multi_transaction(
+        &self,
+        operation_id: &str,
+        records: &[RecordKey],
+    ) -> Result<Option<tiangz_dbproxy_core::MultiRecordTransactionReceipt>, BackendError> {
+        Ok(self
+            .shard_for_operation(operation_id)
+            .load_multi_receipt(operation_id, records)
             .await?)
     }
 }
@@ -567,6 +612,116 @@ async fn dispatch_body(
                 },
             ))
         }
+        wire::request_envelope::Body::ApplyMultiTransaction(request) => {
+            if request.operation_id.trim().is_empty() {
+                return Err(RpcFailure::invalid(
+                    "apply_multi_transaction.operation_id is empty",
+                ));
+            }
+            if request.writes.is_empty() {
+                return Err(RpcFailure::invalid(
+                    "apply_multi_transaction.writes is empty",
+                ));
+            }
+            if request.writes.len() > tiangz_dbproxy_protocol::MAX_TRANSACTION_RECORDS {
+                return Err(RpcFailure::invalid(
+                    "apply_multi_transaction.writes exceeds the record limit",
+                ));
+            }
+            let writes = request
+                .writes
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(RpcFailure::from_protocol)?;
+            let outcome = backend
+                .apply_multi_transaction(MultiRecordTransactionalWrite {
+                    operation_id: request.operation_id,
+                    writes,
+                    result: request.result,
+                })
+                .await
+                .map_err(RpcFailure::from_backend)?;
+            Ok(wire::response_envelope::Body::ApplyMultiTransaction(
+                multi_transaction_outcome(outcome),
+            ))
+        }
+        wire::request_envelope::Body::LoadMultiTransaction(request) => {
+            if request.operation_id.trim().is_empty() {
+                return Err(RpcFailure::invalid(
+                    "load_multi_transaction.operation_id is empty",
+                ));
+            }
+            if request.records.is_empty() {
+                return Err(RpcFailure::invalid(
+                    "load_multi_transaction.records is empty",
+                ));
+            }
+            if request.records.len() > tiangz_dbproxy_protocol::MAX_TRANSACTION_RECORDS {
+                return Err(RpcFailure::invalid(
+                    "load_multi_transaction.records exceeds the record limit",
+                ));
+            }
+            let records = request
+                .records
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(RpcFailure::from_protocol)?;
+            let receipt = backend
+                .load_multi_transaction(&request.operation_id, &records)
+                .await
+                .map_err(RpcFailure::from_backend)?;
+            Ok(wire::response_envelope::Body::LoadMultiTransaction(
+                wire::LoadMultiTransactionResponse {
+                    receipt: receipt.map(multi_transaction_receipt),
+                },
+            ))
+        }
+    }
+}
+
+fn multi_transaction_record_receipt(
+    receipt: tiangz_dbproxy_core::TransactionRecordReceipt,
+) -> wire::MultiTransactionRecordReceipt {
+    wire::MultiTransactionRecordReceipt {
+        record: Some((&receipt.record).into()),
+        new_revision: receipt.new_revision.0,
+    }
+}
+
+fn multi_transaction_receipt(
+    receipt: tiangz_dbproxy_core::MultiRecordTransactionReceipt,
+) -> wire::MultiTransactionReceipt {
+    wire::MultiTransactionReceipt {
+        operation_id: receipt.operation_id,
+        records: receipt
+            .records
+            .into_iter()
+            .map(multi_transaction_record_receipt)
+            .collect(),
+        result: receipt.result,
+    }
+}
+
+fn multi_transaction_outcome(
+    outcome: MultiRecordTransactionalWriteOutcome,
+) -> wire::ApplyMultiTransactionResponse {
+    let (disposition, records, result) = match outcome {
+        MultiRecordTransactionalWriteOutcome::Applied { records, result } => {
+            (wire::WriteDisposition::Applied, records, result)
+        }
+        MultiRecordTransactionalWriteOutcome::Duplicate { records, result } => {
+            (wire::WriteDisposition::Duplicate, records, result)
+        }
+    };
+    wire::ApplyMultiTransactionResponse {
+        disposition: disposition.into(),
+        records: records
+            .into_iter()
+            .map(multi_transaction_record_receipt)
+            .collect(),
+        result,
     }
 }
 
@@ -664,6 +819,8 @@ impl RpcFailure {
             StoreError::InvalidKey(_)
             | StoreError::EmptyRequestId
             | StoreError::EmptyOperationId
+            | StoreError::EmptyTransactionRecords
+            | StoreError::DuplicateTransactionRecord { .. }
             | StoreError::QueuedSnapshotRequiresUnconditionalWrite { .. } => {
                 Self::invalid(error.to_string())
             }

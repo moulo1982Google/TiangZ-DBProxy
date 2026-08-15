@@ -16,6 +16,7 @@
 - 校验RecordKey、Schema、Revision和幂等ID；
 - 在跨Transport边界前复制Payload，防止调用方继续修改缓冲；
 - 保持`Load`、`Save`、`EnqueueSnapshot`、`ApplyTransaction`、`LoadTransaction`的稳定语义；
+- 提供`ApplyMultiTransaction`和`LoadMultiTransaction`，并拒绝重复RecordKey和超过256条记录的请求；
 - 明确使用`bigint`表示uint64，避免JavaScript number精度丢失。
 
 Transport负责：
@@ -31,7 +32,19 @@ TiangZ主仓库的`HostDbProxyTransport`是首个真实宿主实现：TCP连接�
 
 SDK不会自动生成或替换`requestId`、`operationId`。超时表示请求结果未知，重试必须复用原ID和完全相同的Payload。Transport可以重连后重放同一个请求，但不能创建新幂等ID。
 
-如果调用方进程在事务提交后、应用内存状态或返回RPC前崩溃，恢复路径可以用`LoadTransaction(operationId, record)`读取第一次提交保存的`newRevision/result`。查询必须同时提供RecordKey；同一个operationId不能跨记录读取，也不能用回执查询替代正常的业务校验。
+如果调用方进程在事务提交后、应用内存状态或返回RPC前崩溃，恢复路径可以用`LoadTransaction(operationId, record)`或`LoadMultiTransaction(operationId, records)`读取第一次提交保存的`newRevision/result`。多记录查询必须提供原始完整记录集合；同一个operationId不能换一组记录读取，也不能用回执查询替代正常的业务校验。
+
+跨记录事务示例：
+
+```ts
+const result = await client.ApplyMultiTransaction({
+  operationId: "trade:request-1001",
+  writes: [buyerWrite, sellerWrite],
+  result: new TextEncoder().encode("trade-committed"),
+});
+```
+
+业务 Repository 负责先在内存中校验并构造 `buyerWrite/sellerWrite`，DBProxy 只负责整组 Revision/CAS 和原子落库。不要在 DBProxy 中追加业务步骤，也不要因为 Endpoint 切换而更换 `operationId`。
 
 `EnqueueSnapshot`禁止携带`expectedRevision`。它成功只表示Redis AOF backlog已经接收，不能向业务报告PostgreSQL事务已经提交。
 
