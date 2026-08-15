@@ -9,7 +9,7 @@ try {
     if (-not $env:DBPROXY_REDIS_URL) {
         $env:DBPROXY_REDIS_URL = "redis://:tiangz_dev@127.0.0.1:6379/0"
     }
-    cargo test -p tiangz-dbproxy-server --test postgres_redis_network --locked -- --ignored --nocapture
+    cargo test -p tiangz-dbproxy-server --test postgres_redis_network -- --ignored --nocapture
     if ($LASTEXITCODE -ne 0) {
         throw "DBProxy network smoke failed with exit code $LASTEXITCODE"
     }

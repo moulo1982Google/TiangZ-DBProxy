@@ -8,7 +8,10 @@ $env:DBPROXY_RUN_DOCKER_FAULTS = "1"
 
 docker compose --env-file $envFile -f $composeFile up -d
 try {
-    cargo test -p tiangz-dbproxy-storage --test fault_matrix --locked -- --ignored --nocapture --test-threads=1
+    cargo test -p tiangz-dbproxy-storage --test fault_matrix -- --ignored --nocapture --test-threads=1
+    if ($LASTEXITCODE -ne 0) {
+        throw "DBProxy fault matrix failed with exit code $LASTEXITCODE"
+    }
 }
 finally {
     docker compose --env-file $envFile -f $composeFile up -d

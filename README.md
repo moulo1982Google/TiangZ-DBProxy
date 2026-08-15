@@ -72,6 +72,8 @@ cargo clippy --workspace --all-targets
 npm run test:typescript
 ```
 
+GitHub Actions 的普通分支和 Pull Request 只运行开发门禁；推送 `v*` Tag 或发布对应的 GitHub Release 时会自动进入发布验收门，使用 `npm ci`、`cargo ... --locked`，并启动 PostgreSQL/Redis 完成真实存储、网络闭环和故障矩阵测试。发布 Tag 只有在这组测试全部通过后才算验收完成。
+
 本机启动 PostgreSQL 和 Redis：
 
 ```powershell

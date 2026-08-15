@@ -22,7 +22,7 @@ try {
         [Environment]::SetEnvironmentVariable($name, $content, "Process")
     }
 
-    cargo run -p tiangz-dbproxy-server --locked -- --config $ConfigFile
+    cargo run -p tiangz-dbproxy-server -- --config $ConfigFile
     if ($LASTEXITCODE -ne 0) {
         throw "DBProxy exited with code $LASTEXITCODE"
     }

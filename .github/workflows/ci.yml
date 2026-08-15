@@ -1,8 +1,13 @@
 name: Rust CI
 
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
+  release:
+    types: [published]
 
 jobs:
   check:
@@ -22,3 +27,52 @@ jobs:
         run: cargo test --workspace
       - name: 运行 Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  release:
+    name: 发布前完整验收
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v'))
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DBPROXY_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz
+      DBPROXY_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6379/0
+      DBPROXY_RUN_DOCKER_FAULTS: "1"
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: 安装锁定的 TypeScript 依赖
+        run: npm ci
+      - name: 发布 Rust 格式检查
+        run: cargo fmt --all -- --check
+      - name: 发布 Rust 测试
+        run: cargo test --workspace --locked
+      - name: 发布 Rust Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: 发布 TypeScript SDK 测试
+        run: npm run test:typescript
+      - name: 准备本地集成测试配置
+        run: cp deploy/local/.env.example deploy/local/.env
+      - name: 启动 PostgreSQL 与 Redis
+        run: docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml up -d --wait
+      - name: 真实存储测试
+        run: cargo test -p tiangz-dbproxy-storage --test postgres_redis --locked -- --ignored --nocapture --test-threads=1
+      - name: 真实网络闭环测试
+        run: cargo test -p tiangz-dbproxy-server --test postgres_redis_network --locked -- --ignored --nocapture --test-threads=1
+      - name: Redis 与 PostgreSQL 故障矩阵
+        run: cargo test -p tiangz-dbproxy-storage --test fault_matrix --locked -- --ignored --nocapture --test-threads=1
+      - name: 清理测试容器
+        if: always()
+        run: docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml down -v --remove-orphans
