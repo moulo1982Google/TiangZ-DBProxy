@@ -1,0 +1,18 @@
+[Unit]
+Description=TiangZ DBProxy peer %i
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tiangz-dbproxy
+EnvironmentFile=/etc/tiangz/dbproxy.env
+Environment=RUST_LOG=info
+ExecStart=/opt/tiangz-dbproxy/tiangz-dbproxy-server --config /opt/tiangz-dbproxy/configs/external-%i.json
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
