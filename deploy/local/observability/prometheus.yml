@@ -11,3 +11,13 @@ scrape_configs:
       - targets:
           - host.docker.internal:9090
           - host.docker.internal:9091
+
+  - job_name: tiangz-process
+    static_configs:
+      - targets:
+          - host.docker.internal:7600
+          - host.docker.internal:7603
+          - host.docker.internal:7604
+          - host.docker.internal:7606
+          - host.docker.internal:7608
+          - host.docker.internal:7610

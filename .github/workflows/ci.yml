@@ -27,6 +27,15 @@ jobs:
         run: cargo test --workspace
       - name: 运行 Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: 校验可观测性配置
+        run: |
+          cp deploy/local/.env.example deploy/local/.env
+          docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml config --quiet
+          python -m json.tool deploy/local/observability/grafana/dashboards/dbproxy-overview.json >/dev/null
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/deploy/local/observability:/etc/prometheus:ro" \
+            prom/prometheus:v3.13.1 \
+            check config /etc/prometheus/prometheus.yml
 
   release:
     name: 发布前完整验收
