@@ -208,6 +208,16 @@ async fn client_server_round_trip_preserves_persistence_semantics() {
         .unwrap();
     assert_eq!(loaded.revision, Revision(1));
     assert_eq!(loaded.payload, b"hp=100");
+    let batch = client
+        .load_multi(&[
+            RecordKey::new("player", "1001").unwrap(),
+            RecordKey::new("player", "missing").unwrap(),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch[0].as_ref().unwrap().revision, Revision(1));
+    assert!(batch[1].is_none());
 
     let error = client
         .save(snapshot("request-2", Some(Revision::ZERO)))

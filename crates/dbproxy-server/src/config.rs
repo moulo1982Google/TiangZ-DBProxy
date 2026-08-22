@@ -22,11 +22,28 @@ pub struct DbProxyConfig {
     pub schema_document: Option<String>,
     pub config_version: u32,
     pub server: ServerSection,
+    #[serde(default)]
+    pub runtime: RuntimeSection,
     pub storage: StorageSection,
     #[serde(default)]
     pub backlog: BacklogSection,
     #[serde(default)]
     pub logging: LoggingSection,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeSection {
+    #[serde(default = "default_runtime_worker_threads")]
+    pub worker_threads: usize,
+}
+
+impl Default for RuntimeSection {
+    fn default() -> Self {
+        Self {
+            worker_threads: default_runtime_worker_threads(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -43,12 +60,20 @@ pub struct ServerSection {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct StorageSection {
-    pub postgres_url_env: String,
-    pub redis_url_env: String,
-    #[serde(default = "default_storage_shards")]
-    pub shards: usize,
+#[serde(tag = "backend", rename_all = "camelCase", deny_unknown_fields)]
+pub enum StorageSection {
+    PostgresRedis {
+        #[serde(rename = "postgresUrlEnv")]
+        postgres_url_env: String,
+        #[serde(rename = "redisUrlEnv")]
+        redis_url_env: String,
+        #[serde(default = "default_storage_shards")]
+        shards: usize,
+    },
+    Memory {
+        #[serde(default = "default_storage_shards")]
+        shards: usize,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -103,14 +128,40 @@ pub struct ResolvedDbProxyConfig {
     pub max_frame_bytes: usize,
     pub handshake_timeout: Duration,
     pub shutdown_grace: Duration,
-    pub postgres_url: String,
-    pub redis_url: String,
-    pub storage_shards: usize,
+    pub runtime_worker_threads: usize,
+    pub storage: ResolvedStorage,
     pub backlog_workers: usize,
     pub backlog_lease_ms: u64,
     pub backlog_idle_delay: Duration,
     pub backlog_failure_delay: Duration,
     pub log_filter: String,
+}
+
+#[derive(Clone)]
+pub enum ResolvedStorage {
+    PostgresRedis {
+        postgres_url: String,
+        redis_url: String,
+        shards: usize,
+    },
+    Memory {
+        shards: usize,
+    },
+}
+
+impl ResolvedStorage {
+    pub const fn shards(&self) -> usize {
+        match self {
+            Self::PostgresRedis { shards, .. } | Self::Memory { shards } => *shards,
+        }
+    }
+
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::PostgresRedis { .. } => "postgresRedis",
+            Self::Memory { .. } => "memory",
+        }
+    }
 }
 
 impl fmt::Debug for ResolvedDbProxyConfig {
@@ -121,9 +172,9 @@ impl fmt::Debug for ResolvedDbProxyConfig {
             .field("listen_addr", &self.listen_addr)
             .field("auth_token", &"[REDACTED]")
             .field("max_frame_bytes", &self.max_frame_bytes)
-            .field("postgres_url", &"[REDACTED]")
-            .field("redis_url", &"[REDACTED]")
-            .field("storage_shards", &self.storage_shards)
+            .field("runtime_worker_threads", &self.runtime_worker_threads)
+            .field("storage_backend", &self.storage.name())
+            .field("storage_shards", &self.storage.shards())
             .field("backlog_workers", &self.backlog_workers)
             .finish_non_exhaustive()
     }
@@ -203,15 +254,31 @@ impl DbProxyConfig {
             self.server.handshake_timeout_ms,
         )?;
         require_positive("server.shutdownGraceMs", self.server.shutdown_grace_ms)?;
-        require_positive("storage.shards", self.storage.shards)?;
+        require_positive("runtime.workerThreads", self.runtime.worker_threads)?;
         require_positive("backlog.workers", self.backlog.workers)?;
         require_positive("backlog.leaseMs", self.backlog.lease_ms)?;
         require_positive("backlog.idleDelayMs", self.backlog.idle_delay_ms)?;
         require_positive("backlog.failureDelayMs", self.backlog.failure_delay_ms)?;
 
         let auth_token = required_environment(&environment, &self.server.auth_token_env)?;
-        let postgres_url = required_environment(&environment, &self.storage.postgres_url_env)?;
-        let redis_url = required_environment(&environment, &self.storage.redis_url_env)?;
+        let storage = match self.storage {
+            StorageSection::PostgresRedis {
+                postgres_url_env,
+                redis_url_env,
+                shards,
+            } => {
+                require_positive("storage.shards", shards)?;
+                ResolvedStorage::PostgresRedis {
+                    postgres_url: required_environment(&environment, &postgres_url_env)?,
+                    redis_url: required_environment(&environment, &redis_url_env)?,
+                    shards,
+                }
+            }
+            StorageSection::Memory { shards } => {
+                require_positive("storage.shards", shards)?;
+                ResolvedStorage::Memory { shards }
+            }
+        };
         validate_environment_name(&self.logging.filter_env)?;
         let log_filter = environment(&self.logging.filter_env)
             .filter(|value| !value.trim().is_empty())
@@ -229,9 +296,8 @@ impl DbProxyConfig {
             max_frame_bytes: self.server.max_frame_bytes,
             handshake_timeout: Duration::from_millis(self.server.handshake_timeout_ms),
             shutdown_grace: Duration::from_millis(self.server.shutdown_grace_ms),
-            postgres_url,
-            redis_url,
-            storage_shards: self.storage.shards,
+            runtime_worker_threads: self.runtime.worker_threads,
+            storage,
             backlog_workers: self.backlog.workers,
             backlog_lease_ms: self.backlog.lease_ms,
             backlog_idle_delay: Duration::from_millis(self.backlog.idle_delay_ms),
@@ -291,6 +357,11 @@ const fn default_shutdown_grace_ms() -> u64 {
 const fn default_storage_shards() -> usize {
     4
 }
+fn default_runtime_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+}
 const fn default_backlog_workers() -> usize {
     1
 }
@@ -334,7 +405,8 @@ mod tests {
             r#"{
           "configVersion": 1,
           "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
-          "storage": { "postgresUrlEnv": "PG", "redisUrlEnv": "REDIS" }
+          "runtime": { "workerThreads": 4 },
+          "storage": { "backend": "postgresRedis", "postgresUrlEnv": "PG", "redisUrlEnv": "REDIS" }
         }"#,
         );
         let values = HashMap::from([
@@ -345,7 +417,8 @@ mod tests {
         let config =
             load_config_with(&path, |name| values.get(name).map(ToString::to_string)).unwrap();
         fs::remove_file(path).unwrap();
-        assert_eq!(config.storage_shards, 4);
+        assert_eq!(config.storage.shards(), 4);
+        assert_eq!(config.runtime_worker_threads, 4);
         assert_eq!(config.backlog_workers, 1);
         assert_eq!(config.log_filter, "info");
         let debug = format!("{config:?}");
@@ -359,7 +432,7 @@ mod tests {
             r#"{
           "configVersion": 1,
           "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH", "typo": 1 },
-          "storage": { "postgresUrlEnv": "PG", "redisUrlEnv": "REDIS" }
+          "storage": { "backend": "postgresRedis", "postgresUrlEnv": "PG", "redisUrlEnv": "REDIS" }
         }"#,
         );
         let error = load_config_with(&path, |_| None).unwrap_err();
@@ -370,7 +443,7 @@ mod tests {
             r#"{
           "configVersion": 1,
           "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
-          "storage": { "postgresUrlEnv": "PG", "redisUrlEnv": "REDIS" }
+          "storage": { "backend": "postgresRedis", "postgresUrlEnv": "PG", "redisUrlEnv": "REDIS" }
         }"#,
         );
         let error = load_config_with(&path, |_| None).unwrap_err();
@@ -384,11 +457,31 @@ mod tests {
             r#"{
           "configVersion": 2,
           "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
-          "storage": { "postgresUrlEnv": "PG", "redisUrlEnv": "REDIS" }
+          "storage": { "backend": "postgresRedis", "postgresUrlEnv": "PG", "redisUrlEnv": "REDIS" }
         }"#,
         );
         let error = load_config_with(&path, |_| None).unwrap_err();
         fs::remove_file(path).unwrap();
         assert!(error.to_string().contains("configVersion: 2"));
+    }
+
+    #[test]
+    fn memory_backend_does_not_require_database_secrets() {
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "runtime": { "workerThreads": 4 },
+          "storage": { "backend": "memory", "shards": 8 }
+        }"#,
+        );
+        let config = load_config_with(&path, |name| {
+            (name == "AUTH").then(|| "memory-test-token".to_string())
+        })
+        .unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(config.runtime_worker_threads, 4);
+        assert_eq!(config.storage.name(), "memory");
+        assert_eq!(config.storage.shards(), 8);
     }
 }

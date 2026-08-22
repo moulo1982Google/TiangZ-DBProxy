@@ -18,6 +18,7 @@ const MAX_RECORD_KEY_BYTES = 512;
 const MAX_SCHEMA_BYTES = 256;
 const MAX_IDEMPOTENCY_KEY_BYTES = 256;
 const MAX_TRANSACTION_RECORDS = 256;
+const MAX_BATCH_LOAD_RECORDS = 64;
 
 export enum DbProxyErrorCode {
   InvalidRequest = 1001,
@@ -128,6 +129,9 @@ export interface DbProxyMultiTransactionReceipt {
  */
 export interface DbProxyTransport {
   load(record: DbProxyRecordKey): Promise<DbProxySnapshotEnvelope | undefined>;
+  loadMulti(
+    records: readonly DbProxyRecordKey[],
+  ): Promise<readonly (DbProxySnapshotEnvelope | undefined)[]>;
   save(write: DbProxySnapshotWrite): Promise<DbProxySnapshotWriteResult>;
   enqueueSnapshot(write: DbProxySnapshotWrite): Promise<void>;
   applyTransaction(
@@ -173,6 +177,26 @@ export class DbProxyClient {
     return this.transport.load(cloneRecordKey(record)).then((snapshot) =>
       snapshot ? cloneSnapshot(snapshot) : undefined
     );
+  }
+
+  LoadMulti(
+    records: readonly DbProxyRecordKey[],
+  ): Promise<readonly (DbProxySnapshotEnvelope | undefined)[]> {
+    const stableRecords = cloneBatchLoadRecords(records);
+    return this.transport.loadMulti(stableRecords).then((snapshots) => {
+      if (!Array.isArray(snapshots) || snapshots.length !== stableRecords.length) {
+        throw new TypeError("batch load result count does not match its request");
+      }
+      return snapshots.map((snapshot, index) => {
+        if (!snapshot) return undefined;
+        const cloned = cloneSnapshot(snapshot);
+        const expected = stableRecords[index];
+        if (cloned.record.namespace !== expected.namespace || cloned.record.key !== expected.key) {
+          throw new TypeError("batch load snapshot identity does not match its request");
+        }
+        return cloned;
+      });
+    });
   }
 
   Save(write: DbProxySnapshotWrite): Promise<DbProxySnapshotWriteResult> {
@@ -368,6 +392,16 @@ function cloneMultiTransactionRecords(
   const cloned = records.map(cloneRecordKey);
   const names = new Set(cloned.map((item) => `${item.namespace}\u0000${item.key}`));
   if (names.size !== cloned.length) throw new TypeError("multiTransaction.records contain duplicates");
+  return cloned;
+}
+
+function cloneBatchLoadRecords(records: readonly DbProxyRecordKey[]): DbProxyRecordKey[] {
+  if (!Array.isArray(records) || records.length === 0 || records.length > MAX_BATCH_LOAD_RECORDS) {
+    throw new RangeError(`batchLoad.records must contain 1..${MAX_BATCH_LOAD_RECORDS} records`);
+  }
+  const cloned = records.map(cloneRecordKey);
+  const names = new Set(cloned.map((item) => `${item.namespace}\u0000${item.key}`));
+  if (names.size !== cloned.length) throw new TypeError("batchLoad.records contain duplicates");
   return cloned;
 }
 

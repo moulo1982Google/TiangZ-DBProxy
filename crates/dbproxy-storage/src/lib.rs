@@ -3,7 +3,7 @@
 //! PostgreSQL 是唯一权威写入端；Redis 只保存已经提交的快照缓存。
 //! PostgreSQL is the only authoritative write target; Redis caches committed snapshots only.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
@@ -288,6 +288,41 @@ impl PostgresSnapshotStore {
             .await?;
         transaction.commit().await?;
         Ok(())
+    }
+
+    /// 在一次数据库查询中读取多条快照，并保持调用方的记录顺序与缺失位置。
+    /// Load multiple snapshots in one query while preserving input order and missing positions.
+    pub async fn load_multi(
+        &self,
+        records: &[RecordKey],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, StorageError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let namespaces = records
+            .iter()
+            .map(|record| record.namespace.clone())
+            .collect::<Vec<_>>();
+        let keys = records
+            .iter()
+            .map(|record| record.key.clone())
+            .collect::<Vec<_>>();
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                "SELECT namespace, record_key, schema_name, schema_version, revision, payload, updated_at_unix_ms FROM dbproxy_snapshots WHERE (namespace, record_key) IN (SELECT * FROM unnest($1::TEXT[], $2::TEXT[]))",
+                &[&namespaces, &keys],
+            )
+            .await?;
+        let mut snapshots = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let snapshot = snapshot_from_row(row)?;
+            snapshots.insert(snapshot.record.clone(), snapshot);
+        }
+        Ok(records
+            .iter()
+            .map(|record| snapshots.remove(record))
+            .collect())
     }
 }
 
@@ -907,6 +942,35 @@ impl RedisSnapshotCache {
             .transpose()
     }
 
+    /// 使用一次MGET读取多条缓存，并保持调用方的记录顺序与缺失位置。
+    /// Read multiple cache entries with one MGET while preserving order and misses.
+    pub async fn get_multi(
+        &self,
+        records: &[RecordKey],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, StorageError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys = records.iter().map(Self::cache_key).collect::<Vec<_>>();
+        let mut connection = self.connection.lock().await;
+        let values: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
+            .arg(keys)
+            .query_async(&mut *connection)
+            .await?;
+        values
+            .into_iter()
+            .map(|value| {
+                value
+                    .map(|bytes| {
+                        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                            .map(|(snapshot, _)| snapshot)
+                            .map_err(|error| StorageError::Codec(error.to_string()))
+                    })
+                    .transpose()
+            })
+            .collect()
+    }
+
     /// 写入缓存；调用方必须在权威存储成功后调用。
     /// Write the cache; callers must invoke this only after the authoritative store succeeds.
     pub async fn put(&self, snapshot: &SnapshotEnvelope) -> Result<(), StorageError> {
@@ -969,6 +1033,45 @@ impl TieredSnapshotStore {
                 Ok(None)
             }
         }
+    }
+
+    /// 批量读取缓存，并用一次PostgreSQL查询回源全部未命中记录。
+    /// Batch-read cache entries and resolve all misses with one PostgreSQL query.
+    pub async fn load_multi(
+        &self,
+        records: &[RecordKey],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, StorageError> {
+        let mut snapshots = match self.cache.get_multi(records).await {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                tracing::warn!(%error, record_count = records.len(), "snapshot cache batch read failed; falling back to postgres");
+                vec![None; records.len()]
+            }
+        };
+        let misses = records
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| snapshots[*index].is_none())
+            .map(|(index, record)| (index, record.clone()))
+            .collect::<Vec<_>>();
+        if misses.is_empty() {
+            return Ok(snapshots);
+        }
+
+        let missing_records = misses
+            .iter()
+            .map(|(_, record)| record.clone())
+            .collect::<Vec<_>>();
+        let loaded = self.postgres.load_multi(&missing_records).await?;
+        for ((request_index, _), snapshot) in misses.into_iter().zip(loaded) {
+            if let Some(snapshot) = &snapshot
+                && let Err(error) = self.cache.put(snapshot).await
+            {
+                tracing::warn!(%error, namespace = %snapshot.record.namespace, key = %snapshot.record.key, "snapshot cache batch warmup failed");
+            }
+            snapshots[request_index] = snapshot;
+        }
+        Ok(snapshots)
     }
 }
 

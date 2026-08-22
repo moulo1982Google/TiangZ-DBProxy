@@ -50,6 +50,25 @@ async fn postgres_and_redis_preserve_snapshot_semantics() {
     );
     assert_eq!(store.load(&key).await.unwrap().unwrap().payload, b"v1");
 
+    let missing = RecordKey::new("integration", format!("missing-{}", test_suffix())).unwrap();
+    let cache = RedisSnapshotCache::connect(&redis_url).await.unwrap();
+    cache.delete(&key).await.unwrap();
+    let loaded = store
+        .load_multi(&[missing.clone(), key.clone()])
+        .await
+        .unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert!(
+        loaded[0].is_none(),
+        "missing records must preserve their slot"
+    );
+    assert_eq!(loaded[1].as_ref().unwrap().record, key);
+    assert_eq!(loaded[1].as_ref().unwrap().payload, b"v1");
+    assert!(
+        cache.get(&key).await.unwrap().is_some(),
+        "PostgreSQL batch fallback must warm Redis"
+    );
+
     let mut changed_request = first.clone();
     changed_request.payload = b"tampered-retry".to_vec();
     assert!(matches!(

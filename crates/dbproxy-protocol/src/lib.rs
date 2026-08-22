@@ -35,6 +35,8 @@ pub const MAX_RECORD_KEY_BYTES: usize = 512;
 pub const MAX_SCHEMA_BYTES: usize = 256;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 pub const MAX_TRANSACTION_RECORDS: usize = 256;
+/// One batch is intentionally smaller than a transaction limit so a single read cannot monopolize a connection.
+pub const MAX_BATCH_LOAD_RECORDS: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {

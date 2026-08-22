@@ -1,34 +1,54 @@
 use std::{env, error::Error, sync::Arc};
 
 use tiangz_dbproxy_server::{
-    DbProxyBackend, DbProxyServer, ServerConfig, StorageBackend,
-    config::{config_path_from_args, load_config},
+    DbProxyBackend, DbProxyServer, MemoryBackend, ServerConfig, StorageBackend,
+    config::{ResolvedDbProxyConfig, ResolvedStorage, config_path_from_args, load_config},
     run_backlog_worker,
 };
 use tokio::{sync::watch, task::JoinSet};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let config_path = config_path_from_args(env::args())?;
     let config = load_config(config_path)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&config.log_filter)?)
         .init();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config.runtime_worker_threads)
+        .enable_all()
+        .build()?;
+    runtime.block_on(run(config))
+}
 
-    let backend = Arc::new(
-        StorageBackend::connect(
-            &config.postgres_url,
-            &config.redis_url,
-            config.storage_shards,
-        )
-        .await?,
-    );
+async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
+    match config.storage.clone() {
+        ResolvedStorage::PostgresRedis {
+            postgres_url,
+            redis_url,
+            shards,
+        } => {
+            let backend =
+                Arc::new(StorageBackend::connect(&postgres_url, &redis_url, shards).await?);
+            let server_backend: Arc<dyn DbProxyBackend> = backend.clone();
+            run_server(config, server_backend, Some(backend)).await
+        }
+        ResolvedStorage::Memory { shards } => {
+            let backend: Arc<dyn DbProxyBackend> = Arc::new(MemoryBackend::new(shards)?);
+            run_server(config, backend, None).await
+        }
+    }
+}
+
+async fn run_server(
+    config: ResolvedDbProxyConfig,
+    server_backend: Arc<dyn DbProxyBackend>,
+    durable_backend: Option<Arc<StorageBackend>>,
+) -> Result<(), Box<dyn Error>> {
     let mut server_config = ServerConfig::new(config.listen_addr, config.auth_token.clone());
     server_config.max_frame_bytes = config.max_frame_bytes;
     server_config.handshake_timeout = config.handshake_timeout;
     server_config.shutdown_grace = config.shutdown_grace;
-    let server_backend: Arc<dyn DbProxyBackend> = backend.clone();
     let server = DbProxyServer::bind(server_config, server_backend).await?;
     let actual_addr = server.local_addr()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -42,20 +62,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let mut workers = JoinSet::new();
-    for _ in 0..config.backlog_workers {
-        workers.spawn(run_backlog_worker(
-            Arc::clone(&backend),
-            config.backlog_lease_ms,
-            config.backlog_idle_delay,
-            config.backlog_failure_delay,
-            shutdown_rx.clone(),
-        ));
+    if let Some(backend) = durable_backend {
+        for _ in 0..config.backlog_workers {
+            workers.spawn(run_backlog_worker(
+                Arc::clone(&backend),
+                config.backlog_lease_ms,
+                config.backlog_idle_delay,
+                config.backlog_failure_delay,
+                shutdown_rx.clone(),
+            ));
+        }
     }
     tracing::info!(
         %actual_addr,
         config = %config.source.display(),
-        shard_count = config.storage_shards,
-        worker_count = config.backlog_workers,
+        storage_backend = config.storage.name(),
+        shard_count = config.storage.shards(),
+        runtime_worker_threads = config.runtime_worker_threads,
+        backlog_worker_count = if matches!(config.storage, ResolvedStorage::PostgresRedis { .. }) {
+            config.backlog_workers
+        } else {
+            0
+        },
         "TiangZ DBProxy started"
     );
     let serve_result = server.serve(shutdown_rx.clone()).await;

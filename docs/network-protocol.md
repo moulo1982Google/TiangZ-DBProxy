@@ -29,11 +29,17 @@ client_name           // 只用于日志，不参与授权
 
 版本或指纹不一致返回`PROTOCOL_MISMATCH`；令牌不一致返回`UNAUTHORIZED`。认证成功后再接受RPC。当前共享令牌只解决内部服务最小鉴权，尚不包含租户配额、证书轮换或mTLS。
 
-## 七类 RPC
+## 八类 RPC
 
 ### LoadSnapshot
 
 读取Redis缓存，失败或未命中时回源PostgreSQL。返回`None`表示权威库中没有记录，不是网络错误。
+
+### LoadMultiSnapshot
+
+一次读取1至64条不重复的`RecordKey`，用于恢复由多个持久化领域组成的玩家或普通Entity。响应条目数量和顺序与请求严格一致；权威库中不存在的记录保留空条目，不能被压缩掉。客户端必须校验响应数量和每个快照的身份，避免错位应用领域数据。
+
+真实存储后端会按存储shard分组并行读取，不同shard互不阻塞；每个shard使用一次Redis `MGET`，并把全部缓存未命中记录合并为一次PostgreSQL多键查询。这样玩家拥有二三十个持久化领域时，网络、缓存和权威库都不会退化为逐领域串行往返。
 
 ### SaveSnapshot
 

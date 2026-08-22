@@ -16,6 +16,7 @@ test("snapshot writes cross the transport boundary as defensive copies", async (
   let captured;
   const transport = {
     load: async () => undefined,
+    loadMulti: async () => [],
     save: async (write) => {
       captured = write;
       return { disposition: "applied", revision: 1n };
@@ -48,9 +49,41 @@ test("snapshot writes cross the transport boundary as defensive copies", async (
   assert.equal(captured.expectedRevision, 0n);
 });
 
+test("batch load preserves order, missing records, and defensive payload ownership", async () => {
+  const payload = Uint8Array.from([1, 2, 3]);
+  const records = [
+    { namespace: "player", key: "1001:inventory" },
+    { namespace: "player", key: "1001:wallet" },
+  ];
+  const client = new DbProxyClient({
+    load: async () => undefined,
+    loadMulti: async () => [{
+      record: records[0],
+      schema: "player.inventory",
+      schemaVersion: 1,
+      revision: 2n,
+      payload,
+      updatedAtUnixMs: 10n,
+    }, undefined],
+    save: async () => ({ disposition: "applied", revision: 1n }),
+    enqueueSnapshot: async () => undefined,
+    applyTransaction: async () => ({ disposition: "applied", newRevision: 1n, result: new Uint8Array() }),
+    loadTransaction: async () => undefined,
+    applyMultiTransaction: async () => ({ disposition: "applied", records: [], result: new Uint8Array() }),
+    loadMultiTransaction: async () => undefined,
+  });
+  const snapshots = await client.LoadMulti(records);
+  payload[0] = 9;
+  assert.equal(snapshots.length, 2);
+  assert.deepEqual([...snapshots[0].payload], [1, 2, 3]);
+  assert.equal(snapshots[1], undefined);
+  assert.throws(() => client.LoadMulti([records[0], records[0]]), /duplicates/);
+});
+
 test("queued snapshots reject CAS because ACK only means backlog accepted", () => {
   const client = new DbProxyClient({
     load: async () => undefined,
+    loadMulti: async () => [],
     save: async () => ({ disposition: "applied", revision: 1n }),
     enqueueSnapshot: async () => undefined,
     applyTransaction: async () => ({
@@ -78,6 +111,7 @@ test("transaction receipt lookup validates identity and returns defensive bytes"
   const source = Uint8Array.from([7, 8, 9]);
   const client = new DbProxyClient({
     load: async () => undefined,
+    loadMulti: async () => [],
     save: async () => ({ disposition: "applied", revision: 1n }),
     enqueueSnapshot: async () => undefined,
     applyTransaction: async () => ({
@@ -110,6 +144,7 @@ test("multi-record transaction keeps all records and result defensive", async ()
   const result = Uint8Array.from([4, 5]);
   const client = new DbProxyClient({
     load: async () => undefined,
+    loadMulti: async () => [],
     save: async () => ({ disposition: "applied", revision: 1n }),
     enqueueSnapshot: async () => undefined,
     applyTransaction: async () => ({
@@ -166,6 +201,7 @@ test("SDK validation works in a bare V8 without TextEncoder", async () => {
   try {
     const client = new DbProxyClient({
       load: async () => undefined,
+      loadMulti: async () => [],
       save: async () => ({ disposition: "applied", revision: 1n }),
       enqueueSnapshot: async () => undefined,
       applyTransaction: async () => ({

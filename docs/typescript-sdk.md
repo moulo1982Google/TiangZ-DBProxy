@@ -16,6 +16,7 @@
 - 校验RecordKey、Schema、Revision和幂等ID；
 - 在跨Transport边界前复制Payload，防止调用方继续修改缓冲；
 - 保持`Load`、`Save`、`EnqueueSnapshot`、`ApplyTransaction`、`LoadTransaction`的稳定语义；
+- 提供`LoadMulti`批量恢复1至64条不重复记录，并保持缺失记录的响应位置；
 - 提供`ApplyMultiTransaction`和`LoadMultiTransaction`，并拒绝重复RecordKey和超过256条记录的请求；
 - 明确使用`bigint`表示uint64，避免JavaScript number精度丢失。
 

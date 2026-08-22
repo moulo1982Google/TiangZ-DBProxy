@@ -8,6 +8,13 @@
   "properties": {
     "$schema": { "type": "string" },
     "configVersion": { "const": 1 },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workerThreads": { "type": "integer", "minimum": 1, "description": "Tokio Runtime工作线程数；省略时使用逻辑CPU数，性能对比时必须显式设置。" }
+      }
+    },
     "server": {
       "type": "object",
       "additionalProperties": false,
@@ -21,14 +28,28 @@
       }
     },
     "storage": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["postgresUrlEnv", "redisUrlEnv"],
-      "properties": {
-        "postgresUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-        "redisUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-        "shards": { "type": "integer", "minimum": 1, "default": 4 }
-      }
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["backend", "postgresUrlEnv", "redisUrlEnv"],
+          "properties": {
+            "backend": { "const": "postgresRedis" },
+            "postgresUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+            "redisUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+            "shards": { "type": "integer", "minimum": 1, "default": 4 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["backend"],
+          "properties": {
+            "backend": { "const": "memory" },
+            "shards": { "type": "integer", "minimum": 1, "default": 4 }
+          }
+        }
+      ]
     },
     "backlog": {
       "type": "object",

@@ -8,7 +8,11 @@
     "handshakeTimeoutMs": 5000,
     "shutdownGraceMs": 5000
   },
+  "runtime": {
+    "workerThreads": 4
+  },
   "storage": {
+    "backend": "postgresRedis",
     "postgresUrlEnv": "DBPROXY_POSTGRES_URL",
     "redisUrlEnv": "DBPROXY_REDIS_URL",
     "shards": 4

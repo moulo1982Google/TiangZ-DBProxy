@@ -6,8 +6,12 @@
 //! game repositories, entity lifecycle, and business validation stay in TiangZ.
 
 pub mod config;
+mod memory_backend;
+
+pub use memory_backend::MemoryBackend;
 
 use std::{
+    collections::HashSet,
     fmt,
     hash::{Hash, Hasher},
     io,
@@ -46,6 +50,8 @@ pub enum BackendError {
     Core(#[from] StoreError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error("backend worker failed: {0}")]
+    Worker(String),
 }
 
 /// 网络层依赖的最小后端接口。实现不能把业务对象泄漏到 DBProxy。
@@ -53,6 +59,16 @@ pub enum BackendError {
 #[async_trait]
 pub trait DbProxyBackend: Send + Sync + 'static {
     async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, BackendError>;
+    async fn load_multi(
+        &self,
+        records: &[RecordKey],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, BackendError> {
+        let mut snapshots = Vec::with_capacity(records.len());
+        for record in records {
+            snapshots.push(self.load(record).await?);
+        }
+        Ok(snapshots)
+    }
     async fn save(&self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, BackendError>;
     async fn enqueue_snapshot(&self, request: SnapshotWrite) -> Result<(), BackendError>;
     async fn apply_transaction(
@@ -114,11 +130,14 @@ impl StorageBackend {
         })
     }
 
-    fn shard(&self, record: &RecordKey) -> TieredSnapshotStore {
+    fn shard_index(&self, record: &RecordKey) -> usize {
         let mut hasher = StableHasher::default();
         record.hash(&mut hasher);
-        let index = (hasher.finish() as usize) % self.shards.len();
-        self.shards[index].clone()
+        (hasher.finish() as usize) % self.shards.len()
+    }
+
+    fn shard(&self, record: &RecordKey) -> TieredSnapshotStore {
+        self.shards[self.shard_index(record)].clone()
     }
 
     fn shard_for_operation(&self, operation_id: &str) -> TieredSnapshotStore {
@@ -156,6 +175,46 @@ impl StorageBackend {
 impl DbProxyBackend for StorageBackend {
     async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, BackendError> {
         Ok(self.shard(record).load(record).await?)
+    }
+
+    async fn load_multi(
+        &self,
+        records: &[RecordKey],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, BackendError> {
+        let mut groups = vec![Vec::new(); self.shards.len()];
+        for (request_index, record) in records.iter().enumerate() {
+            groups[self.shard_index(record)].push((request_index, record.clone()));
+        }
+
+        let mut workers = JoinSet::new();
+        for (shard_index, group) in groups.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let shard = self.shards[shard_index].clone();
+            workers.spawn(async move {
+                let records = group
+                    .iter()
+                    .map(|(_, record)| record.clone())
+                    .collect::<Vec<_>>();
+                let snapshots = shard.load_multi(&records).await?;
+                let loaded = group
+                    .into_iter()
+                    .zip(snapshots)
+                    .map(|((request_index, _), snapshot)| (request_index, snapshot))
+                    .collect::<Vec<_>>();
+                Ok::<_, StorageError>(loaded)
+            });
+        }
+
+        let mut snapshots = vec![None; records.len()];
+        while let Some(result) = workers.join_next().await {
+            let loaded = result.map_err(|error| BackendError::Worker(error.to_string()))??;
+            for (request_index, snapshot) in loaded {
+                snapshots[request_index] = snapshot;
+            }
+        }
+        Ok(snapshots)
     }
 
     async fn save(&self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, BackendError> {
@@ -553,6 +612,46 @@ async fn dispatch_body(
                 },
             ))
         }
+        wire::request_envelope::Body::LoadMultiSnapshot(request) => {
+            if request.records.is_empty() {
+                return Err(RpcFailure::invalid("load_multi_snapshot.records is empty"));
+            }
+            if request.records.len() > tiangz_dbproxy_protocol::MAX_BATCH_LOAD_RECORDS {
+                return Err(RpcFailure::invalid(
+                    "load_multi_snapshot.records exceeds the record limit",
+                ));
+            }
+            let records = request
+                .records
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<RecordKey>, _>>()
+                .map_err(RpcFailure::from_protocol)?;
+            if records.iter().collect::<HashSet<_>>().len() != records.len() {
+                return Err(RpcFailure::invalid(
+                    "load_multi_snapshot.records contains duplicates",
+                ));
+            }
+            let snapshots = backend
+                .load_multi(&records)
+                .await
+                .map_err(RpcFailure::from_backend)?;
+            if snapshots.len() != records.len() {
+                return Err(RpcFailure::internal(
+                    "backend returned a mismatched batch load result",
+                ));
+            }
+            Ok(wire::response_envelope::Body::LoadMultiSnapshot(
+                wire::LoadMultiSnapshotResponse {
+                    entries: snapshots
+                        .iter()
+                        .map(|snapshot| wire::LoadMultiSnapshotEntry {
+                            snapshot: snapshot.as_ref().map(Into::into),
+                        })
+                        .collect(),
+                },
+            ))
+        }
         wire::request_envelope::Body::SaveSnapshot(request) => {
             let request = request.try_into().map_err(RpcFailure::from_protocol)?;
             let outcome = backend
@@ -773,6 +872,14 @@ impl RpcFailure {
         }
     }
 
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: wire::ErrorCode::Internal,
+            public_message: message.into(),
+            actual_revision: None,
+        }
+    }
+
     fn from_protocol(error: ProtocolError) -> Self {
         match error {
             ProtocolError::Store(error) => Self::from_store(error),
@@ -810,6 +917,10 @@ impl RpcFailure {
                         .to_string(),
                     actual_revision: None,
                 }
+            }
+            BackendError::Worker(error) => {
+                tracing::error!(%error, "DBProxy backend worker failed");
+                Self::internal("DBProxy backend worker failed")
             }
         }
     }

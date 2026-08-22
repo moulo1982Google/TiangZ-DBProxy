@@ -48,6 +48,19 @@ message LoadSnapshotResponse {
   SnapshotEnvelope snapshot = 1;
 }
 
+message LoadMultiSnapshotRequest {
+  repeated RecordKey records = 1;
+}
+
+// Entries preserve request order. A missing snapshot represents an absent record.
+message LoadMultiSnapshotEntry {
+  SnapshotEnvelope snapshot = 1;
+}
+
+message LoadMultiSnapshotResponse {
+  repeated LoadMultiSnapshotEntry entries = 1;
+}
+
 message SaveSnapshotRequest {
   string request_id = 1;
   RecordKey record = 2;
@@ -155,6 +168,7 @@ message RequestEnvelope {
     LoadTransactionRequest load_transaction = 14;
     ApplyMultiTransactionRequest apply_multi_transaction = 15;
     LoadMultiTransactionRequest load_multi_transaction = 16;
+    LoadMultiSnapshotRequest load_multi_snapshot = 17;
   }
 }
 
@@ -169,6 +183,7 @@ message ResponseEnvelope {
     LoadTransactionResponse load_transaction = 14;
     ApplyMultiTransactionResponse apply_multi_transaction = 15;
     LoadMultiTransactionResponse load_multi_transaction = 16;
+    LoadMultiSnapshotResponse load_multi_snapshot = 17;
   }
 }
 

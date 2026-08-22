@@ -35,6 +35,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 - `RedisSnapshotBacklog`：把尚未落 PostgreSQL 的普通快照保存到独立 Redis backlog，支持 lease、ACK、释放、续租和过期回收
 - `dbproxy-protocol`：版本化 Protobuf、协议指纹和 8 MiB 默认有界帧
 - `dbproxy-server`：内部令牌握手、按 RecordKey 分片的真实存储连接和持久积压消费者
+- `MemoryBackend`：保留Revision、CAS、幂等和多记录原子语义的易失后端，用于隔离网络/协议/调度成本；不会连接PostgreSQL或Redis
 - `dbproxy-client`：Rust 异步客户端及多连接池；TiangZ 不需要引用存储 crate
 - `@tiangz/dbproxy-sdk`：TypeScript稳定类型、参数校验、防御性Payload复制、多记录事务和可插拔Transport；不绑定Node、Deno或TiangZ
 - `fault_matrix.ps1`：显式停止/恢复本机容器，验证 Redis、PostgreSQL 和快照积压恢复边界
@@ -44,13 +45,24 @@ TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transpor
 
 ## 启动配置
 
-DBProxy使用带`configVersion: 1`的严格JSON保存普通启动参数，默认读取`configs/local.json`，并由`configs/dbproxy.schema.json`提供编辑器提示。连接串和认证令牌不能写进JSON；配置文件只记录环境变量名，由部署环境注入实际密钥：
+DBProxy使用带`configVersion: 1`的严格JSON保存普通启动参数，默认读取`configs/local.json`，并由`configs/dbproxy.schema.json`提供编辑器提示。`runtime.workerThreads`可以固定Tokio Runtime工作线程数，省略时沿用Tokio按逻辑CPU选择的行为；它与只负责Redis积压消费的`backlog.workers`不是同一个参数。连接串和认证令牌不能写进JSON；配置文件只记录环境变量名，由部署环境注入实际密钥：
 
 ```powershell
 cargo run -p tiangz-dbproxy-server -- --config configs/local.json
 ```
 
 未知字段、零worker、零lease、空密钥变量会在建立网络连接前直接报错。每个 DBProxy 实例只配置一个监听地址；部署两个实例时使用两份 JSON，二者共享同一 PostgreSQL 和 Redis。多 Endpoint 写在业务客户端配置中，而不是 DBProxy 服务端配置中：第一个地址是首选，后续地址是故障切换候选。
+
+存储后端必须显式选择。正式和恢复测试使用`postgresRedis`；`memory`只用于本地开发与性能隔离，进程退出后数据全部丢失，并且`EnqueueSnapshot`会直接写入内存权威快照，不模拟Redis AOF与异步刷盘：
+
+```json
+{
+  "runtime": { "workerThreads": 4 },
+  "storage": { "backend": "memory", "shards": 16 }
+}
+```
+
+仓库提供`configs/perf-memory-4.json`，固定使用4个Runtime工作线程和MemoryStub。该配置只测DBProxy自身的网络、协议、调度、分片锁和事务语义，不把PostgreSQL或Redis性能混入结果。
 
 ```text
 DBProxy-1: 127.0.0.1:7800 ─┐
@@ -101,6 +113,34 @@ powershell -ExecutionPolicy Bypass -File tools/run_local.ps1
 powershell -ExecutionPolicy Bypass -File tools/network_smoke.ps1
 ```
 
+## 业务持久化性能
+
+当前4-worker MemoryBackend基线中，100并发拾取事务达到约3.53万次/秒，NPC商店事务约3.84万次/秒；30个领域使用`LoadMultiSnapshot`后，玩家恢复吞吐相对逐条读取提高约12.23倍。完整环境、延迟、并发曲线、结果边界和复现命令见[性能基线](PERFORMANCE.md)。
+
+`dbproxy_business_load`直接经过Rust客户端、TCP协议和DBProxy后端，使用Starter当前的持久化形状：
+
+- `playerDataSingle`：每个玩家领域各发一个`LoadSnapshot`，作为批量读取的对照组。
+- `playerDataBatch`：用一个`LoadMultiSnapshot`读取全部玩家领域。
+- `pickup`：原子提交`inventory + quest + wallet`三条记录及拾取回执。
+- `npcShop`：原子提交`inventory + wallet`两条记录及买卖回执。
+
+它刻意不运行战斗、AOI、怪物死亡或NPC距离检查，因此测到的是DBProxy链路，不是整服玩法吞吐。Payload大小会写入结果，所有写操作都持续推进真实Revision，任何冲突都会计为失败并停止对应虚拟玩家。
+
+```powershell
+cargo build --release -p tiangz-dbproxy-server --bin tiangz-dbproxy-server
+cargo build --release --bin dbproxy_business_load
+$env:DBPROXY_AUTH_TOKEN = "local-perf-token-1234"
+./target/release/tiangz-dbproxy-server --config configs/perf-memory-4.json
+
+# 在另一个终端运行。
+./target/release/dbproxy_business_load --endpoint 127.0.0.1:7810 --pool-size 32 --players 100 --duration 30
+
+# 模拟30个玩家持久化领域，比较逐条Load和LoadMulti。
+./target/release/dbproxy_business_load --endpoint 127.0.0.1:7810 --pool-size 64 --players 100 --duration 30 --domain-count 30 --workloads playerDataSingle,playerDataBatch
+```
+
+正式测试必须保持服务端`runtime.workerThreads`、`storage.shards`、客户端连接池、玩家数、时长和机器环境一致。每种工作负载使用全新DBProxy进程，至少运行三轮，报告`ops/s、p50/p95/p99、失败数、DBProxy CPU/RSS`。该结果是DBProxy自身的性能上界，不代表PostgreSQL容量，也不用于评价数据库选型。
+
 本机开发账号只绑定回环地址：PostgreSQL 用户和数据库都是 `tiangz`，密码是 `tiangz_dev`；Redis 密码也是 `tiangz_dev`。这些凭据只适用于本地开发，不能复制到线上。
 
 ## 设计原则
@@ -114,7 +154,7 @@ powershell -ExecutionPolicy Bypass -File tools/network_smoke.ps1
 
 ## TypeScript SDK
 
-SDK以`DbProxyTransport`隔离宿主I/O。业务或框架适配层创建`DbProxyClient`后，只调用`Load`、`Save`、`EnqueueSnapshot`、`ApplyTransaction`和`LoadTransaction`；SDK不会生成幂等ID，也不会在失败后偷偷换ID重试。
+SDK以`DbProxyTransport`隔离宿主I/O。业务或框架适配层创建`DbProxyClient`后，只调用版本化SDK；SDK不会生成幂等ID，也不会在失败后偷偷换ID重试。玩家由多个持久化领域组成时，应使用`LoadMulti`一次恢复最多64条快照，避免为每个领域单独产生网络往返。
 
 ```ts
 import { DbProxyClient, type DbProxyTransport } from "@tiangz/dbproxy-sdk";
@@ -128,10 +168,11 @@ const snapshot = await client.Load({ namespace: "player", key: "1001" });
 
 ## 网络边界
 
-当前协议提供七类 RPC：
+当前协议提供八类 RPC：
 
 ```text
 LoadSnapshot       读取已提交权威快照
+LoadMultiSnapshot  按请求顺序批量读取最多64条权威快照，缺失记录保留空位
 SaveSnapshot       同步写 PostgreSQL，再刷新 Redis；成功才表示本次提交完成
 EnqueueSnapshot    写入 Redis AOF backlog；成功只表示已可靠接收，不表示 PostgreSQL 已落库
 ApplyTransaction   提交单记录关键事务并保存原始业务结果

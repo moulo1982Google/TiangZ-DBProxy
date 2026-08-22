@@ -6,6 +6,7 @@
 //! should use a pool, and TiangZ business threads must never perform blocking database I/O.
 
 use std::{
+    collections::HashSet,
     fmt,
     hash::{Hash, Hasher},
     sync::Arc,
@@ -22,8 +23,9 @@ use tiangz_dbproxy_core::{
     TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_protocol::{
-    DEFAULT_MAX_FRAME_BYTES, MAX_AUTH_TOKEN_BYTES, MAX_CLIENT_NAME_BYTES, MAX_TRANSACTION_RECORDS,
-    PROTOCOL_FINGERPRINT, PROTOCOL_VERSION, ProtocolError, read_message, wire, write_message,
+    DEFAULT_MAX_FRAME_BYTES, MAX_AUTH_TOKEN_BYTES, MAX_BATCH_LOAD_RECORDS, MAX_CLIENT_NAME_BYTES,
+    MAX_TRANSACTION_RECORDS, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION, ProtocolError, read_message,
+    wire, write_message,
 };
 use tokio::{net::TcpStream, sync::Mutex, time::timeout};
 
@@ -179,6 +181,16 @@ impl DbProxyClientPool {
 
     pub async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, ClientError> {
         self.client(record).load(record).await
+    }
+
+    pub async fn load_multi(
+        &self,
+        records: &[RecordKey],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, ClientError> {
+        let first = records
+            .first()
+            .ok_or(ClientError::InvalidConfig("batch load records are empty"))?;
+        self.client(first).load_multi(records).await
     }
 
     pub async fn save(&self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, ClientError> {
@@ -449,6 +461,60 @@ impl DbProxyClient {
             .map(TryInto::try_into)
             .transpose()
             .map_err(Into::into)
+    }
+
+    pub async fn load_multi(
+        &self,
+        records: &[RecordKey],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, ClientError> {
+        if records.is_empty() || records.len() > MAX_BATCH_LOAD_RECORDS {
+            return Err(ClientError::InvalidConfig(
+                "batch load size is outside the protocol limit",
+            ));
+        }
+        if records.iter().collect::<HashSet<_>>().len() != records.len() {
+            return Err(ClientError::InvalidConfig(
+                "batch load records contain duplicates",
+            ));
+        }
+        let response = self
+            .call(wire::request_envelope::Body::LoadMultiSnapshot(
+                wire::LoadMultiSnapshotRequest {
+                    records: records.iter().map(Into::into).collect(),
+                },
+            ))
+            .await?;
+        let Some(wire::response_envelope::Body::LoadMultiSnapshot(result)) = response.body else {
+            return Err(ClientError::UnexpectedResponse(
+                "batch load returned another response type",
+            ));
+        };
+        if result.entries.len() != records.len() {
+            return Err(ClientError::UnexpectedResponse(
+                "batch load returned a mismatched result count",
+            ));
+        }
+        result
+            .entries
+            .into_iter()
+            .zip(records)
+            .map(|(entry, expected)| {
+                let snapshot = entry
+                    .snapshot
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .map_err(ClientError::from)?;
+                if snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot: &SnapshotEnvelope| &snapshot.record != expected)
+                {
+                    return Err(ClientError::UnexpectedResponse(
+                        "batch load snapshot identity mismatch",
+                    ));
+                }
+                Ok(snapshot)
+            })
+            .collect()
     }
 
     pub async fn save(&self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, ClientError> {
