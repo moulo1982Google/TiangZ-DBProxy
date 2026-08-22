@@ -37,6 +37,8 @@ pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 pub const MAX_TRANSACTION_RECORDS: usize = 256;
 /// One batch is intentionally smaller than a transaction limit so a single read cannot monopolize a connection.
 pub const MAX_BATCH_LOAD_RECORDS: usize = 64;
+/// Ordinary snapshot batches are bounded independently from atomic multi-record transactions.
+pub const MAX_BATCH_SNAPSHOT_WRITES: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {

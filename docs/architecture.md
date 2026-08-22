@@ -187,7 +187,7 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 - [x] 多Endpoint客户端：首选地址、备用地址、连接失效后的顺序切换，并保留原幂等ID重放
 - [x] 两个对等DBProxy实例共享云Redis/PostgreSQL；网络测试覆盖请求中断、同ID重放和全候选失败
 - [x] 跨记录原子事务：固定排序加锁、整组CAS、整组回执和重复提交恢复
-- [ ] 批量读取和批量写入
+- [x] 批量读取和批量写入：按shard并行、逐记录结果，普通快照不冒充跨记录事务
 - Prometheus 指标
 - [ ] 生产级优雅停机指标、死信处理和连接自动恢复
 
@@ -199,7 +199,7 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 - [ ] 批量登录恢复与周期快照
 - [ ] 关键经济事务、崩溃窗口和节点接管验收
 
-批量读取/写入、Outbox、跨数据库补偿和生产节点接管仍是后续阶段；本版本的跨记录事务只覆盖同一 PostgreSQL 权威库内的整组快照提交。
+Outbox、跨数据库补偿和生产节点接管仍是后续阶段；普通批量写入允许部分成功，跨记录事务只覆盖同一 PostgreSQL 权威库内的整组快照提交。
 
 ## 网络服务边界
 
@@ -209,7 +209,8 @@ ACK前如果同一`RecordKey`又入队了新快照，旧ACK只会移除旧proces
 TiangZ Repository
     -> DbProxyClientPool
     -> ClientHello(version + fingerprint + token)
-    -> Load / Save / Enqueue / ApplyTransaction / LoadTransaction
+    -> Load / Save / Enqueue / batch snapshot operations
+    -> ApplyTransaction / LoadTransaction
     -> ApplyMultiTransaction / LoadMultiTransaction
     -> StorageBackend(record or operation shard)
     -> PostgreSQL / Redis
@@ -219,4 +220,4 @@ TiangZ Repository
 
 一个SDK连接内有且只有一个在途请求，避免超时后响应错位。需要并发时使用`DbProxyClientPool`；同一RecordKey稳定落在同一连接，不同记录可以并行。服务端同样按RecordKey选择独立`TieredSnapshotStore`分片，数据库仍负责跨连接的Revision、唯一键和事务一致性。
 
-TypeScript SDK不直接假定Node或Deno网络API，而是定义`DbProxyTransport`。宿主Transport负责真实TCP、连接池、超时和重连，SDK负责参数校验、Payload所有权与四种RPC的ACK语义。这样TiangZ嵌入式V8、Node工具和未来其他TS宿主可以共用同一业务接口，而不把某个运行时能力带进DBProxy核心。
+TypeScript SDK不直接假定Node或Deno网络API，而是定义`DbProxyTransport`。宿主Transport负责真实TCP、连接池、超时和重连，SDK负责参数校验、Payload所有权与各类RPC的ACK语义。这样TiangZ嵌入式V8、Node工具和未来其他TS宿主可以共用同一业务接口，而不把某个运行时能力带进DBProxy核心。

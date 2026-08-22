@@ -76,12 +76,39 @@ message SaveSnapshotResponse {
   uint64 revision = 2;
 }
 
+message SaveMultiSnapshotRequest {
+  repeated SaveSnapshotRequest writes = 1;
+}
+
+// Entries preserve request order. A record error does not roll back successful siblings.
+message SaveMultiSnapshotEntry {
+  SaveSnapshotResponse result = 1;
+  RpcError error = 2;
+}
+
+message SaveMultiSnapshotResponse {
+  repeated SaveMultiSnapshotEntry entries = 1;
+}
+
 message EnqueueSnapshotRequest {
   SaveSnapshotRequest write = 1;
 }
 
 message EnqueueSnapshotResponse {
   bool accepted = 1;
+}
+
+message EnqueueMultiSnapshotRequest {
+  repeated SaveSnapshotRequest writes = 1;
+}
+
+message EnqueueMultiSnapshotEntry {
+  bool accepted = 1;
+  RpcError error = 2;
+}
+
+message EnqueueMultiSnapshotResponse {
+  repeated EnqueueMultiSnapshotEntry entries = 1;
 }
 
 message ApplyTransactionRequest {
@@ -169,6 +196,8 @@ message RequestEnvelope {
     ApplyMultiTransactionRequest apply_multi_transaction = 15;
     LoadMultiTransactionRequest load_multi_transaction = 16;
     LoadMultiSnapshotRequest load_multi_snapshot = 17;
+    SaveMultiSnapshotRequest save_multi_snapshot = 18;
+    EnqueueMultiSnapshotRequest enqueue_multi_snapshot = 19;
   }
 }
 
@@ -184,6 +213,8 @@ message ResponseEnvelope {
     ApplyMultiTransactionResponse apply_multi_transaction = 15;
     LoadMultiTransactionResponse load_multi_transaction = 16;
     LoadMultiSnapshotResponse load_multi_snapshot = 17;
+    SaveMultiSnapshotResponse save_multi_snapshot = 18;
+    EnqueueMultiSnapshotResponse enqueue_multi_snapshot = 19;
   }
 }
 

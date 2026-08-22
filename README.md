@@ -174,7 +174,9 @@ const snapshot = await client.Load({ namespace: "player", key: "1001" });
 LoadSnapshot       读取已提交权威快照
 LoadMultiSnapshot  按请求顺序批量读取最多64条权威快照，缺失记录保留空位
 SaveSnapshot       同步写 PostgreSQL，再刷新 Redis；成功才表示本次提交完成
+SaveMultiSnapshot  最多64条普通快照按shard并行，逐记录返回revision或错误，不提供原子性
 EnqueueSnapshot    写入 Redis AOF backlog；成功只表示已可靠接收，不表示 PostgreSQL 已落库
+EnqueueMultiSnapshot 最多64条普通快照一次写入Redis backlog，禁止携带expectedRevision
 ApplyTransaction   提交单记录关键事务并保存原始业务结果
 LoadTransaction    按operationId与RecordKey读取已提交事务回执
 ApplyMultiTransaction  在一个 PostgreSQL 事务中原子提交多条记录

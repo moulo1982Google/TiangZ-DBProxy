@@ -29,7 +29,7 @@ client_name           // 只用于日志，不参与授权
 
 版本或指纹不一致返回`PROTOCOL_MISMATCH`；令牌不一致返回`UNAUTHORIZED`。认证成功后再接受RPC。当前共享令牌只解决内部服务最小鉴权，尚不包含租户配额、证书轮换或mTLS。
 
-## 八类 RPC
+## 十类 RPC
 
 ### LoadSnapshot
 
@@ -53,6 +53,12 @@ PostgreSQL事务提交
 
 缓存刷新失败会返回`STORAGE_UNAVAILABLE`。此时PostgreSQL可能已经提交，调用方必须用原`request_id`重试；DBProxy命中幂等收据后修复缓存。
 
+### SaveMultiSnapshot
+
+一次提交1至64条不重复的普通快照。真实存储后端按RecordKey分组到固定shard，并行执行各组写入；响应保持请求顺序，每条记录独立返回`Applied/Duplicate + revision`或结构化错误。
+
+该接口只减少网络往返与调度开销，不是跨记录事务。部分记录成功时不会回滚已经提交的其他记录，调用方必须先应用全部成功revision，再针对失败记录决定重载或重试。需要“全部成功或全部回滚”的货币、背包、交易变更必须使用`ApplyMultiTransaction`。
+
 ### EnqueueSnapshot
 
 用于允许小范围回退的合并快照。成功响应只表示Redis AOF backlog已经接收：
@@ -65,6 +71,10 @@ EnqueueSnapshot ACK
 ```
 
 货币、背包、奖励和交易禁止使用该接口。
+
+### EnqueueMultiSnapshot
+
+一次把1至64条无CAS普通快照写入Redis AOF backlog。真实Redis后端通过一个Lua脚本原子接收整批记录，只产生一次Redis往返；成功仍然只代表backlog可靠接收，不代表PostgreSQL已经落库。
 
 ### ApplyTransaction
 
@@ -135,10 +145,9 @@ let config = ClientConfig::new("127.0.0.1:7800", token, "map-1")
 
 ## 当前未完成
 
-- 批量Load/Save，减少大量登录恢复时的RPC开销
 - Prometheus延迟、错误码、连接、存储分片和backlog指标
 - 健康检查、熔断窗口和恢复探测指标（当前已有连接失效后的顺序切换）
 - 生产TLS/mTLS、令牌轮换、租户隔离和限流
 - 生产Docker镜像、滚动升级和协议双版本窗口
 
-运行时无关 TypeScript SDK 已支持多记录事务，TiangZ首个Player Snapshot Repository仍通过单记录通用 Repository 接入；跨玩家交易等领域 Repository 应显式调用多记录接口，不应把它偷偷塞进普通Entity Repository。
+运行时无关 TypeScript SDK 已支持批量普通快照与多记录事务。跨玩家交易等领域 Repository 应显式调用多记录事务接口，不应把原子业务语义偷偷塞进普通Entity Repository。

@@ -218,6 +218,41 @@ impl RedisSnapshotBacklog {
         Ok(())
     }
 
+    /// 原子接收一批普通快照；同一批只产生一次 Redis 往返。批内记录必须已经去重。
+    /// Atomically accept one snapshot batch with a single Redis round trip. Records must be unique.
+    pub async fn enqueue_multi(&self, requests: &[SnapshotWrite]) -> Result<(), StorageError> {
+        let mut prepared = Vec::with_capacity(requests.len());
+        for request in requests {
+            Self::validate(request)?;
+            let member = Self::member(&request.record);
+            prepared.push((Self::entry_key(&member), Self::encode(request)?, member));
+        }
+        let score = Self::now_unix_ms()?;
+        let script = Script::new(
+            r#"
+local score = ARGV[1]
+for index = 2, #ARGV, 3 do
+    redis.call('SET', ARGV[index], ARGV[index + 1])
+    redis.call('ZADD', KEYS[1], score, ARGV[index + 2])
+end
+return (#ARGV - 1) / 3
+"#,
+        );
+        let mut invocation = script.prepare_invoke();
+        invocation.key(PENDING_KEY).arg(score);
+        for (entry_key, encoded, member) in prepared {
+            invocation.arg(entry_key).arg(encoded).arg(member);
+        }
+        let mut connection = self.connection.lock().await;
+        let accepted: i64 = invocation.invoke_async(&mut *connection).await?;
+        if accepted != i64::try_from(requests.len()).unwrap_or(i64::MAX) {
+            return Err(StorageError::BacklogProtocol(
+                "batch enqueue returned an invalid count".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// 领取一条积压并设置 lease；会先把过期 lease 重新放回 pending。
     /// Claim one backlog item with a lease; expired leases are reclaimed first.
     pub async fn claim(&self, lease_ms: u64) -> Result<Option<SnapshotBacklogLease>, StorageError> {

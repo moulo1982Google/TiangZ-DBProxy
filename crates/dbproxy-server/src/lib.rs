@@ -70,7 +70,27 @@ pub trait DbProxyBackend: Send + Sync + 'static {
         Ok(snapshots)
     }
     async fn save(&self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, BackendError>;
+    async fn save_multi(
+        &self,
+        requests: Vec<SnapshotWrite>,
+    ) -> Result<Vec<Result<SnapshotWriteOutcome, BackendError>>, BackendError> {
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            outcomes.push(self.save(request).await);
+        }
+        Ok(outcomes)
+    }
     async fn enqueue_snapshot(&self, request: SnapshotWrite) -> Result<(), BackendError>;
+    async fn enqueue_multi_snapshot(
+        &self,
+        requests: Vec<SnapshotWrite>,
+    ) -> Result<Vec<Result<(), BackendError>>, BackendError> {
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            outcomes.push(self.enqueue_snapshot(request).await);
+        }
+        Ok(outcomes)
+    }
     async fn apply_transaction(
         &self,
         request: TransactionalWrite,
@@ -222,8 +242,65 @@ impl DbProxyBackend for StorageBackend {
         Ok(store.save(request).await?)
     }
 
+    async fn save_multi(
+        &self,
+        requests: Vec<SnapshotWrite>,
+    ) -> Result<Vec<Result<SnapshotWriteOutcome, BackendError>>, BackendError> {
+        let request_count = requests.len();
+        let mut groups = (0..self.shards.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
+        for (request_index, request) in requests.into_iter().enumerate() {
+            groups[self.shard_index(&request.record)].push((request_index, request));
+        }
+
+        let mut workers = JoinSet::new();
+        for (shard_index, group) in groups.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let mut shard = self.shards[shard_index].clone();
+            workers.spawn(async move {
+                let mut outcomes = Vec::with_capacity(group.len());
+                for (request_index, request) in group {
+                    outcomes.push((
+                        request_index,
+                        shard.save(request).await.map_err(BackendError::from),
+                    ));
+                }
+                outcomes
+            });
+        }
+
+        let mut outcomes = std::iter::repeat_with(|| None)
+            .take(request_count)
+            .collect::<Vec<_>>();
+        while let Some(result) = workers.join_next().await {
+            for (request_index, outcome) in
+                result.map_err(|error| BackendError::Worker(error.to_string()))?
+            {
+                outcomes[request_index] = Some(outcome);
+            }
+        }
+        outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome
+                    .ok_or_else(|| BackendError::Worker("batch save result is missing".to_string()))
+            })
+            .collect()
+    }
+
     async fn enqueue_snapshot(&self, request: SnapshotWrite) -> Result<(), BackendError> {
         Ok(self.backlog.enqueue(request).await?)
+    }
+
+    async fn enqueue_multi_snapshot(
+        &self,
+        requests: Vec<SnapshotWrite>,
+    ) -> Result<Vec<Result<(), BackendError>>, BackendError> {
+        self.backlog.enqueue_multi(&requests).await?;
+        Ok(requests.into_iter().map(|_| Ok(())).collect())
     }
 
     async fn apply_transaction(
@@ -666,6 +743,55 @@ async fn dispatch_body(
                 },
             ))
         }
+        wire::request_envelope::Body::SaveMultiSnapshot(request) => {
+            if request.writes.is_empty() {
+                return Err(RpcFailure::invalid("save_multi_snapshot.writes is empty"));
+            }
+            if request.writes.len() > tiangz_dbproxy_protocol::MAX_BATCH_SNAPSHOT_WRITES {
+                return Err(RpcFailure::invalid(
+                    "save_multi_snapshot.writes exceeds the record limit",
+                ));
+            }
+            let writes = request
+                .writes
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<SnapshotWrite>, _>>()
+                .map_err(RpcFailure::from_protocol)?;
+            validate_snapshot_write_batch(&writes)?;
+            let expected_count = writes.len();
+            let outcomes = backend
+                .save_multi(writes)
+                .await
+                .map_err(RpcFailure::from_backend)?;
+            if outcomes.len() != expected_count {
+                return Err(RpcFailure::internal(
+                    "backend returned a mismatched batch save result",
+                ));
+            }
+            let entries = outcomes
+                .into_iter()
+                .map(|outcome| match outcome {
+                    Ok(outcome) => {
+                        let (disposition, revision) = snapshot_outcome(outcome);
+                        wire::SaveMultiSnapshotEntry {
+                            result: Some(wire::SaveSnapshotResponse {
+                                disposition: disposition.into(),
+                                revision: revision.0,
+                            }),
+                            error: None,
+                        }
+                    }
+                    Err(error) => wire::SaveMultiSnapshotEntry {
+                        result: None,
+                        error: Some(RpcFailure::from_backend(error).into_wire()),
+                    },
+                })
+                .collect::<Vec<_>>();
+            Ok(wire::response_envelope::Body::SaveMultiSnapshot(
+                wire::SaveMultiSnapshotResponse { entries },
+            ))
+        }
         wire::request_envelope::Body::EnqueueSnapshot(request) => {
             let request = request
                 .write
@@ -678,6 +804,51 @@ async fn dispatch_body(
                 .map_err(RpcFailure::from_backend)?;
             Ok(wire::response_envelope::Body::EnqueueSnapshot(
                 wire::EnqueueSnapshotResponse { accepted: true },
+            ))
+        }
+        wire::request_envelope::Body::EnqueueMultiSnapshot(request) => {
+            if request.writes.is_empty() {
+                return Err(RpcFailure::invalid(
+                    "enqueue_multi_snapshot.writes is empty",
+                ));
+            }
+            if request.writes.len() > tiangz_dbproxy_protocol::MAX_BATCH_SNAPSHOT_WRITES {
+                return Err(RpcFailure::invalid(
+                    "enqueue_multi_snapshot.writes exceeds the record limit",
+                ));
+            }
+            let writes = request
+                .writes
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<SnapshotWrite>, _>>()
+                .map_err(RpcFailure::from_protocol)?;
+            validate_snapshot_write_batch(&writes)?;
+            let expected_count = writes.len();
+            let outcomes = backend
+                .enqueue_multi_snapshot(writes)
+                .await
+                .map_err(RpcFailure::from_backend)?;
+            if outcomes.len() != expected_count {
+                return Err(RpcFailure::internal(
+                    "backend returned a mismatched batch enqueue result",
+                ));
+            }
+            let entries = outcomes
+                .into_iter()
+                .map(|outcome| match outcome {
+                    Ok(()) => wire::EnqueueMultiSnapshotEntry {
+                        accepted: true,
+                        error: None,
+                    },
+                    Err(error) => wire::EnqueueMultiSnapshotEntry {
+                        accepted: false,
+                        error: Some(RpcFailure::from_backend(error).into_wire()),
+                    },
+                })
+                .collect::<Vec<_>>();
+            Ok(wire::response_envelope::Body::EnqueueMultiSnapshot(
+                wire::EnqueueMultiSnapshotResponse { entries },
             ))
         }
         wire::request_envelope::Body::ApplyTransaction(request) => {
@@ -842,6 +1013,32 @@ fn snapshot_outcome(outcome: SnapshotWriteOutcome) -> (wire::WriteDisposition, R
     }
 }
 
+fn validate_snapshot_write_batch(writes: &[SnapshotWrite]) -> Result<(), RpcFailure> {
+    if writes
+        .iter()
+        .map(|write| &write.record)
+        .collect::<HashSet<_>>()
+        .len()
+        != writes.len()
+    {
+        return Err(RpcFailure::invalid(
+            "snapshot batch contains duplicate records",
+        ));
+    }
+    if writes
+        .iter()
+        .map(|write| write.request_id.as_str())
+        .collect::<HashSet<_>>()
+        .len()
+        != writes.len()
+    {
+        return Err(RpcFailure::invalid(
+            "snapshot batch contains duplicate request ids",
+        ));
+    }
+    Ok(())
+}
+
 fn transaction_outcome(
     outcome: TransactionalWriteOutcome,
 ) -> (wire::WriteDisposition, Revision, Vec<u8>) {
@@ -864,6 +1061,10 @@ struct RpcFailure {
 }
 
 impl RpcFailure {
+    fn into_wire(self) -> wire::RpcError {
+        wire_error(self.code, &self.public_message, self.actual_revision)
+    }
+
     fn invalid(message: impl Into<String>) -> Self {
         Self {
             code: wire::ErrorCode::InvalidRequest,

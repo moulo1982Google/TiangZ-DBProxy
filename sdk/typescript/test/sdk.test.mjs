@@ -80,6 +80,56 @@ test("batch load preserves order, missing records, and defensive payload ownersh
   assert.throws(() => client.LoadMulti([records[0], records[0]]), /duplicates/);
 });
 
+test("batch save preserves per-record outcomes and defensive writes", async () => {
+  let captured;
+  const payload = Uint8Array.from([1, 2, 3]);
+  const client = new DbProxyClient({
+    load: async () => undefined,
+    loadMulti: async () => [],
+    save: async () => ({ disposition: "applied", revision: 1n }),
+    saveMulti: async (writes) => {
+      captured = writes;
+      return [
+        { ok: true, result: { disposition: "applied", revision: 2n } },
+        { ok: false, error: { code: 2001, message: "revision conflict", actualRevision: 3n } },
+      ];
+    },
+    enqueueSnapshot: async () => undefined,
+    enqueueMultiSnapshot: async () => [],
+    applyTransaction: async () => ({ disposition: "applied", newRevision: 1n, result: new Uint8Array() }),
+    loadTransaction: async () => undefined,
+    applyMultiTransaction: async () => ({ disposition: "applied", records: [], result: new Uint8Array() }),
+    loadMultiTransaction: async () => undefined,
+  });
+  const results = await client.SaveMulti([
+    {
+      requestId: "batch-save-1",
+      record: { namespace: "player", key: "1001:wallet" },
+      schema: "player.wallet",
+      schemaVersion: 1,
+      payload,
+      expectedRevision: 1n,
+      updatedAtUnixMs: 1n,
+    },
+    {
+      requestId: "batch-save-2",
+      record: { namespace: "player", key: "1001:items" },
+      schema: "player.items",
+      schemaVersion: 1,
+      payload: new Uint8Array([4]),
+      expectedRevision: 2n,
+      updatedAtUnixMs: 1n,
+    },
+  ]);
+  payload[0] = 9;
+  assert.deepEqual([...captured[0].payload], [1, 2, 3]);
+  assert.deepEqual(results[0], { ok: true, result: { disposition: "applied", revision: 2n } });
+  assert.deepEqual(results[1], {
+    ok: false,
+    error: { code: 2001, message: "revision conflict", actualRevision: 3n },
+  });
+});
+
 test("queued snapshots reject CAS because ACK only means backlog accepted", () => {
   const client = new DbProxyClient({
     load: async () => undefined,

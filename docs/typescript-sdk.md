@@ -17,6 +17,7 @@
 - 在跨Transport边界前复制Payload，防止调用方继续修改缓冲；
 - 保持`Load`、`Save`、`EnqueueSnapshot`、`ApplyTransaction`、`LoadTransaction`的稳定语义；
 - 提供`LoadMulti`批量恢复1至64条不重复记录，并保持缺失记录的响应位置；
+- 提供`SaveMulti`和`EnqueueMultiSnapshot`批量写入1至64条不重复记录，并保持逐记录结果顺序；
 - 提供`ApplyMultiTransaction`和`LoadMultiTransaction`，并拒绝重复RecordKey和超过256条记录的请求；
 - 明确使用`bigint`表示uint64，避免JavaScript number精度丢失。
 
@@ -48,6 +49,8 @@ const result = await client.ApplyMultiTransaction({
 业务 Repository 负责先在内存中校验并构造 `buyerWrite/sellerWrite`，DBProxy 只负责整组 Revision/CAS 和原子落库。不要在 DBProxy 中追加业务步骤，也不要因为 Endpoint 切换而更换 `operationId`。
 
 `EnqueueSnapshot`禁止携带`expectedRevision`。它成功只表示Redis AOF backlog已经接收，不能向业务报告PostgreSQL事务已经提交。
+
+`SaveMulti`不是事务。调用方收到部分成功结果时，必须保存成功条目的新revision，再处理失败条目；不能因为一个领域失败就把其余领域当成未提交。`EnqueueMultiSnapshot`同样只适用于允许小范围回退的普通状态。
 
 ## 协议锁
 

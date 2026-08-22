@@ -19,6 +19,7 @@ const MAX_SCHEMA_BYTES = 256;
 const MAX_IDEMPOTENCY_KEY_BYTES = 256;
 const MAX_TRANSACTION_RECORDS = 256;
 const MAX_BATCH_LOAD_RECORDS = 64;
+const MAX_BATCH_SNAPSHOT_WRITES = 64;
 
 export enum DbProxyErrorCode {
   InvalidRequest = 1001,
@@ -62,6 +63,20 @@ export interface DbProxySnapshotWriteResult {
   readonly disposition: DbProxyWriteDisposition;
   readonly revision: bigint;
 }
+
+export interface DbProxyBatchWriteError {
+  readonly code: DbProxyErrorCode;
+  readonly message: string;
+  readonly actualRevision?: bigint;
+}
+
+export type DbProxyBatchSnapshotWriteResult =
+  | { readonly ok: true; readonly result: DbProxySnapshotWriteResult }
+  | { readonly ok: false; readonly error: DbProxyBatchWriteError };
+
+export type DbProxyBatchSnapshotEnqueueResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly error: DbProxyBatchWriteError };
 
 export interface DbProxyTransactionalWrite {
   readonly operationId: string;
@@ -133,7 +148,13 @@ export interface DbProxyTransport {
     records: readonly DbProxyRecordKey[],
   ): Promise<readonly (DbProxySnapshotEnvelope | undefined)[]>;
   save(write: DbProxySnapshotWrite): Promise<DbProxySnapshotWriteResult>;
+  saveMulti(
+    writes: readonly DbProxySnapshotWrite[],
+  ): Promise<readonly DbProxyBatchSnapshotWriteResult[]>;
   enqueueSnapshot(write: DbProxySnapshotWrite): Promise<void>;
+  enqueueMultiSnapshot(
+    writes: readonly DbProxySnapshotWrite[],
+  ): Promise<readonly DbProxyBatchSnapshotEnqueueResult[]>;
   applyTransaction(
     write: DbProxyTransactionalWrite,
   ): Promise<DbProxyTransactionalWriteResult>;
@@ -203,11 +224,29 @@ export class DbProxyClient {
     return this.transport.save(cloneSnapshotWrite(write));
   }
 
+  SaveMulti(
+    writes: readonly DbProxySnapshotWrite[],
+  ): Promise<readonly DbProxyBatchSnapshotWriteResult[]> {
+    const stableWrites = cloneBatchSnapshotWrites(writes, false);
+    return this.transport.saveMulti(stableWrites).then((results) =>
+      cloneBatchWriteResults(results, stableWrites.length)
+    );
+  }
+
   EnqueueSnapshot(write: DbProxySnapshotWrite): Promise<void> {
     if (write.expectedRevision !== undefined) {
       throw new TypeError("queued snapshots cannot carry expectedRevision");
     }
     return this.transport.enqueueSnapshot(cloneSnapshotWrite(write));
+  }
+
+  EnqueueMultiSnapshot(
+    writes: readonly DbProxySnapshotWrite[],
+  ): Promise<readonly DbProxyBatchSnapshotEnqueueResult[]> {
+    const stableWrites = cloneBatchSnapshotWrites(writes, true);
+    return this.transport.enqueueMultiSnapshot(stableWrites).then((results) =>
+      cloneBatchEnqueueResults(results, stableWrites.length)
+    );
   }
 
   ApplyTransaction(
@@ -403,6 +442,77 @@ function cloneBatchLoadRecords(records: readonly DbProxyRecordKey[]): DbProxyRec
   const names = new Set(cloned.map((item) => `${item.namespace}\u0000${item.key}`));
   if (names.size !== cloned.length) throw new TypeError("batchLoad.records contain duplicates");
   return cloned;
+}
+
+function cloneBatchSnapshotWrites(
+  writes: readonly DbProxySnapshotWrite[],
+  requireUnconditional: boolean,
+): DbProxySnapshotWrite[] {
+  if (!Array.isArray(writes) || writes.length === 0 || writes.length > MAX_BATCH_SNAPSHOT_WRITES) {
+    throw new RangeError(`batchSnapshot.writes must contain 1..${MAX_BATCH_SNAPSHOT_WRITES} records`);
+  }
+  const cloned = writes.map(cloneSnapshotWrite);
+  const records = new Set(cloned.map((item) => `${item.record.namespace}\u0000${item.record.key}`));
+  if (records.size !== cloned.length) {
+    throw new TypeError("batchSnapshot.writes cannot contain duplicate records");
+  }
+  const requestIds = new Set(cloned.map((item) => item.requestId));
+  if (requestIds.size !== cloned.length) {
+    throw new TypeError("batchSnapshot.writes cannot contain duplicate requestIds");
+  }
+  if (requireUnconditional && cloned.some((item) => item.expectedRevision !== undefined)) {
+    throw new TypeError("queued snapshots cannot carry expectedRevision");
+  }
+  return cloned;
+}
+
+function cloneBatchWriteResults(
+  results: readonly DbProxyBatchSnapshotWriteResult[],
+  expectedCount: number,
+): DbProxyBatchSnapshotWriteResult[] {
+  if (!Array.isArray(results) || results.length !== expectedCount) {
+    throw new TypeError("batch save result count does not match its request");
+  }
+  return results.map((entry) => {
+    if (entry.ok) {
+      return {
+        ok: true,
+        result: {
+          disposition: entry.result.disposition,
+          revision: requireUint64(entry.result.revision, "batchSave.result.revision"),
+        },
+      };
+    }
+    return { ok: false, error: cloneBatchWriteError(entry.error) };
+  });
+}
+
+function cloneBatchEnqueueResults(
+  results: readonly DbProxyBatchSnapshotEnqueueResult[],
+  expectedCount: number,
+): DbProxyBatchSnapshotEnqueueResult[] {
+  if (!Array.isArray(results) || results.length !== expectedCount) {
+    throw new TypeError("batch enqueue result count does not match its request");
+  }
+  return results.map((entry) => entry.ok
+    ? { ok: true }
+    : { ok: false, error: cloneBatchWriteError(entry.error) });
+}
+
+function cloneBatchWriteError(error: DbProxyBatchWriteError): DbProxyBatchWriteError {
+  if (!error || typeof error.message !== "string" || error.message.length === 0) {
+    throw new TypeError("batch write error must contain a message");
+  }
+  if (!Object.values(DbProxyErrorCode).includes(error.code)) {
+    throw new TypeError("batch write error contains an invalid code");
+  }
+  return {
+    code: error.code,
+    message: error.message,
+    actualRevision: error.actualRevision === undefined
+      ? undefined
+      : requireUint64(error.actualRevision, "batchWrite.error.actualRevision"),
+  };
 }
 
 function cloneMultiTransactionRecordReceipt(

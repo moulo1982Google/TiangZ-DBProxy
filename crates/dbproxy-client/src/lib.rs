@@ -23,9 +23,9 @@ use tiangz_dbproxy_core::{
     TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_protocol::{
-    DEFAULT_MAX_FRAME_BYTES, MAX_AUTH_TOKEN_BYTES, MAX_BATCH_LOAD_RECORDS, MAX_CLIENT_NAME_BYTES,
-    MAX_TRANSACTION_RECORDS, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION, ProtocolError, read_message,
-    wire, write_message,
+    DEFAULT_MAX_FRAME_BYTES, MAX_AUTH_TOKEN_BYTES, MAX_BATCH_LOAD_RECORDS,
+    MAX_BATCH_SNAPSHOT_WRITES, MAX_CLIENT_NAME_BYTES, MAX_TRANSACTION_RECORDS,
+    PROTOCOL_FINGERPRINT, PROTOCOL_VERSION, ProtocolError, read_message, wire, write_message,
 };
 use tokio::{net::TcpStream, sync::Mutex, time::timeout};
 
@@ -106,6 +106,9 @@ pub struct RemoteError {
     pub message: String,
     pub actual_revision: Option<Revision>,
 }
+
+pub type BatchSnapshotWriteOutcome = Result<SnapshotWriteOutcome, RemoteError>;
+pub type BatchSnapshotEnqueueOutcome = Result<(), RemoteError>;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -197,8 +200,30 @@ impl DbProxyClientPool {
         self.client(&request.record).save(request).await
     }
 
+    pub async fn save_multi(
+        &self,
+        requests: &[SnapshotWrite],
+    ) -> Result<Vec<BatchSnapshotWriteOutcome>, ClientError> {
+        let first = requests
+            .first()
+            .ok_or(ClientError::InvalidConfig("batch save writes are empty"))?;
+        self.client(&first.record).save_multi(requests).await
+    }
+
     pub async fn enqueue_snapshot(&self, request: SnapshotWrite) -> Result<(), ClientError> {
         self.client(&request.record).enqueue_snapshot(request).await
+    }
+
+    pub async fn enqueue_multi_snapshot(
+        &self,
+        requests: &[SnapshotWrite],
+    ) -> Result<Vec<BatchSnapshotEnqueueOutcome>, ClientError> {
+        let first = requests
+            .first()
+            .ok_or(ClientError::InvalidConfig("batch enqueue writes are empty"))?;
+        self.client(&first.record)
+            .enqueue_multi_snapshot(requests)
+            .await
     }
 
     pub async fn apply_transaction(
@@ -528,17 +553,42 @@ impl DbProxyClient {
                 "save returned another response type",
             ));
         };
-        match wire::WriteDisposition::try_from(result.disposition).ok() {
-            Some(wire::WriteDisposition::Applied) => Ok(SnapshotWriteOutcome::Applied {
-                revision: Revision(result.revision),
-            }),
-            Some(wire::WriteDisposition::Duplicate) => Ok(SnapshotWriteOutcome::Duplicate {
-                revision: Revision(result.revision),
-            }),
-            _ => Err(ClientError::UnexpectedResponse(
-                "save returned an invalid disposition",
-            )),
+        snapshot_write_outcome(result)
+    }
+
+    pub async fn save_multi(
+        &self,
+        requests: &[SnapshotWrite],
+    ) -> Result<Vec<BatchSnapshotWriteOutcome>, ClientError> {
+        validate_snapshot_write_batch(requests)?;
+        let response = self
+            .call(wire::request_envelope::Body::SaveMultiSnapshot(
+                wire::SaveMultiSnapshotRequest {
+                    writes: requests.iter().map(Into::into).collect(),
+                },
+            ))
+            .await?;
+        let Some(wire::response_envelope::Body::SaveMultiSnapshot(result)) = response.body else {
+            return Err(ClientError::UnexpectedResponse(
+                "batch save returned another response type",
+            ));
+        };
+        if result.entries.len() != requests.len() {
+            return Err(ClientError::UnexpectedResponse(
+                "batch save returned a mismatched result count",
+            ));
         }
+        result
+            .entries
+            .into_iter()
+            .map(|entry| match (entry.result, entry.error) {
+                (Some(result), None) => snapshot_write_outcome(result).map(Ok),
+                (None, Some(error)) => Ok(Err(remote_error(Some(error)))),
+                _ => Err(ClientError::UnexpectedResponse(
+                    "batch save entry has an invalid result shape",
+                )),
+            })
+            .collect()
     }
 
     /// 把允许回退的普通快照写入 Redis 持久积压；成功只表示 backlog 已接收，
@@ -563,6 +613,42 @@ impl DbProxyClient {
             ));
         }
         Ok(())
+    }
+
+    pub async fn enqueue_multi_snapshot(
+        &self,
+        requests: &[SnapshotWrite],
+    ) -> Result<Vec<BatchSnapshotEnqueueOutcome>, ClientError> {
+        validate_snapshot_write_batch(requests)?;
+        let response = self
+            .call(wire::request_envelope::Body::EnqueueMultiSnapshot(
+                wire::EnqueueMultiSnapshotRequest {
+                    writes: requests.iter().map(Into::into).collect(),
+                },
+            ))
+            .await?;
+        let Some(wire::response_envelope::Body::EnqueueMultiSnapshot(result)) = response.body
+        else {
+            return Err(ClientError::UnexpectedResponse(
+                "batch enqueue returned another response type",
+            ));
+        };
+        if result.entries.len() != requests.len() {
+            return Err(ClientError::UnexpectedResponse(
+                "batch enqueue returned a mismatched result count",
+            ));
+        }
+        result
+            .entries
+            .into_iter()
+            .map(|entry| match (entry.accepted, entry.error) {
+                (true, None) => Ok(Ok(())),
+                (false, Some(error)) => Ok(Err(remote_error(Some(error)))),
+                _ => Err(ClientError::UnexpectedResponse(
+                    "batch enqueue entry has an invalid result shape",
+                )),
+            })
+            .collect()
     }
 
     pub async fn apply_transaction(
@@ -872,6 +958,53 @@ fn remote_error(error: Option<wire::RpcError>) -> RemoteError {
         message: error.message,
         actual_revision: error.actual_revision.map(Revision),
     }
+}
+
+fn snapshot_write_outcome(
+    result: wire::SaveSnapshotResponse,
+) -> Result<SnapshotWriteOutcome, ClientError> {
+    match wire::WriteDisposition::try_from(result.disposition).ok() {
+        Some(wire::WriteDisposition::Applied) => Ok(SnapshotWriteOutcome::Applied {
+            revision: Revision(result.revision),
+        }),
+        Some(wire::WriteDisposition::Duplicate) => Ok(SnapshotWriteOutcome::Duplicate {
+            revision: Revision(result.revision),
+        }),
+        _ => Err(ClientError::UnexpectedResponse(
+            "save returned an invalid disposition",
+        )),
+    }
+}
+
+fn validate_snapshot_write_batch(requests: &[SnapshotWrite]) -> Result<(), ClientError> {
+    if requests.is_empty() || requests.len() > MAX_BATCH_SNAPSHOT_WRITES {
+        return Err(ClientError::InvalidConfig(
+            "batch snapshot write size is outside the protocol limit",
+        ));
+    }
+    if requests
+        .iter()
+        .map(|request| &request.record)
+        .collect::<HashSet<_>>()
+        .len()
+        != requests.len()
+    {
+        return Err(ClientError::InvalidConfig(
+            "batch snapshot writes contain duplicate records",
+        ));
+    }
+    if requests
+        .iter()
+        .map(|request| request.request_id.as_str())
+        .collect::<HashSet<_>>()
+        .len()
+        != requests.len()
+    {
+        return Err(ClientError::InvalidConfig(
+            "batch snapshot writes contain duplicate request ids",
+        ));
+    }
+    Ok(())
 }
 
 fn is_reconnectable(error: &ClientError) -> bool {

@@ -142,6 +142,22 @@ fn snapshot(request_id: &str, expected_revision: Option<Revision>) -> SnapshotWr
     }
 }
 
+fn domain_snapshot(
+    request_id: &str,
+    domain: &str,
+    expected_revision: Option<Revision>,
+) -> SnapshotWrite {
+    SnapshotWrite {
+        request_id: request_id.to_string(),
+        record: RecordKey::new(domain, "1001").unwrap(),
+        schema: format!("{domain}.snapshot"),
+        schema_version: 1,
+        payload: format!("{domain}=value").into_bytes(),
+        expected_revision,
+        updated_at_unix_ms: 100,
+    }
+}
+
 fn transaction(operation_id: &str) -> TransactionalWrite {
     TransactionalWrite {
         operation_id: operation_id.to_string(),
@@ -229,6 +245,51 @@ async fn client_server_round_trip_preserves_persistence_semantics() {
             if remote.code == wire::ErrorCode::RevisionConflict
                 && remote.actual_revision == Some(Revision(1))
     ));
+
+    let first_batch = vec![
+        domain_snapshot("batch-wallet-1", "wallet", Some(Revision::ZERO)),
+        domain_snapshot("batch-items-1", "items", Some(Revision::ZERO)),
+    ];
+    let outcomes = client.save_multi(&first_batch).await.unwrap();
+    assert_eq!(
+        outcomes,
+        vec![
+            Ok(SnapshotWriteOutcome::Applied {
+                revision: Revision(1)
+            }),
+            Ok(SnapshotWriteOutcome::Applied {
+                revision: Revision(1)
+            }),
+        ]
+    );
+    let partial_batch = vec![
+        domain_snapshot("batch-wallet-2", "wallet", Some(Revision::ZERO)),
+        domain_snapshot("batch-items-2", "items", Some(Revision(1))),
+    ];
+    let outcomes = client.save_multi(&partial_batch).await.unwrap();
+    assert!(matches!(
+        &outcomes[0],
+        Err(remote)
+            if remote.code == wire::ErrorCode::RevisionConflict
+                && remote.actual_revision == Some(Revision(1))
+    ));
+    assert_eq!(
+        outcomes[1],
+        Ok(SnapshotWriteOutcome::Applied {
+            revision: Revision(2)
+        })
+    );
+
+    client
+        .enqueue_multi_snapshot(&[
+            domain_snapshot("queued-wallet", "queued-wallet", None),
+            domain_snapshot("queued-items", "queued-items", None),
+        ])
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     let transaction = transaction("operation-1");
     assert_eq!(
