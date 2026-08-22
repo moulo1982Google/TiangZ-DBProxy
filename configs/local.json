@@ -26,5 +26,8 @@
   "logging": {
     "filterEnv": "RUST_LOG",
     "defaultFilter": "info"
+  },
+  "observability": {
+    "listenAddr": "0.0.0.0:9090"
   }
 }

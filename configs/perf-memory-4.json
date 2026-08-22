@@ -18,5 +18,8 @@
   "logging": {
     "filterEnv": "RUST_LOG",
     "defaultFilter": "info"
+  },
+  "observability": {
+    "listenAddr": "127.0.0.1:9092"
   }
 }

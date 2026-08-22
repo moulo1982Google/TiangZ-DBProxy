@@ -1,7 +1,16 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use tiangz_dbproxy_client::{ClientConfig, ClientError, DbProxyClient};
+use tiangz_dbproxy_client::{
+    ClientConfig, ClientConnectionOutcome, ClientError, ClientObserver, ClientRequestOutcome,
+    DbProxyClient,
+};
 use tiangz_dbproxy_core::{
     AsyncMultiRecordTransactionStore, InMemoryMultiRecordTransactionStore, InMemorySnapshotStore,
     InMemoryTransactionalStore, MultiRecordTransactionReceipt, MultiRecordTransactionalWrite,
@@ -95,6 +104,51 @@ struct TestServer {
     endpoint: String,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct RecordingObserver {
+    connected: AtomicU64,
+    unavailable: AtomicU64,
+    failovers: AtomicU64,
+    request_successes: AtomicU64,
+    request_failures: AtomicU64,
+}
+
+impl ClientObserver for RecordingObserver {
+    fn connection_attempt(
+        &self,
+        _endpoint_index: usize,
+        _elapsed: Duration,
+        outcome: ClientConnectionOutcome,
+    ) {
+        match outcome {
+            ClientConnectionOutcome::Connected => &self.connected,
+            ClientConnectionOutcome::Timeout | ClientConnectionOutcome::Unavailable => {
+                &self.unavailable
+            }
+            ClientConnectionOutcome::Rejected => return,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn endpoint_failover(&self, _from_endpoint_index: usize, _to_endpoint_index: usize) {
+        self.failovers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn request_attempt(
+        &self,
+        _endpoint_index: usize,
+        _operation: &'static str,
+        _elapsed: Duration,
+        outcome: ClientRequestOutcome,
+    ) {
+        match outcome {
+            ClientRequestOutcome::Success => &self.request_successes,
+            _ => &self.request_failures,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn unused_endpoint() -> String {
@@ -387,8 +441,10 @@ async fn client_fails_over_to_the_second_endpoint_and_replays_the_same_write() {
     let backend: Arc<dyn DbProxyBackend> = Arc::new(MemoryBackend::default());
     let primary = TestServer::start_with_backend(TOKEN, Arc::clone(&backend)).await;
     let secondary = TestServer::start_with_backend(TOKEN, Arc::clone(&backend)).await;
+    let observer = Arc::new(RecordingObserver::default());
     let config = ClientConfig::new(&primary.endpoint, TOKEN, "failover-test")
-        .with_endpoints(vec![secondary.endpoint.clone()]);
+        .with_endpoints(vec![secondary.endpoint.clone()])
+        .with_observer(observer.clone());
     let client = DbProxyClient::connect(config).await.unwrap();
 
     assert_eq!(
@@ -423,6 +479,10 @@ async fn client_fails_over_to_the_second_endpoint_and_replays_the_same_write() {
             revision: Revision(2)
         }
     );
+    assert_eq!(observer.connected.load(Ordering::Relaxed), 2);
+    assert_eq!(observer.failovers.load(Ordering::Relaxed), 1);
+    assert!(observer.request_successes.load(Ordering::Relaxed) >= 3);
+    assert!(observer.request_failures.load(Ordering::Relaxed) >= 1);
     secondary.stop().await;
 }
 

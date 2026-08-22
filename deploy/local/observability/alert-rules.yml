@@ -1,0 +1,47 @@
+groups:
+  - name: tiangz-dbproxy
+    rules:
+      - alert: TiangZDbProxyDown
+        expr: up{job="tiangz-dbproxy"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "DBProxy instance is unreachable"
+          description: "Prometheus cannot scrape {{ $labels.instance }} for 30 seconds."
+
+      - alert: TiangZDbProxyNotReady
+        expr: dbproxy_ready == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "DBProxy instance is not ready"
+          description: "{{ $labels.instance }} is alive but has withdrawn readiness."
+
+      - alert: TiangZDbProxyStorageErrors
+        expr: sum by (instance) (rate(dbproxy_rpc_errors_total{code="storage_unavailable"}[2m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy storage operations are failing"
+          description: "{{ $labels.instance }} has sustained storage errors. Retry with the original idempotency IDs."
+
+      - alert: TiangZDbProxyHighP99Latency
+        expr: histogram_quantile(0.99, sum by (instance, le) (rate(dbproxy_rpc_duration_seconds_bucket[5m]))) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy P99 latency is above 100ms"
+          description: "{{ $labels.instance }} has sustained high RPC latency."
+
+      - alert: TiangZDbProxyBacklogFailures
+        expr: sum by (instance) (rate(dbproxy_backlog_polls_total{result="failure"}[2m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy snapshot backlog processing is failing"
+          description: "{{ $labels.instance }} cannot flush ordinary snapshot backlog work."

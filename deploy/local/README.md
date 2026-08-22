@@ -1,6 +1,6 @@
 # 本机 DBProxy 依赖
 
-这套 Compose 只启动本机开发使用的 PostgreSQL 和 Redis，不包含线上部署配置。
+这套 Compose 启动本机开发使用的 PostgreSQL、Redis、Prometheus和Grafana，不包含线上部署配置。
 
 Redis 使用 AOF 和 Docker 命名卷保存普通快照 backlog。AOF 只保证本机部署下的恢复边界，不等于 Redis 集群或跨机高可用。
 
@@ -23,6 +23,8 @@ redis://:tiangz_dev@127.0.0.1:6379/0
 docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml up -d
 docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml ps
 ```
+
+启动DBProxy后打开`http://127.0.0.1:3000`，使用`.env`中的Grafana管理员账号登录；`TiangZ / TiangZ DBProxy Overview`会自动出现。Prometheus本机入口为`http://127.0.0.1:9095`。本地DBProxy观测端口使用`0.0.0.0:9090/9091`，只为Docker Desktop或本机Linux容器抓取开放，不能照搬到公网部署。
 
 依赖就绪后启动 DBProxy 网络服务：
 
@@ -49,6 +51,8 @@ Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File
 ```
 
 客户端把 `127.0.0.1:7800` 配为首选，把 `127.0.0.1:7801` 配为备用。两份配置必须继续指向同一 PostgreSQL/Redis；停掉其中一个只验证客户端切换，不应删除共享数据卷。
+
+两个实例的指标分别位于`http://127.0.0.1:9090/metrics`和`http://127.0.0.1:9091/metrics`。只启动一个实例时，Grafana会明确显示另一个Target为Down，这是预期状态。
 
 停止容器但保留数据：
 

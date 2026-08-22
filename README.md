@@ -58,9 +58,12 @@ cargo run -p tiangz-dbproxy-server -- --config configs/local.json
 ```json
 {
   "runtime": { "workerThreads": 4 },
+  "observability": { "listenAddr": "127.0.0.1:9090" },
   "storage": { "backend": "memory", "shards": 16 }
 }
 ```
+
+配置`observability.listenAddr`后，DBProxy在独立HTTP端口提供`/live`、`/ready`和Prometheus格式的`/metrics`。本地Compose会启动Prometheus与Grafana并自动加载Dashboard；指标、告警和部署边界见[可观测性指南](OBSERVABILITY.md)。观测端口不要求业务认证，因此只能绑定本机或运维内网，禁止经Nginx暴露公网。
 
 仓库提供`configs/perf-memory-4.json`，固定使用4个Runtime工作线程和MemoryStub。该配置只测DBProxy自身的网络、协议、调度、分片锁和事务语义，不把PostgreSQL或Redis性能混入结果。
 

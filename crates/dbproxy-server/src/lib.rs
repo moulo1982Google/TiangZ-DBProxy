@@ -7,8 +7,10 @@
 
 pub mod config;
 mod memory_backend;
+mod observability;
 
 pub use memory_backend::MemoryBackend;
+pub use observability::{DbProxyMetrics, ObservabilityServer};
 
 use std::{
     collections::HashSet,
@@ -17,7 +19,7 @@ use std::{
     io,
     net::SocketAddr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -41,6 +43,8 @@ use tokio::{
     task::JoinSet,
     time::{sleep, timeout},
 };
+
+use observability::{BacklogMetricResult, HandshakeRejection, RpcOperation};
 
 #[derive(Debug, Error)]
 pub enum BackendError {
@@ -355,21 +359,46 @@ pub async fn run_backlog_worker(
     lease_ms: u64,
     idle_delay: Duration,
     failure_delay: Duration,
+    shutdown: watch::Receiver<bool>,
+) {
+    run_backlog_worker_observed(backend, lease_ms, idle_delay, failure_delay, shutdown, None).await;
+}
+
+/// 运行带Prometheus观测的积压消费者；指标不得影响Lease或ACK语义。
+/// Run an observed backlog consumer without changing lease or ACK semantics.
+pub async fn run_backlog_worker_observed(
+    backend: Arc<StorageBackend>,
+    lease_ms: u64,
+    idle_delay: Duration,
+    failure_delay: Duration,
     mut shutdown: watch::Receiver<bool>,
+    metrics: Option<Arc<DbProxyMetrics>>,
 ) {
     loop {
         if *shutdown.borrow() {
             return;
         }
+        let started_at = Instant::now();
         match backend.process_backlog_once(lease_ms).await {
-            Ok(BacklogProcessOutcome::Committed(_)) => continue,
+            Ok(BacklogProcessOutcome::Committed(_)) => {
+                if let Some(metrics) = &metrics {
+                    metrics.backlog_finished(BacklogMetricResult::Committed, started_at.elapsed());
+                }
+                continue;
+            }
             Ok(BacklogProcessOutcome::Empty) => {
+                if let Some(metrics) = &metrics {
+                    metrics.backlog_finished(BacklogMetricResult::Empty, started_at.elapsed());
+                }
                 tokio::select! {
                     _ = sleep(idle_delay) => {}
                     _ = shutdown.changed() => return,
                 }
             }
             Err(error) => {
+                if let Some(metrics) = &metrics {
+                    metrics.backlog_finished(BacklogMetricResult::Failure, started_at.elapsed());
+                }
                 tracing::error!(%error, "snapshot backlog flush failed");
                 tokio::select! {
                     _ = sleep(failure_delay) => {}
@@ -389,6 +418,7 @@ pub struct ServerConfig {
     pub max_frame_bytes: usize,
     pub handshake_timeout: Duration,
     pub shutdown_grace: Duration,
+    pub metrics: Arc<DbProxyMetrics>,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -400,6 +430,7 @@ impl fmt::Debug for ServerConfig {
             .field("max_frame_bytes", &self.max_frame_bytes)
             .field("handshake_timeout", &self.handshake_timeout)
             .field("shutdown_grace", &self.shutdown_grace)
+            .field("metrics", &"[PROMETHEUS]")
             .finish()
     }
 }
@@ -412,6 +443,7 @@ impl ServerConfig {
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             handshake_timeout: Duration::from_secs(5),
             shutdown_grace: Duration::from_secs(5),
+            metrics: Arc::new(DbProxyMetrics::default()),
         }
     }
 
@@ -473,16 +505,20 @@ impl DbProxyServer {
                 }
                 accepted = self.listener.accept() => {
                     let (stream, peer) = accepted?;
+                    self.config.metrics.connection_opened();
                     let config = Arc::clone(&self.config);
                     let backend = Arc::clone(&self.backend);
                     let connection_shutdown = shutdown.clone();
                     connections.spawn(async move {
-                        if let Err(error) = handle_connection(
+                        let result = handle_connection(
                             stream,
-                            config,
+                            Arc::clone(&config),
                             backend,
                             connection_shutdown,
-                        ).await {
+                        ).await;
+                        config.metrics.connection_closed();
+                        if let Err(error) = result {
+                            config.metrics.connection_failed();
                             tracing::warn!(%peer, %error, "DBProxy connection closed with an error");
                         }
                     });
@@ -548,6 +584,9 @@ async fn handle_connection(
     if hello.protocol_version != PROTOCOL_VERSION
         || hello.protocol_fingerprint != PROTOCOL_FINGERPRINT
     {
+        config
+            .metrics
+            .handshake_rejected(HandshakeRejection::ProtocolMismatch);
         write_hello_rejection(
             &mut stream,
             config.max_frame_bytes,
@@ -558,6 +597,9 @@ async fn handle_connection(
         return Ok(());
     }
     if hello.auth_token.len() > MAX_AUTH_TOKEN_BYTES {
+        config
+            .metrics
+            .handshake_rejected(HandshakeRejection::Unauthorized);
         write_hello_rejection(
             &mut stream,
             config.max_frame_bytes,
@@ -568,6 +610,9 @@ async fn handle_connection(
         return Ok(());
     }
     if !constant_time_token_eq(config.auth_token.as_bytes(), hello.auth_token.as_bytes()) {
+        config
+            .metrics
+            .handshake_rejected(HandshakeRejection::Unauthorized);
         write_hello_rejection(
             &mut stream,
             config.max_frame_bytes,
@@ -578,6 +623,9 @@ async fn handle_connection(
         return Ok(());
     }
     if hello.client_name.trim().is_empty() || hello.client_name.len() > MAX_CLIENT_NAME_BYTES {
+        config
+            .metrics
+            .handshake_rejected(HandshakeRejection::InvalidClient);
         write_hello_rejection(
             &mut stream,
             config.max_frame_bytes,
@@ -615,7 +663,7 @@ async fn handle_connection(
         let Some(wire::client_frame::Body::Request(request)) = frame.body else {
             return Err(ConnectionError::MissingHandshake);
         };
-        let response = dispatch(request, backend.as_ref()).await;
+        let response = dispatch(request, backend.as_ref(), &config.metrics).await;
         write_message(&mut stream, &response, config.max_frame_bytes).await?;
     }
 }
@@ -644,9 +692,24 @@ async fn write_hello_rejection(
 async fn dispatch(
     request: wire::RequestEnvelope,
     backend: &dyn DbProxyBackend,
+    metrics: &DbProxyMetrics,
 ) -> wire::ServerFrame {
     let rpc_id = request.rpc_id;
+    let operation = RpcOperation::from_body(request.body.as_ref());
+    let record_count = RpcOperation::record_count(request.body.as_ref());
+    let started_at = Instant::now();
+    metrics.request_started();
     let result = dispatch_body(request.body, backend).await;
+    let error_code = result.as_ref().err().map(|failure| failure.code);
+    metrics.request_finished(operation, record_count, started_at.elapsed(), error_code);
+    tracing::debug!(
+        rpc_id,
+        operation = operation.name(),
+        record_count,
+        result = if error_code.is_some() { "error" } else { "ok" },
+        duration_ms = started_at.elapsed().as_secs_f64() * 1000.0,
+        "DBProxy RPC completed"
+    );
     let response = match result {
         Ok(body) => wire::ResponseEnvelope {
             rpc_id,

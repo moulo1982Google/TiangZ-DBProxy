@@ -10,7 +10,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -29,6 +29,44 @@ use tiangz_dbproxy_protocol::{
 };
 use tokio::{net::TcpStream, sync::Mutex, time::timeout};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientConnectionOutcome {
+    Connected,
+    Timeout,
+    Unavailable,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientRequestOutcome {
+    Success,
+    Timeout,
+    Unavailable,
+    RemoteError,
+    ProtocolError,
+}
+
+/// 可选的低开销客户端观测器。实现只能记录有界指标，不得把RecordKey或幂等ID作为标签。
+/// Optional low-overhead client observer. Implementations must not label metrics with RecordKey or idempotency IDs.
+pub trait ClientObserver: Send + Sync + 'static {
+    fn connection_attempt(
+        &self,
+        endpoint_index: usize,
+        elapsed: Duration,
+        outcome: ClientConnectionOutcome,
+    );
+
+    fn endpoint_failover(&self, from_endpoint_index: usize, to_endpoint_index: usize);
+
+    fn request_attempt(
+        &self,
+        endpoint_index: usize,
+        operation: &'static str,
+        elapsed: Duration,
+        outcome: ClientRequestOutcome,
+    );
+}
+
 /// 客户端连接参数；令牌只用于内部服务认证，不能写入日志或提交到生产配置。
 /// Client connection settings; the internal token must not be logged or committed as production data.
 #[derive(Clone)]
@@ -40,6 +78,7 @@ pub struct ClientConfig {
     pub max_frame_bytes: usize,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
+    pub observer: Option<Arc<dyn ClientObserver>>,
 }
 
 impl fmt::Debug for ClientConfig {
@@ -53,6 +92,7 @@ impl fmt::Debug for ClientConfig {
             .field("max_frame_bytes", &self.max_frame_bytes)
             .field("connect_timeout", &self.connect_timeout)
             .field("request_timeout", &self.request_timeout)
+            .field("observer", &self.observer.as_ref().map(|_| "configured"))
             .finish()
     }
 }
@@ -71,6 +111,7 @@ impl ClientConfig {
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
+            observer: None,
         }
     }
 
@@ -78,6 +119,13 @@ impl ClientConfig {
     /// Set ordered failover endpoints; `endpoint` remains the preferred address.
     pub fn with_endpoints(mut self, endpoints: impl IntoIterator<Item = String>) -> Self {
         self.failover_endpoints = endpoints.into_iter().collect::<Vec<_>>().into();
+        self
+    }
+
+    /// 安装运行时观测器；它不参与重试决策，也不能读取认证令牌。
+    /// Install an observer that never participates in retry decisions or receives credentials.
+    pub fn with_observer(mut self, observer: Arc<dyn ClientObserver>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -278,13 +326,29 @@ impl DbProxyClient {
         let candidates = config.endpoint_candidates()?;
         let mut last_error = None;
         for endpoint_index in 0..candidates.len() {
-            match Self::connect_single(config.clone(), endpoint_index).await {
+            match Self::connect_observed(config.clone(), endpoint_index).await {
                 Ok(client) => return Ok(client),
                 Err(error) if is_endpoint_unavailable(&error) => last_error = Some(error),
                 Err(error) => return Err(error),
             }
         }
         Err(last_error.unwrap_or(ClientError::ConnectionClosed))
+    }
+
+    async fn connect_observed(
+        config: ClientConfig,
+        endpoint_index: usize,
+    ) -> Result<Self, ClientError> {
+        let started_at = Instant::now();
+        let result = Self::connect_single(config.clone(), endpoint_index).await;
+        if let Some(observer) = &config.observer {
+            observer.connection_attempt(
+                endpoint_index,
+                started_at.elapsed(),
+                connection_outcome(&result),
+            );
+        }
+        result
     }
 
     async fn connect_single(
@@ -376,59 +440,74 @@ impl DbProxyClient {
         &self,
         body: wire::request_envelope::Body,
     ) -> Result<wire::ResponseEnvelope, ClientError> {
+        let operation = request_operation(&body);
+        let started_at = Instant::now();
         let mut connection = self.connection.lock().await;
-        if !connection.usable {
-            return Err(ClientError::ConnectionUnusable);
-        }
-        let rpc_id = connection.next_rpc_id;
-        connection.next_rpc_id = connection.next_rpc_id.wrapping_add(1).max(1);
-        let frame = wire::ClientFrame {
-            body: Some(wire::client_frame::Body::Request(wire::RequestEnvelope {
-                rpc_id,
-                body: Some(body),
-            })),
-        };
-        let max_frame_bytes = connection.max_frame_bytes;
-        let request_timeout = connection.request_timeout;
-        let exchange = async {
-            write_message(&mut connection.stream, &frame, max_frame_bytes).await?;
-            read_message::<_, wire::ServerFrame>(&mut connection.stream, max_frame_bytes).await
-        };
-        let result = match timeout(request_timeout, exchange).await {
-            Ok(result) => result,
-            Err(_) => {
-                connection.usable = false;
-                return Err(ClientError::RequestTimeout);
+        let endpoint_index = connection.endpoint_index;
+        let result = async {
+            if !connection.usable {
+                return Err(ClientError::ConnectionUnusable);
             }
-        };
-        let frame = match result {
-            Ok(Some(frame)) => frame,
-            Ok(None) => {
+            let rpc_id = connection.next_rpc_id;
+            connection.next_rpc_id = connection.next_rpc_id.wrapping_add(1).max(1);
+            let frame = wire::ClientFrame {
+                body: Some(wire::client_frame::Body::Request(wire::RequestEnvelope {
+                    rpc_id,
+                    body: Some(body),
+                })),
+            };
+            let max_frame_bytes = connection.max_frame_bytes;
+            let request_timeout = connection.request_timeout;
+            let exchange = async {
+                write_message(&mut connection.stream, &frame, max_frame_bytes).await?;
+                read_message::<_, wire::ServerFrame>(&mut connection.stream, max_frame_bytes).await
+            };
+            let result = match timeout(request_timeout, exchange).await {
+                Ok(result) => result,
+                Err(_) => {
+                    connection.usable = false;
+                    return Err(ClientError::RequestTimeout);
+                }
+            };
+            let frame = match result {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    connection.usable = false;
+                    return Err(ClientError::ConnectionClosed);
+                }
+                Err(error) => {
+                    connection.usable = false;
+                    return Err(error.into());
+                }
+            };
+            let wire::server_frame::Body::Response(response) = frame
+                .body
+                .ok_or(ClientError::UnexpectedResponse("empty response frame"))?
+            else {
                 connection.usable = false;
-                return Err(ClientError::ConnectionClosed);
-            }
-            Err(error) => {
+                return Err(ClientError::UnexpectedResponse(
+                    "server repeated the handshake",
+                ));
+            };
+            if response.rpc_id != rpc_id {
                 connection.usable = false;
-                return Err(error.into());
+                return Err(ClientError::UnexpectedResponse("rpc id mismatch"));
             }
-        };
-        let wire::server_frame::Body::Response(response) = frame
-            .body
-            .ok_or(ClientError::UnexpectedResponse("empty response frame"))?
-        else {
-            connection.usable = false;
-            return Err(ClientError::UnexpectedResponse(
-                "server repeated the handshake",
-            ));
-        };
-        if response.rpc_id != rpc_id {
-            connection.usable = false;
-            return Err(ClientError::UnexpectedResponse("rpc id mismatch"));
+            if response.error.is_some() {
+                return Err(ClientError::Remote(remote_error(response.error)));
+            }
+            Ok(response)
         }
-        if response.error.is_some() {
-            return Err(ClientError::Remote(remote_error(response.error)));
+        .await;
+        if let Some(observer) = &self.config.observer {
+            observer.request_attempt(
+                endpoint_index,
+                operation,
+                started_at.elapsed(),
+                request_outcome(&result),
+            );
         }
-        Ok(response)
+        result
     }
 
     async fn call(
@@ -452,12 +531,15 @@ impl DbProxyClient {
         let mut last_error = None;
         for offset in 1..=candidates.len() {
             let endpoint_index = (current_index + offset) % candidates.len();
-            match Self::connect_single(self.config.clone(), endpoint_index).await {
+            match Self::connect_observed(self.config.clone(), endpoint_index).await {
                 Ok(next) => {
                     let next_connection = Arc::try_unwrap(next.connection)
                         .map_err(|_| ClientError::ConnectionUnusable)?
                         .into_inner();
                     *connection = next_connection;
+                    if let Some(observer) = &self.config.observer {
+                        observer.endpoint_failover(current_index, endpoint_index);
+                    }
                     return Ok(());
                 }
                 Err(error) if is_endpoint_unavailable(&error) => last_error = Some(error),
@@ -1024,6 +1106,43 @@ fn is_endpoint_unavailable(error: &ClientError) -> bool {
             | ClientError::ConnectionClosed
             | ClientError::Protocol(ProtocolError::Io(_))
     )
+}
+
+fn request_operation(body: &wire::request_envelope::Body) -> &'static str {
+    match body {
+        wire::request_envelope::Body::LoadSnapshot(_) => "load_snapshot",
+        wire::request_envelope::Body::LoadMultiSnapshot(_) => "load_multi_snapshot",
+        wire::request_envelope::Body::SaveSnapshot(_) => "save_snapshot",
+        wire::request_envelope::Body::SaveMultiSnapshot(_) => "save_multi_snapshot",
+        wire::request_envelope::Body::EnqueueSnapshot(_) => "enqueue_snapshot",
+        wire::request_envelope::Body::EnqueueMultiSnapshot(_) => "enqueue_multi_snapshot",
+        wire::request_envelope::Body::ApplyTransaction(_) => "apply_transaction",
+        wire::request_envelope::Body::LoadTransaction(_) => "load_transaction",
+        wire::request_envelope::Body::ApplyMultiTransaction(_) => "apply_multi_transaction",
+        wire::request_envelope::Body::LoadMultiTransaction(_) => "load_multi_transaction",
+    }
+}
+
+fn connection_outcome(result: &Result<DbProxyClient, ClientError>) -> ClientConnectionOutcome {
+    match result {
+        Ok(_) => ClientConnectionOutcome::Connected,
+        Err(ClientError::ConnectTimeout) => ClientConnectionOutcome::Timeout,
+        Err(error) if is_endpoint_unavailable(error) => ClientConnectionOutcome::Unavailable,
+        Err(_) => ClientConnectionOutcome::Rejected,
+    }
+}
+
+fn request_outcome(result: &Result<wire::ResponseEnvelope, ClientError>) -> ClientRequestOutcome {
+    match result {
+        Ok(_) => ClientRequestOutcome::Success,
+        Err(ClientError::RequestTimeout) => ClientRequestOutcome::Timeout,
+        Err(ClientError::ConnectionUnusable | ClientError::ConnectionClosed) => {
+            ClientRequestOutcome::Unavailable
+        }
+        Err(ClientError::Protocol(ProtocolError::Io(_))) => ClientRequestOutcome::Unavailable,
+        Err(ClientError::Remote(_)) => ClientRequestOutcome::RemoteError,
+        Err(_) => ClientRequestOutcome::ProtocolError,
+    }
 }
 
 struct StableHasher(u64);

@@ -29,6 +29,8 @@ pub struct DbProxyConfig {
     pub backlog: BacklogSection,
     #[serde(default)]
     pub logging: LoggingSection,
+    #[serde(default)]
+    pub observability: ObservabilitySection,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -109,6 +111,15 @@ pub struct LoggingSection {
     pub default_filter: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObservabilitySection {
+    /// 省略时不启动HTTP探针；生产部署必须显式绑定内网地址。
+    /// Omission disables HTTP probes; production deployments must bind an internal address explicitly.
+    #[serde(default)]
+    pub listen_addr: Option<SocketAddr>,
+}
+
 impl Default for LoggingSection {
     fn default() -> Self {
         Self {
@@ -135,6 +146,7 @@ pub struct ResolvedDbProxyConfig {
     pub backlog_idle_delay: Duration,
     pub backlog_failure_delay: Duration,
     pub log_filter: String,
+    pub observability_listen_addr: Option<SocketAddr>,
 }
 
 #[derive(Clone)]
@@ -176,6 +188,7 @@ impl fmt::Debug for ResolvedDbProxyConfig {
             .field("storage_backend", &self.storage.name())
             .field("storage_shards", &self.storage.shards())
             .field("backlog_workers", &self.backlog_workers)
+            .field("observability_listen_addr", &self.observability_listen_addr)
             .finish_non_exhaustive()
     }
 }
@@ -303,6 +316,7 @@ impl DbProxyConfig {
             backlog_idle_delay: Duration::from_millis(self.backlog.idle_delay_ms),
             backlog_failure_delay: Duration::from_millis(self.backlog.failure_delay_ms),
             log_filter,
+            observability_listen_addr: self.observability.listen_addr,
         })
     }
 }

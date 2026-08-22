@@ -68,6 +68,13 @@
         "filterEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "default": "RUST_LOG" },
         "defaultFilter": { "type": "string", "minLength": 1, "default": "info" }
       }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "listenAddr": { "type": "string", "description": "Prometheus与健康探针HTTP监听地址；必须仅暴露在本机或运维内网。" }
+      }
     }
   }
 }

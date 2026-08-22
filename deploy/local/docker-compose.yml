@@ -43,6 +43,41 @@ services:
       timeout: 5s
       retries: 12
 
+  prometheus:
+    image: prom/prometheus:v3.13.1
+    container_name: tiangz-dbproxy-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    ports:
+      - "127.0.0.1:${DBPROXY_PROMETHEUS_PORT:-9095}:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - tiangz-dbproxy-prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:13.1.0
+    container_name: tiangz-dbproxy-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${DBPROXY_GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${DBPROXY_GRAFANA_ADMIN_PASSWORD:?DBPROXY_GRAFANA_ADMIN_PASSWORD is required}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "127.0.0.1:${DBPROXY_GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - tiangz-dbproxy-grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
 volumes:
   tiangz-dbproxy-postgres-data:
   tiangz-dbproxy-redis-data:
+  tiangz-dbproxy-prometheus-data:
+  tiangz-dbproxy-grafana-data:
