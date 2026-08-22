@@ -29,6 +29,8 @@ struct Options {
 enum Workload {
     PlayerLoadSingle,
     PlayerLoadBatch,
+    PlayerSaveSingle,
+    PlayerSaveBatch,
     Pickup,
     NpcShop,
 }
@@ -38,6 +40,8 @@ impl Workload {
         match self {
             Self::PlayerLoadSingle => "playerDataSingle",
             Self::PlayerLoadBatch => "playerDataBatch",
+            Self::PlayerSaveSingle => "playerSaveSingle",
+            Self::PlayerSaveBatch => "playerSaveBatch",
             Self::Pickup => "pickup",
             Self::NpcShop => "npcShop",
         }
@@ -103,7 +107,8 @@ async fn main() -> Result<(), DynError> {
                 "max": latencies.last().copied().unwrap_or(0) as f64 / 1_000.0,
             },
             "payloadBytes": match workload {
-                Workload::PlayerLoadSingle | Workload::PlayerLoadBatch =>
+                Workload::PlayerLoadSingle | Workload::PlayerLoadBatch |
+                Workload::PlayerSaveSingle | Workload::PlayerSaveBatch =>
                     (0..options.domain_count).map(domain_payload_bytes).sum::<usize>(),
                 Workload::Pickup => BASE_PAYLOAD_BYTES[0] + BASE_PAYLOAD_BYTES[2] + BASE_PAYLOAD_BYTES[4] + 512,
                 Workload::NpcShop => BASE_PAYLOAD_BYTES[0] + BASE_PAYLOAD_BYTES[4] + 256,
@@ -244,6 +249,30 @@ async fn execute(
                 return Err("player batch load missed a seeded domain".into());
             }
         }
+        Workload::PlayerSaveSingle => {
+            for index in 0..state.records.len() {
+                let outcome = pool.save(snapshot_write(state, index, "single")).await?;
+                state.revisions[index] = snapshot_revision(outcome);
+            }
+        }
+        Workload::PlayerSaveBatch => {
+            let writes = (0..state.records.len())
+                .map(|index| snapshot_write(state, index, "batch"))
+                .collect::<Vec<_>>();
+            let outcomes = pool.save_multi(&writes).await?;
+            for (index, outcome) in outcomes.into_iter().enumerate() {
+                state.revisions[index] = match outcome {
+                    Ok(outcome) => snapshot_revision(outcome),
+                    Err(error) => {
+                        return Err(format!(
+                            "batch snapshot save failed: code={:?}, message={}",
+                            error.code, error.message
+                        )
+                        .into());
+                    }
+                };
+            }
+        }
         Workload::Pickup => {
             apply_multi(pool, state, &[0, 2, 4], "pickup", 512).await?;
         }
@@ -252,6 +281,32 @@ async fn execute(
         }
     }
     Ok(())
+}
+
+fn snapshot_write(state: &PlayerState, index: usize, mode: &str) -> SnapshotWrite {
+    SnapshotWrite {
+        request_id: format!(
+            "perf:save-{mode}:{}:{}:{}",
+            state.player_id, state.operation_sequence, state.domains[index]
+        ),
+        record: state.records[index].clone(),
+        schema: format!("tiangz.demo.player.{}", state.domains[index]),
+        schema_version: 1,
+        payload: payload(
+            &state.domains[index],
+            state.player_id,
+            domain_payload_bytes(index),
+        ),
+        expected_revision: Some(state.revisions[index]),
+        updated_at_unix_ms: state.operation_sequence,
+    }
+}
+
+fn snapshot_revision(outcome: tiangz_dbproxy_core::SnapshotWriteOutcome) -> Revision {
+    match outcome {
+        tiangz_dbproxy_core::SnapshotWriteOutcome::Applied { revision }
+        | tiangz_dbproxy_core::SnapshotWriteOutcome::Duplicate { revision } => revision,
+    }
 }
 
 async fn apply_multi(
@@ -345,6 +400,8 @@ fn parse_options() -> Result<Options, DynError> {
     let mut workloads = vec![
         Workload::PlayerLoadSingle,
         Workload::PlayerLoadBatch,
+        Workload::PlayerSaveSingle,
+        Workload::PlayerSaveBatch,
         Workload::Pickup,
         Workload::NpcShop,
     ];
@@ -366,6 +423,8 @@ fn parse_options() -> Result<Options, DynError> {
                     .map(|name| match name {
                         "playerData" | "playerDataSingle" => Ok(Workload::PlayerLoadSingle),
                         "playerDataBatch" => Ok(Workload::PlayerLoadBatch),
+                        "playerSave" | "playerSaveSingle" => Ok(Workload::PlayerSaveSingle),
+                        "playerSaveBatch" => Ok(Workload::PlayerSaveBatch),
                         "pickup" => Ok(Workload::Pickup),
                         "npcShop" => Ok(Workload::NpcShop),
                         _ => Err(format!("unknown workload: {name}")),

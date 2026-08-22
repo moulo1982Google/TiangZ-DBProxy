@@ -121,6 +121,8 @@ powershell -ExecutionPolicy Bypass -File tools/network_smoke.ps1
 
 - `playerDataSingle`：每个玩家领域各发一个`LoadSnapshot`，作为批量读取的对照组。
 - `playerDataBatch`：用一个`LoadMultiSnapshot`读取全部玩家领域。
+- `playerSaveSingle`：按旧周期Flush路径为每个领域依次发送一个`SaveSnapshot`。
+- `playerSaveBatch`：用一个`SaveMultiSnapshot`保存全部玩家领域并逐条推进Revision。
 - `pickup`：原子提交`inventory + quest + wallet`三条记录及拾取回执。
 - `npcShop`：原子提交`inventory + wallet`两条记录及买卖回执。
 
@@ -137,6 +139,9 @@ $env:DBPROXY_AUTH_TOKEN = "local-perf-token-1234"
 
 # 模拟30个玩家持久化领域，比较逐条Load和LoadMulti。
 ./target/release/dbproxy_business_load --endpoint 127.0.0.1:7810 --pool-size 64 --players 100 --duration 30 --domain-count 30 --workloads playerDataSingle,playerDataBatch
+
+# 比较5/10/30领域的逐条Save和SaveMulti；正式结论至少运行三轮。
+./target/release/dbproxy_business_load --endpoint 127.0.0.1:7810 --pool-size 32 --players 100 --duration 30 --domain-count 30 --workloads playerSaveSingle,playerSaveBatch
 ```
 
 正式测试必须保持服务端`runtime.workerThreads`、`storage.shards`、客户端连接池、玩家数、时长和机器环境一致。每种工作负载使用全新DBProxy进程，至少运行三轮，报告`ops/s、p50/p95/p99、失败数、DBProxy CPU/RSS`。该结果是DBProxy自身的性能上界，不代表PostgreSQL容量，也不用于评价数据库选型。

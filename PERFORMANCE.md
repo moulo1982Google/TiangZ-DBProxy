@@ -27,6 +27,8 @@
 |---|---|
 | `playerDataSingle` | 每个领域分别发送一个 `LoadSnapshot` |
 | `playerDataBatch` | 使用一个 `LoadMultiSnapshot` 读取全部领域 |
+| `playerSaveSingle` | 每个领域依次发送一个 `SaveSnapshot`，模拟旧周期 Flush |
+| `playerSaveBatch` | 使用一个 `SaveMultiSnapshot` 保存全部领域并逐条推进 Revision |
 | `pickup` | 原子提交 inventory、quest、wallet 三条记录及拾取结果 |
 | `npcShop` | 原子提交 inventory、wallet 两条记录及商店结果 |
 
@@ -90,6 +92,17 @@ powershell -ExecutionPolicy Bypass -Command "& {
     -DurationSeconds 5 `
     -Rounds 3 `
     -ClientPoolSize 64
+}"
+
+# 对比30领域逐条保存和批量保存；5/10领域只需修改DomainCount。
+powershell -ExecutionPolicy Bypass -Command "& {
+  .\tools\run_memory_business_perf.ps1 `
+    -Players @(100) `
+    -Workloads @('playerSaveSingle', 'playerSaveBatch') `
+    -DomainCount 30 `
+    -DurationSeconds 5 `
+    -Rounds 3 `
+    -ClientPoolSize 32
 }"
 ```
 
