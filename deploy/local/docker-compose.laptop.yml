@@ -1,0 +1,42 @@
+services:
+  postgres:
+    restart: "no"
+    mem_limit: 1g
+    mem_reservation: 256m
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - autovacuum_work_mem=32MB
+      - -c
+      - max_connections=30
+      - -c
+      - wal_buffers=8MB
+      - -c
+      - jit=off
+
+  redis:
+    restart: "no"
+    mem_limit: 384m
+    mem_reservation: 64m
+    command:
+      - redis-server
+      - --appendonly
+      - ${DBPROXY_REDIS_APPENDONLY:-no}
+      - --requirepass
+      - ${DBPROXY_REDIS_PASSWORD:?DBPROXY_REDIS_PASSWORD is required}
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+
+  prometheus:
+    profiles: ["observability"]
+
+  grafana:
+    profiles: ["observability"]

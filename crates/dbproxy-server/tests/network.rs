@@ -13,10 +13,11 @@ use tiangz_dbproxy_client::{
 };
 use tiangz_dbproxy_core::{
     AsyncMultiRecordTransactionStore, InMemoryMultiRecordTransactionStore, InMemorySnapshotStore,
-    InMemoryTransactionalStore, MultiRecordTransactionReceipt, MultiRecordTransactionalWrite,
-    MultiRecordTransactionalWriteOutcome, RecordKey, Revision, SnapshotEnvelope, SnapshotStore,
-    SnapshotWrite, SnapshotWriteOutcome, TransactionReceipt, TransactionStore, TransactionalWrite,
-    TransactionalWriteOutcome,
+    InMemoryTransactionalStore, LedgerPosting, MultiRecordTransactionReceipt,
+    MultiRecordTransactionalWrite, MultiRecordTransactionalWriteOutcome, OutboxEvent, RecordKey,
+    Revision, SnapshotEnvelope, SnapshotStore, SnapshotWrite, SnapshotWriteOutcome, TradeState,
+    TradeTransaction, TradeTransactionOutcome, TradeTransition, TransactionReceipt,
+    TransactionStore, TransactionalRecordWrite, TransactionalWrite, TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_protocol::{
     DEFAULT_MAX_FRAME_BYTES, PROTOCOL_FINGERPRINT, read_message, wire, write_message,
@@ -540,5 +541,96 @@ async fn multi_record_transaction_is_atomic_idempotent_and_recoverable() {
     assert_eq!(receipt.operation_id, "trade-network-1");
     assert_eq!(receipt.records.len(), 2);
     assert_eq!(receipt.result, b"trade-complete");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn trade_transaction_round_trip_preserves_state_ledger_and_receipt() {
+    const TOKEN: &str = "network-trade-transaction-token";
+    let backend: Arc<dyn DbProxyBackend> =
+        Arc::new(tiangz_dbproxy_server::MemoryBackend::new(4).unwrap());
+    let server = TestServer::start_with_backend(TOKEN, backend).await;
+    let client = DbProxyClient::connect(ClientConfig::new(
+        &server.endpoint,
+        TOKEN,
+        "trade-transaction-test",
+    ))
+    .await
+    .unwrap();
+    let trade_id = "network-trade-1".to_string();
+    let request = TradeTransaction {
+        operation_id: "network-trade-op-1".to_string(),
+        transition: TradeTransition {
+            trade_id: trade_id.clone(),
+            expected_version: Revision::ZERO,
+            expected_state: None,
+            next_state: TradeState::Escrowed,
+            payload: b"escrow".to_vec(),
+            updated_at_unix_ms: 100,
+        },
+        writes: vec![
+            TransactionalRecordWrite {
+                record: RecordKey::new("trade-wallet", "buyer").unwrap(),
+                schema: "wallet.snapshot".to_string(),
+                schema_version: 1,
+                expected_revision: Revision::ZERO,
+                payload: b"gold=0".to_vec(),
+                updated_at_unix_ms: 100,
+            },
+            TransactionalRecordWrite {
+                record: RecordKey::new("trade-inventory", "seller").unwrap(),
+                schema: "inventory.snapshot".to_string(),
+                schema_version: 1,
+                expected_revision: Revision::ZERO,
+                payload: b"item=escrow".to_vec(),
+                updated_at_unix_ms: 100,
+            },
+        ],
+        ledger_postings: vec![
+            LedgerPosting {
+                posting_id: "network-buyer-debit".to_string(),
+                account_id: "buyer".to_string(),
+                asset: "gold".to_string(),
+                amount: -100,
+                metadata: Vec::new(),
+            },
+            LedgerPosting {
+                posting_id: "network-escrow-credit".to_string(),
+                account_id: "trade-escrow".to_string(),
+                asset: "gold".to_string(),
+                amount: 100,
+                metadata: Vec::new(),
+            },
+        ],
+        outbox_events: vec![OutboxEvent {
+            event_id: "network-trade-event".to_string(),
+            topic: "trade.escrowed".to_string(),
+            partition_key: trade_id.clone(),
+            payload: b"event".to_vec(),
+            occurred_at_unix_ms: 100,
+        }],
+        result: b"escrowed".to_vec(),
+    };
+    let applied = client
+        .apply_trade_transaction(request.clone())
+        .await
+        .unwrap();
+    assert!(matches!(applied, TradeTransactionOutcome::Applied(_)));
+    assert!(matches!(
+        client.apply_trade_transaction(request).await.unwrap(),
+        TradeTransactionOutcome::Duplicate(_)
+    ));
+    let trade = client.load_trade(&trade_id).await.unwrap().unwrap();
+    assert_eq!(trade.version, Revision(1));
+    assert_eq!(trade.state, TradeState::Escrowed);
+    let receipt = client
+        .load_trade_transaction("network-trade-op-1", &trade_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.new_trade_version, Revision(1));
+    assert_eq!(receipt.records.len(), 2);
+    assert_eq!(receipt.ledger_posting_ids.len(), 2);
+    assert_eq!(receipt.outbox_event_ids, ["network-trade-event"]);
     server.stop().await;
 }

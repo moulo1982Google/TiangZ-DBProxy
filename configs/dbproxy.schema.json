@@ -4,6 +4,20 @@
   "title": "TiangZ DBProxy Configuration",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "retryQueue": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workers": { "type": "integer", "minimum": 1, "default": 1 },
+        "leaseMs": { "type": "integer", "minimum": 1, "default": 30000 },
+        "idleDelayMs": { "type": "integer", "minimum": 1, "default": 250 },
+        "baseRetryDelayMs": { "type": "integer", "minimum": 1, "default": 1000 },
+        "maxRetryDelayMs": { "type": "integer", "minimum": 1, "default": 60000 },
+        "maxAttempts": { "type": "integer", "minimum": 1, "default": 20 }
+      }
+    }
+  },
   "required": ["configVersion", "server", "storage"],
   "properties": {
     "$schema": { "type": "string" },
@@ -23,6 +37,7 @@
         "listenAddr": { "type": "string", "description": "单个DBProxy实例的监听地址。" },
         "authTokenEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "认证令牌所在的环境变量名。" },
         "maxFrameBytes": { "type": "integer", "minimum": 1, "default": 8388608 },
+        "maxPayloadBytes": { "type": "integer", "minimum": 1, "default": 1048576 },
         "handshakeTimeoutMs": { "type": "integer", "minimum": 1, "default": 5000 },
         "shutdownGraceMs": { "type": "integer", "minimum": 1, "default": 5000 }
       }
@@ -37,7 +52,18 @@
             "backend": { "const": "postgresRedis" },
             "postgresUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
             "redisUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-            "shards": { "type": "integer", "minimum": 1, "default": 4 }
+            "shards": { "type": "integer", "minimum": 1, "default": 4 },
+            "cacheFallbackConcurrency": { "type": "integer", "minimum": 1, "default": 16 },
+            "cacheFallbackTimeoutMs": { "type": "integer", "minimum": 1, "default": 2000 },
+            "cacheFallbackCircuitFailureThreshold": { "type": "integer", "minimum": 1, "default": 5 },
+            "cacheFallbackCircuitCooldownMs": { "type": "integer", "minimum": 1, "default": 5000 },
+            "cacheFallbackLockLeaseMs": { "type": "integer", "minimum": 1, "default": 3000 },
+            "cacheFallbackLockWaitMs": { "type": "integer", "minimum": 1, "default": 1000 },
+            "cacheFallbackLockPollMs": { "type": "integer", "minimum": 1, "default": 25 },
+            "cacheTtlMs": { "type": "integer", "minimum": 1, "default": 300000, "description": "Fresh lifetime for a positive snapshot cache entry." },
+            "cacheTtlJitterMs": { "type": "integer", "minimum": 0, "default": 30000, "description": "Deterministic per-record TTL jitter; zero disables jitter." },
+            "cacheNegativeTtlMs": { "type": "integer", "minimum": 0, "default": 5000, "description": "Lifetime for a not-found marker; zero disables negative caching." },
+            "cacheStaleWhileRevalidateMs": { "type": "integer", "minimum": 0, "default": 30000, "description": "Additional stale-serving window after freshness expires; zero disables stale-while-revalidate." }
           }
         },
         {
@@ -60,6 +86,14 @@
         "idleDelayMs": { "type": "integer", "minimum": 1, "default": 20 },
         "failureDelayMs": { "type": "integer", "minimum": 1, "default": 1000 }
       }
+    },
+    "cacheRepair": {
+      "$ref": "#/$defs/retryQueue",
+      "description": "PostgreSQL持久缓存修复队列worker；Redis回写失败不会丢失修复意图。"
+    },
+    "outbox": {
+      "$ref": "#/$defs/retryQueue",
+      "description": "PostgreSQL事务Outbox worker；事件至少一次发布到Redis Streams。"
     },
     "logging": {
       "type": "object",

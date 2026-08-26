@@ -5,6 +5,7 @@
     "listenAddr": "127.0.0.1:7800",
     "authTokenEnv": "DBPROXY_AUTH_TOKEN",
     "maxFrameBytes": 8388608,
+    "maxPayloadBytes": 1048576,
     "handshakeTimeoutMs": 5000,
     "shutdownGraceMs": 5000
   },
@@ -15,13 +16,40 @@
     "backend": "postgresRedis",
     "postgresUrlEnv": "DBPROXY_POSTGRES_URL",
     "redisUrlEnv": "DBPROXY_REDIS_URL",
-    "shards": 4
+    "shards": 4,
+    "cacheFallbackConcurrency": 16,
+    "cacheFallbackTimeoutMs": 2000,
+    "cacheFallbackCircuitFailureThreshold": 5,
+    "cacheFallbackCircuitCooldownMs": 5000,
+    "cacheFallbackLockLeaseMs": 3000,
+    "cacheFallbackLockWaitMs": 1000,
+    "cacheFallbackLockPollMs": 25,
+    "cacheTtlMs": 300000,
+    "cacheTtlJitterMs": 30000,
+    "cacheNegativeTtlMs": 5000,
+    "cacheStaleWhileRevalidateMs": 30000
   },
   "backlog": {
     "workers": 1,
     "leaseMs": 30000,
     "idleDelayMs": 20,
     "failureDelayMs": 1000
+  },
+  "cacheRepair": {
+    "workers": 1,
+    "leaseMs": 30000,
+    "idleDelayMs": 250,
+    "baseRetryDelayMs": 1000,
+    "maxRetryDelayMs": 60000,
+    "maxAttempts": 20
+  },
+  "outbox": {
+    "workers": 1,
+    "leaseMs": 30000,
+    "idleDelayMs": 250,
+    "baseRetryDelayMs": 1000,
+    "maxRetryDelayMs": 60000,
+    "maxAttempts": 20
   },
   "logging": {
     "filterEnv": "RUST_LOG",

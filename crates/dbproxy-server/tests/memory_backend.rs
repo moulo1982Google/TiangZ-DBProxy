@@ -1,6 +1,7 @@
 use tiangz_dbproxy_core::{
-    MultiRecordTransactionalWrite, RecordKey, Revision, SnapshotWrite, SnapshotWriteOutcome,
-    StoreError, TransactionalRecordWrite, TransactionalWrite, TransactionalWriteOutcome,
+    LedgerPosting, MultiRecordTransactionalWrite, OutboxEvent, RecordKey, Revision, SnapshotWrite,
+    SnapshotWriteOutcome, StoreError, TradeState, TradeTransaction, TradeTransactionOutcome,
+    TradeTransition, TransactionalRecordWrite, TransactionalWrite, TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_server::{BackendError, DbProxyBackend, MemoryBackend};
 
@@ -26,6 +27,59 @@ fn transaction(record: RecordKey, operation_id: &str, revision: Revision) -> Tra
         payload: b"inventory=2".to_vec(),
         result: b"picked-up".to_vec(),
         updated_at_unix_ms: 200,
+    }
+}
+
+fn trade(
+    operation_id: &str,
+    trade_id: &str,
+    record_key: &str,
+    debit_posting_id: &str,
+    credit_posting_id: &str,
+    event_id: &str,
+) -> TradeTransaction {
+    TradeTransaction {
+        operation_id: operation_id.to_string(),
+        transition: TradeTransition {
+            trade_id: trade_id.to_string(),
+            expected_version: Revision::ZERO,
+            expected_state: None,
+            next_state: TradeState::Escrowed,
+            payload: b"escrow".to_vec(),
+            updated_at_unix_ms: 100,
+        },
+        writes: vec![TransactionalRecordWrite {
+            record: RecordKey::new("trade-record", record_key).unwrap(),
+            schema: "trade.snapshot".to_string(),
+            schema_version: 1,
+            expected_revision: Revision::ZERO,
+            payload: b"escrowed".to_vec(),
+            updated_at_unix_ms: 100,
+        }],
+        ledger_postings: vec![
+            LedgerPosting {
+                posting_id: debit_posting_id.to_string(),
+                account_id: format!("buyer:{trade_id}"),
+                asset: "gold".to_string(),
+                amount: -1,
+                metadata: Vec::new(),
+            },
+            LedgerPosting {
+                posting_id: credit_posting_id.to_string(),
+                account_id: format!("escrow:{trade_id}"),
+                asset: "gold".to_string(),
+                amount: 1,
+                metadata: Vec::new(),
+            },
+        ],
+        outbox_events: vec![OutboxEvent {
+            event_id: event_id.to_string(),
+            topic: "trade.escrowed".to_string(),
+            partition_key: trade_id.to_string(),
+            payload: b"escrowed".to_vec(),
+            occurred_at_unix_ms: 100,
+        }],
+        result: b"ok".to_vec(),
     }
 }
 
@@ -141,5 +195,69 @@ async fn compact_receipt_fingerprints_still_reject_changed_payloads() {
     assert!(matches!(
         backend.apply_multi_transaction(request).await.unwrap_err(),
         BackendError::Core(StoreError::OperationIdConflict { .. })
+    ));
+}
+
+#[tokio::test]
+async fn snapshot_idempotency_fingerprint_includes_the_business_timestamp() {
+    let backend = MemoryBackend::new(2).unwrap();
+    let record = RecordKey::new("player", "timestamp-fingerprint").unwrap();
+    let mut request = snapshot(record, "timestamp-request", Revision::ZERO);
+    backend.save(request.clone()).await.unwrap();
+    request.updated_at_unix_ms += 1;
+    assert!(matches!(
+        backend.save(request).await.unwrap_err(),
+        BackendError::Core(StoreError::IdempotencyConflict { .. })
+    ));
+}
+
+#[tokio::test]
+async fn trade_posting_and_event_ids_are_global_across_memory_shards() {
+    let backend = MemoryBackend::new(4).unwrap();
+    assert!(matches!(
+        backend
+            .apply_trade_transaction(trade(
+                "trade-op-a",
+                "trade-a",
+                "record-a",
+                "shared-debit",
+                "credit-a",
+                "shared-event",
+            ))
+            .await
+            .unwrap(),
+        TradeTransactionOutcome::Applied(_)
+    ));
+
+    let posting_conflict = backend
+        .apply_trade_transaction(trade(
+            "trade-op-b",
+            "trade-b",
+            "record-b",
+            "shared-debit",
+            "credit-b",
+            "event-b",
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        posting_conflict,
+        BackendError::Core(StoreError::LedgerPostingConflict { .. })
+    ));
+
+    let event_conflict = backend
+        .apply_trade_transaction(trade(
+            "trade-op-c",
+            "trade-c",
+            "record-c",
+            "debit-c",
+            "credit-c",
+            "shared-event",
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        event_conflict,
+        BackendError::Core(StoreError::OutboxEventConflict { .. })
     ));
 }

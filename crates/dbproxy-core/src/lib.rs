@@ -1,6 +1,6 @@
 //! DBProxy 的稳定核心契约。
 //!
-//! 本 crate 只定义与游戏无关的快照、Revision、CAS 和幂等语义，
+//! 本 crate 只定义与游戏无关的快照、Revision、CAS、幂等和交易持久化原语，
 //! 不依赖 TiangZ Runtime、TypeScript、Redis 或具体数据库。
 //! Adapters and the network service are intentionally kept outside this crate.
 
@@ -11,6 +11,7 @@ use thiserror::Error;
 
 mod flush;
 mod multi_transaction;
+mod trade;
 mod transaction;
 
 pub use flush::{SnapshotFlushError, SnapshotFlushQueue, SnapshotFlushReport};
@@ -18,6 +19,10 @@ pub use multi_transaction::{
     AsyncMultiRecordTransactionStore, InMemoryMultiRecordTransactionStore,
     MultiRecordTransactionReceipt, MultiRecordTransactionalWrite,
     MultiRecordTransactionalWriteOutcome, TransactionRecordReceipt, TransactionalRecordWrite,
+};
+pub use trade::{
+    AsyncTradeStore, LedgerPosting, OutboxEvent, TradeEnvelope, TradeReceipt, TradeState,
+    TradeTransaction, TradeTransactionOutcome, TradeTransition, normalize_trade_transaction,
 };
 pub use transaction::{
     AsyncTransactionalStore, InMemoryTransactionalStore, TransactionReceipt, TransactionStore,
@@ -122,6 +127,43 @@ pub enum StoreError {
     EmptyTransactionRecords,
     #[error("multi-record transaction contains duplicate record {record:?}")]
     DuplicateTransactionRecord { record: RecordKey },
+    #[error("trade id is empty")]
+    EmptyTradeId,
+    #[error("trade transaction has no snapshot records")]
+    EmptyTradeRecords,
+    #[error("trade {trade_id} version conflict: expected {expected:?}, actual {actual:?}")]
+    TradeVersionConflict {
+        trade_id: String,
+        expected: Revision,
+        actual: Revision,
+    },
+    #[error("trade {trade_id} state conflict: expected {expected:?}, actual {actual:?}")]
+    TradeStateConflict {
+        trade_id: String,
+        expected: Option<TradeState>,
+        actual: Option<TradeState>,
+    },
+    #[error("trade version exhausted for {trade_id}")]
+    TradeVersionExhausted { trade_id: String },
+    #[error("invalid trade state transition from {from:?} to {to:?}")]
+    InvalidTradeStateTransition {
+        from: Option<TradeState>,
+        to: TradeState,
+    },
+    #[error("invalid ledger posting: {0}")]
+    InvalidLedgerPosting(&'static str),
+    #[error("duplicate ledger posting id: {posting_id}")]
+    DuplicateLedgerPosting { posting_id: String },
+    #[error("ledger posting id was already used: {posting_id}")]
+    LedgerPostingConflict { posting_id: String },
+    #[error("ledger postings for asset {asset} are not balanced")]
+    UnbalancedLedger { asset: String },
+    #[error("invalid outbox event: {0}")]
+    InvalidOutboxEvent(&'static str),
+    #[error("duplicate outbox event id: {event_id}")]
+    DuplicateOutboxEvent { event_id: String },
+    #[error("outbox event id was already used: {event_id}")]
+    OutboxEventConflict { event_id: String },
 }
 
 /// DBProxy 适配器必须实现的最小快照接口。

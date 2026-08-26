@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "TiangZ-DBProxy"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde_json",
  "tiangz-dbproxy-client",
@@ -28,6 +28,15 @@ name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "arcstr"
@@ -62,6 +71,15 @@ name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+]
 
 [[package]]
 name = "base64"
@@ -1001,11 +1019,14 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3257df217f7eab0044627a268c9cc6cdb60c0c421c88f83ac41c4e31520b6b84"
 dependencies = [
+ "arc-swap",
  "arcstr",
  "async-lock",
+ "backon",
  "bytes",
  "cfg-if",
  "combine",
+ "futures-channel",
  "futures-util",
  "itoa",
  "num-bigint",
@@ -1300,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "tiangz-dbproxy-client"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "thiserror",
@@ -1311,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "tiangz-dbproxy-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -1321,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "tiangz-dbproxy-protocol"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -1334,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "tiangz-dbproxy-server"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -1352,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "tiangz-dbproxy-storage"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bincode",

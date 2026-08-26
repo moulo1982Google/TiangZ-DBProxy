@@ -10,6 +10,9 @@ enum ErrorCode {
   ERROR_CODE_REVISION_CONFLICT = 2001;
   ERROR_CODE_IDEMPOTENCY_CONFLICT = 2002;
   ERROR_CODE_OPERATION_CONFLICT = 2003;
+  ERROR_CODE_TRADE_CONFLICT = 2004;
+  ERROR_CODE_LEDGER_CONFLICT = 2005;
+  ERROR_CODE_OUTBOX_CONFLICT = 2006;
   ERROR_CODE_STORAGE_UNAVAILABLE = 3001;
   ERROR_CODE_INTERNAL = 9000;
 }
@@ -18,6 +21,14 @@ enum WriteDisposition {
   WRITE_DISPOSITION_UNSPECIFIED = 0;
   WRITE_DISPOSITION_APPLIED = 1;
   WRITE_DISPOSITION_DUPLICATE = 2;
+}
+
+enum TradeState {
+  TRADE_STATE_UNSPECIFIED = 0;
+  TRADE_STATE_PROPOSED = 1;
+  TRADE_STATE_ESCROWED = 2;
+  TRADE_STATE_SETTLED = 3;
+  TRADE_STATE_CANCELLED = 4;
 }
 
 message RpcError {
@@ -185,6 +196,81 @@ message LoadMultiTransactionResponse {
   MultiTransactionReceipt receipt = 1;
 }
 
+message TradeEnvelope {
+  string trade_id = 1;
+  uint64 version = 2;
+  TradeState state = 3;
+  bytes payload = 4;
+  uint64 updated_at_unix_ms = 5;
+}
+
+message TradeTransition {
+  string trade_id = 1;
+  uint64 expected_version = 2;
+  optional TradeState expected_state = 3;
+  TradeState next_state = 4;
+  bytes payload = 5;
+  uint64 updated_at_unix_ms = 6;
+}
+
+message LedgerPosting {
+  string posting_id = 1;
+  string account_id = 2;
+  string asset = 3;
+  sint64 amount = 4;
+  bytes metadata = 5;
+}
+
+message OutboxEvent {
+  string event_id = 1;
+  string topic = 2;
+  string partition_key = 3;
+  bytes payload = 4;
+  uint64 occurred_at_unix_ms = 5;
+}
+
+message ApplyTradeTransactionRequest {
+  string operation_id = 1;
+  TradeTransition transition = 2;
+  repeated TransactionalRecordWrite writes = 3;
+  repeated LedgerPosting ledger_postings = 4;
+  repeated OutboxEvent outbox_events = 5;
+  bytes result = 6;
+}
+
+message TradeReceipt {
+  string operation_id = 1;
+  string trade_id = 2;
+  uint64 new_trade_version = 3;
+  TradeState state = 4;
+  repeated MultiTransactionRecordReceipt records = 5;
+  repeated string ledger_posting_ids = 6;
+  repeated string outbox_event_ids = 7;
+  bytes result = 8;
+}
+
+message ApplyTradeTransactionResponse {
+  WriteDisposition disposition = 1;
+  TradeReceipt receipt = 2;
+}
+
+message LoadTradeRequest {
+  string trade_id = 1;
+}
+
+message LoadTradeResponse {
+  TradeEnvelope trade = 1;
+}
+
+message LoadTradeTransactionRequest {
+  string operation_id = 1;
+  string trade_id = 2;
+}
+
+message LoadTradeTransactionResponse {
+  TradeReceipt receipt = 1;
+}
+
 message RequestEnvelope {
   uint64 rpc_id = 1;
   oneof body {
@@ -198,6 +284,9 @@ message RequestEnvelope {
     LoadMultiSnapshotRequest load_multi_snapshot = 17;
     SaveMultiSnapshotRequest save_multi_snapshot = 18;
     EnqueueMultiSnapshotRequest enqueue_multi_snapshot = 19;
+    ApplyTradeTransactionRequest apply_trade_transaction = 20;
+    LoadTradeRequest load_trade = 21;
+    LoadTradeTransactionRequest load_trade_transaction = 22;
   }
 }
 
@@ -215,6 +304,9 @@ message ResponseEnvelope {
     LoadMultiSnapshotResponse load_multi_snapshot = 17;
     SaveMultiSnapshotResponse save_multi_snapshot = 18;
     EnqueueMultiSnapshotResponse enqueue_multi_snapshot = 19;
+    ApplyTradeTransactionResponse apply_trade_transaction = 20;
+    LoadTradeResponse load_trade = 21;
+    LoadTradeTransactionResponse load_trade_transaction = 22;
   }
 }
 

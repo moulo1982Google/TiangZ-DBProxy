@@ -38,6 +38,26 @@ Grafana会自动配置Prometheus数据源并加载`TiangZ DBProxy Overview`，�
 
 | 指标 | 含义 |
 | --- | --- |
+| `dbproxy_cache_hits_total` / `dbproxy_cache_misses_total` | Initial logical Redis cache result per requested record; hits include fresh, stale, and negative results |
+| `dbproxy_cache_negative_hits_total` / `dbproxy_cache_negative_writes_total` | Negative-cache hits and missing-record markers written to Redis |
+| `dbproxy_cache_stale_hits_total` | Stale snapshots served during the stale-while-revalidate window |
+| `dbproxy_cache_refresh_started_total` / `dbproxy_cache_refresh_completed_total` / `dbproxy_cache_refresh_errors_total` | Background stale-cache refresh lifecycle |
+| `dbproxy_cache_read_errors_total` / `dbproxy_cache_write_errors_total` | Redis read/decode and cache write/delete failures |
+| `dbproxy_cache_writes_total` | Successful Redis snapshot cache writes |
+| `dbproxy_postgres_fallbacks_total` | PostgreSQL fallback attempts after a Redis cache miss |
+| `dbproxy_postgres_fallback_errors_total` / `dbproxy_postgres_fallback_timeouts_total` | Fallback read failures and configured timeout expirations |
+| `dbproxy_postgres_fallback_circuit_open_total` | Fallback requests rejected while the PostgreSQL fallback circuit is open |
+| `dbproxy_cache_fallback_lock_acquired_total` / `dbproxy_cache_fallback_lock_contention_total` | Redis cross-instance fallback locks acquired and contended |
+| `dbproxy_cache_fallback_lock_timeouts_total` / `dbproxy_cache_fallback_lock_errors_total` | Lock waits that expired and lock/recheck failures that triggered unlocked fallback |
+| `dbproxy_cache_fallback_lock_release_errors_total` | Lock release failures; Redis TTL remains the recovery path |
+| `dbproxy_backlog_pending` / `dbproxy_backlog_processing` | Current pending and leased Redis backlog depth |
+| `dbproxy_backlog_oldest_pending_age_seconds` | Age of the oldest pending backlog item; zero when empty |
+| `dbproxy_cache_repair_pending` / `dbproxy_cache_repair_processing` / `dbproxy_cache_repair_dead_lettered` | PostgreSQL-backed cache repair queue state |
+| `dbproxy_cache_repair_oldest_age_seconds` | Age of the oldest committed snapshot still awaiting cache repair |
+| `dbproxy_cache_repair_worker_polls_total` | Repair worker outcomes: committed/retry/dead-letter/lease-lost/empty/failure |
+| `dbproxy_outbox_pending` / `dbproxy_outbox_processing` / `dbproxy_outbox_dead_lettered` | PostgreSQL transactional Outbox state |
+| `dbproxy_outbox_oldest_age_seconds` | Age of the oldest unpublished non-dead event |
+| `dbproxy_outbox_worker_polls_total` | Outbox worker outcomes using the same fixed result labels |
 | `dbproxy_live` / `dbproxy_ready` | 实例存活与接流量状态 |
 | `dbproxy_connections_total` / `dbproxy_connections_active` | TCP连接累计值与当前值 |
 | `dbproxy_handshake_rejections_total` | 按协议、令牌或客户端名称分类的握手拒绝 |
@@ -46,6 +66,7 @@ Grafana会自动配置Prometheus数据源并加载`TiangZ DBProxy Overview`，�
 | `dbproxy_rpc_failures_total` | 按固定操作名统计的失败 |
 | `dbproxy_rpc_errors_total` | 按固定错误码分类的失败原因 |
 | `dbproxy_rpc_records_total` | 批量RPC处理的逻辑记录数 |
+| `dbproxy_rpc_payload_bytes_total` | RPC请求中的二进制payload和事务result字节数 |
 | `dbproxy_rpc_duration_seconds` | 可计算P50/P95/P99的Histogram |
 | `dbproxy_backlog_polls_total` | Backlog提交、空轮询与失败次数 |
 | `dbproxy_backlog_processing_seconds_total` | Backlog处理累计时间 |
@@ -61,7 +82,16 @@ Grafana会自动配置Prometheus数据源并加载`TiangZ DBProxy Overview`，�
 - 实例持续30秒未Ready；
 - 存储错误持续出现；
 - P99持续5分钟超过100ms；
-- Redis普通快照Backlog持续处理失败。
+- Redis普通快照Backlog持续处理失败；
+- PostgreSQL回源持续超时；
+- PostgreSQL回源熔断器打开并持续拒绝回源；
+- Redis跨实例回源锁协调持续失败或等待超时；
+- 缓存后台刷新持续失败；
+- Backlog待处理深度超过1000或最老项目超过5分钟；
+- 缓存修复或Outbox最老项目持续超过1分钟；
+- 缓存修复或Outbox出现任意死信（critical）。
+
+`dbproxy_cache_stale_hits_total`用于观察SWR实际承接的流量，不单独触发告警；是否异常需要结合刷新失败、PostgreSQL回源和延迟指标判断。
 
 本地Prometheus只计算告警，不配置通知渠道。生产环境由运维侧Alertmanager或云监控接收这些规则。
 
@@ -69,6 +99,6 @@ Grafana会自动配置Prometheus数据源并加载`TiangZ DBProxy Overview`，�
 
 两个DBProxy实例使用不同观测端口，例如`127.0.0.1:9090`和`127.0.0.1:9091`。Prometheus可以部署在同机，也可以通过防火墙允许专用监控网段访问。业务TCP、观测HTTP和PostgreSQL/Redis端口必须分别管理，不能因为Grafana需要指标就把任一端口暴露公网。
 
-Dashboard展示的是DBProxy服务和TiangZ客户端行为。PostgreSQL与Redis自身的连接池、慢查询、Buffer和实例资源仍应使用云厂商监控或官方Exporter；DBProxy不会冒充数据库内部指标的权威来源。
+Dashboard新增缓存修复/Outbox状态与worker结果面板。它展示的是DBProxy服务和TiangZ客户端行为；PostgreSQL与Redis自身的连接池、慢查询、Buffer、AOF rewrite和实例资源仍应使用云厂商监控或官方Exporter，DBProxy不会冒充数据库内部指标的权威来源。
 
 本地Prometheus还会抓取TiangZ all-in-one的`7600`以及`cluster-dbproxy`中启用持久化的Process健康端口。未启动的开发拓扑会显示为Down，但不会触发`tiangz-dbproxy`实例告警；正式部署应通过服务发现或独立静态目标清单替换这些本机示例端口。

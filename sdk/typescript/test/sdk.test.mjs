@@ -8,7 +8,7 @@ import {
 } from "../dist/index.js";
 
 test("protocol lock is generated from the authoritative proto", () => {
-  assert.equal(DBPROXY_PROTOCOL_VERSION, 1);
+  assert.equal(DBPROXY_PROTOCOL_VERSION, 2);
   assert.match(DBPROXY_PROTOCOL_FINGERPRINT, /^[0-9a-f]{64}$/);
 });
 
@@ -243,6 +243,120 @@ test("multi-record transaction keeps all records and result defensive", async ()
   assert.equal(captured.writes[0].payload[0], 9);
   assert.deepEqual([...returned.result], [4, 5]);
   assert.deepEqual([...returned.records[1].record.key], [..."seller"]);
+});
+
+test("trade transaction validates state and ledger while preserving byte ownership", async () => {
+  let captured;
+  const receiptResult = Uint8Array.from([5]);
+  let responseVersion = 1n;
+  const client = new DbProxyClient({
+    applyTradeTransaction: async (transaction) => {
+      captured = transaction;
+      return {
+        disposition: "applied",
+        receipt: {
+          operationId: transaction.operationId,
+          tradeId: transaction.transition.tradeId,
+          newTradeVersion: responseVersion,
+          state: "escrowed",
+          records: transaction.writes.map((write) => ({
+            record: write.record,
+            newRevision: 1n,
+          })),
+          ledgerPostingIds: transaction.ledgerPostings.map((posting) => posting.postingId),
+          outboxEventIds: transaction.outboxEvents.map((event) => event.eventId),
+          result: receiptResult,
+        },
+      };
+    },
+  });
+  const transitionPayload = Uint8Array.from([1]);
+  const snapshotPayload = Uint8Array.from([2]);
+  const ledgerMetadata = Uint8Array.from([3]);
+  const eventPayload = Uint8Array.from([4]);
+  const resultPayload = Uint8Array.from([5]);
+  const trade = {
+    operationId: "trade-op-1",
+    transition: {
+      tradeId: "trade-1",
+      expectedVersion: 0n,
+      nextState: "escrowed",
+      payload: transitionPayload,
+      updatedAtUnixMs: 1n,
+    },
+    writes: [{
+      record: { namespace: "inventory", key: "seller" },
+      schema: "inventory.snapshot",
+      schemaVersion: 1,
+      expectedRevision: 0n,
+      payload: snapshotPayload,
+      updatedAtUnixMs: 1n,
+    }],
+    ledgerPostings: [
+      {
+        postingId: "buyer-debit",
+        accountId: "buyer",
+        asset: "gold",
+        amount: -100n,
+        metadata: ledgerMetadata,
+      },
+      {
+        postingId: "escrow-credit",
+        accountId: "escrow:trade-1",
+        asset: "gold",
+        amount: 100n,
+        metadata: new Uint8Array(),
+      },
+    ],
+    outboxEvents: [{
+      eventId: "trade-event-1",
+      topic: "trade.escrowed",
+      partitionKey: "trade-1",
+      payload: eventPayload,
+      occurredAtUnixMs: 1n,
+    }],
+    result: resultPayload,
+  };
+
+  const applied = await client.ApplyTradeTransaction(trade);
+  transitionPayload[0] = 9;
+  snapshotPayload[0] = 9;
+  ledgerMetadata[0] = 9;
+  eventPayload[0] = 9;
+  resultPayload[0] = 9;
+  receiptResult[0] = 9;
+  assert.equal(captured.transition.payload[0], 1);
+  assert.equal(captured.writes[0].payload[0], 2);
+  assert.equal(captured.ledgerPostings[0].metadata[0], 3);
+  assert.equal(captured.outboxEvents[0].payload[0], 4);
+  assert.equal(captured.result[0], 5);
+  assert.deepEqual([...applied.receipt.result], [5]);
+
+  responseVersion = 2n;
+  await assert.rejects(
+    () => client.ApplyTradeTransaction(trade),
+    /receipt does not match the request/,
+  );
+
+  assert.throws(
+    () => client.ApplyTradeTransaction({
+      ...trade,
+      ledgerPostings: [trade.ledgerPostings[0]],
+    }),
+    /ledger is not balanced/,
+  );
+  assert.throws(
+    () => client.ApplyTradeTransaction({
+      ...trade,
+      transition: {
+        ...trade.transition,
+        expectedVersion: 1n,
+        expectedState: "settled",
+        nextState: "escrowed",
+      },
+    }),
+    /illegal state transition/,
+  );
 });
 
 test("SDK validation works in a bare V8 without TextEncoder", async () => {

@@ -5,6 +5,7 @@
     "listenAddr": "127.0.0.1:7810",
     "authTokenEnv": "DBPROXY_AUTH_TOKEN",
     "maxFrameBytes": 8388608,
+    "maxPayloadBytes": 1048576,
     "handshakeTimeoutMs": 5000,
     "shutdownGraceMs": 5000
   },

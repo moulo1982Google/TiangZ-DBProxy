@@ -11,7 +11,14 @@ use std::{
 };
 
 use serde::Deserialize;
-use tiangz_dbproxy_protocol::DEFAULT_MAX_FRAME_BYTES;
+use tiangz_dbproxy_protocol::{DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_PAYLOAD_BYTES};
+use tiangz_dbproxy_storage::{
+    DEFAULT_CACHE_FALLBACK_CIRCUIT_COOLDOWN_MS, DEFAULT_CACHE_FALLBACK_CIRCUIT_FAILURE_THRESHOLD,
+    DEFAULT_CACHE_FALLBACK_CONCURRENCY, DEFAULT_CACHE_FALLBACK_LOCK_LEASE_MS,
+    DEFAULT_CACHE_FALLBACK_LOCK_POLL_MS, DEFAULT_CACHE_FALLBACK_LOCK_WAIT_MS,
+    DEFAULT_CACHE_FALLBACK_TIMEOUT_MS, DEFAULT_CACHE_NEGATIVE_TTL_MS,
+    DEFAULT_CACHE_STALE_WHILE_REVALIDATE_MS, DEFAULT_CACHE_TTL_JITTER_MS, DEFAULT_CACHE_TTL_MS,
+};
 
 const DEFAULT_CONFIG_PATH: &str = "configs/local.json";
 
@@ -27,6 +34,10 @@ pub struct DbProxyConfig {
     pub storage: StorageSection,
     #[serde(default)]
     pub backlog: BacklogSection,
+    #[serde(default)]
+    pub cache_repair: RetryQueueSection,
+    #[serde(default)]
+    pub outbox: RetryQueueSection,
     #[serde(default)]
     pub logging: LoggingSection,
     #[serde(default)]
@@ -55,6 +66,8 @@ pub struct ServerSection {
     pub auth_token_env: String,
     #[serde(default = "default_max_frame_bytes")]
     pub max_frame_bytes: usize,
+    #[serde(default = "default_max_payload_bytes")]
+    pub max_payload_bytes: usize,
     #[serde(default = "default_handshake_timeout_ms")]
     pub handshake_timeout_ms: u64,
     #[serde(default = "default_shutdown_grace_ms")]
@@ -71,6 +84,55 @@ pub enum StorageSection {
         redis_url_env: String,
         #[serde(default = "default_storage_shards")]
         shards: usize,
+        #[serde(
+            rename = "cacheFallbackConcurrency",
+            default = "default_cache_fallback_concurrency"
+        )]
+        cache_fallback_concurrency: usize,
+        #[serde(
+            rename = "cacheFallbackTimeoutMs",
+            default = "default_cache_fallback_timeout_ms"
+        )]
+        cache_fallback_timeout_ms: u64,
+        #[serde(
+            rename = "cacheFallbackCircuitFailureThreshold",
+            default = "default_cache_fallback_circuit_failure_threshold"
+        )]
+        cache_fallback_circuit_failure_threshold: u32,
+        #[serde(
+            rename = "cacheFallbackCircuitCooldownMs",
+            default = "default_cache_fallback_circuit_cooldown_ms"
+        )]
+        cache_fallback_circuit_cooldown_ms: u64,
+        #[serde(
+            rename = "cacheFallbackLockLeaseMs",
+            default = "default_cache_fallback_lock_lease_ms"
+        )]
+        cache_fallback_lock_lease_ms: u64,
+        #[serde(
+            rename = "cacheFallbackLockWaitMs",
+            default = "default_cache_fallback_lock_wait_ms"
+        )]
+        cache_fallback_lock_wait_ms: u64,
+        #[serde(
+            rename = "cacheFallbackLockPollMs",
+            default = "default_cache_fallback_lock_poll_ms"
+        )]
+        cache_fallback_lock_poll_ms: u64,
+        #[serde(rename = "cacheTtlMs", default = "default_cache_ttl_ms")]
+        cache_ttl_ms: u64,
+        #[serde(rename = "cacheTtlJitterMs", default = "default_cache_ttl_jitter_ms")]
+        cache_ttl_jitter_ms: u64,
+        #[serde(
+            rename = "cacheNegativeTtlMs",
+            default = "default_cache_negative_ttl_ms"
+        )]
+        cache_negative_ttl_ms: u64,
+        #[serde(
+            rename = "cacheStaleWhileRevalidateMs",
+            default = "default_cache_stale_while_revalidate_ms"
+        )]
+        cache_stale_while_revalidate_ms: u64,
     },
     Memory {
         #[serde(default = "default_storage_shards")]
@@ -98,6 +160,36 @@ impl Default for BacklogSection {
             lease_ms: default_backlog_lease_ms(),
             idle_delay_ms: default_backlog_idle_delay_ms(),
             failure_delay_ms: default_backlog_failure_delay_ms(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetryQueueSection {
+    #[serde(default = "default_retry_queue_workers")]
+    pub workers: usize,
+    #[serde(default = "default_retry_queue_lease_ms")]
+    pub lease_ms: u64,
+    #[serde(default = "default_retry_queue_idle_delay_ms")]
+    pub idle_delay_ms: u64,
+    #[serde(default = "default_retry_queue_base_delay_ms")]
+    pub base_retry_delay_ms: u64,
+    #[serde(default = "default_retry_queue_max_delay_ms")]
+    pub max_retry_delay_ms: u64,
+    #[serde(default = "default_retry_queue_max_attempts")]
+    pub max_attempts: u32,
+}
+
+impl Default for RetryQueueSection {
+    fn default() -> Self {
+        Self {
+            workers: default_retry_queue_workers(),
+            lease_ms: default_retry_queue_lease_ms(),
+            idle_delay_ms: default_retry_queue_idle_delay_ms(),
+            base_retry_delay_ms: default_retry_queue_base_delay_ms(),
+            max_retry_delay_ms: default_retry_queue_max_delay_ms(),
+            max_attempts: default_retry_queue_max_attempts(),
         }
     }
 }
@@ -137,6 +229,7 @@ pub struct ResolvedDbProxyConfig {
     pub listen_addr: SocketAddr,
     pub auth_token: String,
     pub max_frame_bytes: usize,
+    pub max_payload_bytes: usize,
     pub handshake_timeout: Duration,
     pub shutdown_grace: Duration,
     pub runtime_worker_threads: usize,
@@ -145,8 +238,20 @@ pub struct ResolvedDbProxyConfig {
     pub backlog_lease_ms: u64,
     pub backlog_idle_delay: Duration,
     pub backlog_failure_delay: Duration,
+    pub cache_repair: ResolvedRetryQueue,
+    pub outbox: ResolvedRetryQueue,
     pub log_filter: String,
     pub observability_listen_addr: Option<SocketAddr>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ResolvedRetryQueue {
+    pub workers: usize,
+    pub lease_ms: u64,
+    pub idle_delay: Duration,
+    pub base_retry_delay_ms: u64,
+    pub max_retry_delay_ms: u64,
+    pub max_attempts: u32,
 }
 
 #[derive(Clone)]
@@ -155,6 +260,17 @@ pub enum ResolvedStorage {
         postgres_url: String,
         redis_url: String,
         shards: usize,
+        cache_fallback_concurrency: usize,
+        cache_fallback_timeout_ms: u64,
+        cache_fallback_circuit_failure_threshold: u32,
+        cache_fallback_circuit_cooldown_ms: u64,
+        cache_fallback_lock_lease_ms: u64,
+        cache_fallback_lock_wait_ms: u64,
+        cache_fallback_lock_poll_ms: u64,
+        cache_ttl_ms: u64,
+        cache_ttl_jitter_ms: u64,
+        cache_negative_ttl_ms: u64,
+        cache_stale_while_revalidate_ms: u64,
     },
     Memory {
         shards: usize,
@@ -184,10 +300,13 @@ impl fmt::Debug for ResolvedDbProxyConfig {
             .field("listen_addr", &self.listen_addr)
             .field("auth_token", &"[REDACTED]")
             .field("max_frame_bytes", &self.max_frame_bytes)
+            .field("max_payload_bytes", &self.max_payload_bytes)
             .field("runtime_worker_threads", &self.runtime_worker_threads)
             .field("storage_backend", &self.storage.name())
             .field("storage_shards", &self.storage.shards())
             .field("backlog_workers", &self.backlog_workers)
+            .field("cache_repair_workers", &self.cache_repair.workers)
+            .field("outbox_workers", &self.outbox.workers)
             .field("observability_listen_addr", &self.observability_listen_addr)
             .finish_non_exhaustive()
     }
@@ -262,6 +381,12 @@ impl DbProxyConfig {
             )));
         }
         require_positive("server.maxFrameBytes", self.server.max_frame_bytes)?;
+        require_positive("server.maxPayloadBytes", self.server.max_payload_bytes)?;
+        if self.server.max_payload_bytes > self.server.max_frame_bytes {
+            return Err(ConfigError(
+                "server.maxPayloadBytes cannot exceed server.maxFrameBytes".to_string(),
+            ));
+        }
         require_positive(
             "server.handshakeTimeoutMs",
             self.server.handshake_timeout_ms,
@@ -272,6 +397,8 @@ impl DbProxyConfig {
         require_positive("backlog.leaseMs", self.backlog.lease_ms)?;
         require_positive("backlog.idleDelayMs", self.backlog.idle_delay_ms)?;
         require_positive("backlog.failureDelayMs", self.backlog.failure_delay_ms)?;
+        let cache_repair = resolve_retry_queue("cacheRepair", self.cache_repair)?;
+        let outbox = resolve_retry_queue("outbox", self.outbox)?;
 
         let auth_token = required_environment(&environment, &self.server.auth_token_env)?;
         let storage = match self.storage {
@@ -279,12 +406,60 @@ impl DbProxyConfig {
                 postgres_url_env,
                 redis_url_env,
                 shards,
+                cache_fallback_concurrency,
+                cache_fallback_timeout_ms,
+                cache_fallback_circuit_failure_threshold,
+                cache_fallback_circuit_cooldown_ms,
+                cache_fallback_lock_lease_ms,
+                cache_fallback_lock_wait_ms,
+                cache_fallback_lock_poll_ms,
+                cache_ttl_ms,
+                cache_ttl_jitter_ms,
+                cache_negative_ttl_ms,
+                cache_stale_while_revalidate_ms,
             } => {
                 require_positive("storage.shards", shards)?;
+                require_positive(
+                    "storage.cacheFallbackConcurrency",
+                    cache_fallback_concurrency,
+                )?;
+                require_positive("storage.cacheFallbackTimeoutMs", cache_fallback_timeout_ms)?;
+                require_positive(
+                    "storage.cacheFallbackCircuitFailureThreshold",
+                    cache_fallback_circuit_failure_threshold,
+                )?;
+                require_positive(
+                    "storage.cacheFallbackCircuitCooldownMs",
+                    cache_fallback_circuit_cooldown_ms,
+                )?;
+                require_positive(
+                    "storage.cacheFallbackLockLeaseMs",
+                    cache_fallback_lock_lease_ms,
+                )?;
+                require_positive(
+                    "storage.cacheFallbackLockWaitMs",
+                    cache_fallback_lock_wait_ms,
+                )?;
+                require_positive(
+                    "storage.cacheFallbackLockPollMs",
+                    cache_fallback_lock_poll_ms,
+                )?;
+                require_positive("storage.cacheTtlMs", cache_ttl_ms)?;
                 ResolvedStorage::PostgresRedis {
                     postgres_url: required_environment(&environment, &postgres_url_env)?,
                     redis_url: required_environment(&environment, &redis_url_env)?,
                     shards,
+                    cache_fallback_concurrency,
+                    cache_fallback_timeout_ms,
+                    cache_fallback_circuit_failure_threshold,
+                    cache_fallback_circuit_cooldown_ms,
+                    cache_fallback_lock_lease_ms,
+                    cache_fallback_lock_wait_ms,
+                    cache_fallback_lock_poll_ms,
+                    cache_ttl_ms,
+                    cache_ttl_jitter_ms,
+                    cache_negative_ttl_ms,
+                    cache_stale_while_revalidate_ms,
                 }
             }
             StorageSection::Memory { shards } => {
@@ -307,6 +482,7 @@ impl DbProxyConfig {
             listen_addr: self.server.listen_addr,
             auth_token,
             max_frame_bytes: self.server.max_frame_bytes,
+            max_payload_bytes: self.server.max_payload_bytes,
             handshake_timeout: Duration::from_millis(self.server.handshake_timeout_ms),
             shutdown_grace: Duration::from_millis(self.server.shutdown_grace_ms),
             runtime_worker_threads: self.runtime.worker_threads,
@@ -315,6 +491,8 @@ impl DbProxyConfig {
             backlog_lease_ms: self.backlog.lease_ms,
             backlog_idle_delay: Duration::from_millis(self.backlog.idle_delay_ms),
             backlog_failure_delay: Duration::from_millis(self.backlog.failure_delay_ms),
+            cache_repair,
+            outbox,
             log_filter,
             observability_listen_addr: self.observability.listen_addr,
         })
@@ -362,6 +540,9 @@ where
 const fn default_max_frame_bytes() -> usize {
     DEFAULT_MAX_FRAME_BYTES
 }
+const fn default_max_payload_bytes() -> usize {
+    DEFAULT_MAX_PAYLOAD_BYTES
+}
 const fn default_handshake_timeout_ms() -> u64 {
     5_000
 }
@@ -370,6 +551,85 @@ const fn default_shutdown_grace_ms() -> u64 {
 }
 const fn default_storage_shards() -> usize {
     4
+}
+const fn default_cache_fallback_concurrency() -> usize {
+    DEFAULT_CACHE_FALLBACK_CONCURRENCY
+}
+const fn default_cache_fallback_timeout_ms() -> u64 {
+    DEFAULT_CACHE_FALLBACK_TIMEOUT_MS
+}
+const fn default_cache_fallback_circuit_failure_threshold() -> u32 {
+    DEFAULT_CACHE_FALLBACK_CIRCUIT_FAILURE_THRESHOLD
+}
+const fn default_cache_fallback_circuit_cooldown_ms() -> u64 {
+    DEFAULT_CACHE_FALLBACK_CIRCUIT_COOLDOWN_MS
+}
+const fn default_cache_fallback_lock_lease_ms() -> u64 {
+    DEFAULT_CACHE_FALLBACK_LOCK_LEASE_MS
+}
+const fn default_cache_fallback_lock_wait_ms() -> u64 {
+    DEFAULT_CACHE_FALLBACK_LOCK_WAIT_MS
+}
+const fn default_cache_fallback_lock_poll_ms() -> u64 {
+    DEFAULT_CACHE_FALLBACK_LOCK_POLL_MS
+}
+const fn default_cache_ttl_ms() -> u64 {
+    DEFAULT_CACHE_TTL_MS
+}
+const fn default_cache_ttl_jitter_ms() -> u64 {
+    DEFAULT_CACHE_TTL_JITTER_MS
+}
+const fn default_cache_negative_ttl_ms() -> u64 {
+    DEFAULT_CACHE_NEGATIVE_TTL_MS
+}
+const fn default_cache_stale_while_revalidate_ms() -> u64 {
+    DEFAULT_CACHE_STALE_WHILE_REVALIDATE_MS
+}
+const fn default_retry_queue_workers() -> usize {
+    1
+}
+const fn default_retry_queue_lease_ms() -> u64 {
+    30_000
+}
+const fn default_retry_queue_idle_delay_ms() -> u64 {
+    250
+}
+const fn default_retry_queue_base_delay_ms() -> u64 {
+    1_000
+}
+const fn default_retry_queue_max_delay_ms() -> u64 {
+    60_000
+}
+const fn default_retry_queue_max_attempts() -> u32 {
+    20
+}
+
+fn resolve_retry_queue(
+    name: &str,
+    queue: RetryQueueSection,
+) -> Result<ResolvedRetryQueue, ConfigError> {
+    require_positive(&format!("{name}.workers"), queue.workers)?;
+    require_positive(&format!("{name}.leaseMs"), queue.lease_ms)?;
+    require_positive(&format!("{name}.idleDelayMs"), queue.idle_delay_ms)?;
+    require_positive(
+        &format!("{name}.baseRetryDelayMs"),
+        queue.base_retry_delay_ms,
+    )?;
+    require_positive(&format!("{name}.maxRetryDelayMs"), queue.max_retry_delay_ms)?;
+    require_positive(&format!("{name}.maxAttempts"), queue.max_attempts)?;
+    if queue.max_retry_delay_ms < queue.base_retry_delay_ms {
+        return Err(ConfigError(format!(
+            "{name}.maxRetryDelayMs cannot be less than {name}.baseRetryDelayMs"
+        )));
+    }
+    Ok(ResolvedRetryQueue {
+        workers: queue.workers,
+        lease_ms: queue.lease_ms,
+        idle_delay: Duration::from_millis(queue.idle_delay_ms),
+        base_retry_delay_ms: queue.base_retry_delay_ms,
+        max_retry_delay_ms: queue.max_retry_delay_ms,
+        max_attempts: queue.max_attempts,
+    })
 }
 fn default_runtime_worker_threads() -> usize {
     std::thread::available_parallelism()
@@ -433,8 +693,67 @@ mod tests {
         fs::remove_file(path).unwrap();
         assert_eq!(config.storage.shards(), 4);
         assert_eq!(config.runtime_worker_threads, 4);
+        assert_eq!(config.max_payload_bytes, DEFAULT_MAX_PAYLOAD_BYTES);
         assert_eq!(config.backlog_workers, 1);
+        assert_eq!(config.cache_repair.workers, 1);
+        assert_eq!(config.cache_repair.lease_ms, 30_000);
+        assert_eq!(config.cache_repair.max_attempts, 20);
+        assert_eq!(config.outbox.workers, 1);
+        assert_eq!(config.outbox.max_attempts, 20);
         assert_eq!(config.log_filter, "info");
+        match &config.storage {
+            ResolvedStorage::PostgresRedis {
+                cache_fallback_concurrency,
+                cache_fallback_timeout_ms,
+                cache_fallback_circuit_failure_threshold,
+                cache_fallback_circuit_cooldown_ms,
+                cache_fallback_lock_lease_ms,
+                cache_fallback_lock_wait_ms,
+                cache_fallback_lock_poll_ms,
+                cache_ttl_ms,
+                cache_ttl_jitter_ms,
+                cache_negative_ttl_ms,
+                cache_stale_while_revalidate_ms,
+                ..
+            } => {
+                assert_eq!(
+                    *cache_fallback_concurrency,
+                    DEFAULT_CACHE_FALLBACK_CONCURRENCY
+                );
+                assert_eq!(
+                    *cache_fallback_timeout_ms,
+                    DEFAULT_CACHE_FALLBACK_TIMEOUT_MS
+                );
+                assert_eq!(
+                    *cache_fallback_circuit_failure_threshold,
+                    DEFAULT_CACHE_FALLBACK_CIRCUIT_FAILURE_THRESHOLD
+                );
+                assert_eq!(
+                    *cache_fallback_circuit_cooldown_ms,
+                    DEFAULT_CACHE_FALLBACK_CIRCUIT_COOLDOWN_MS
+                );
+                assert_eq!(
+                    *cache_fallback_lock_lease_ms,
+                    DEFAULT_CACHE_FALLBACK_LOCK_LEASE_MS
+                );
+                assert_eq!(
+                    *cache_fallback_lock_wait_ms,
+                    DEFAULT_CACHE_FALLBACK_LOCK_WAIT_MS
+                );
+                assert_eq!(
+                    *cache_fallback_lock_poll_ms,
+                    DEFAULT_CACHE_FALLBACK_LOCK_POLL_MS
+                );
+                assert_eq!(*cache_ttl_ms, DEFAULT_CACHE_TTL_MS);
+                assert_eq!(*cache_ttl_jitter_ms, DEFAULT_CACHE_TTL_JITTER_MS);
+                assert_eq!(*cache_negative_ttl_ms, DEFAULT_CACHE_NEGATIVE_TTL_MS);
+                assert_eq!(
+                    *cache_stale_while_revalidate_ms,
+                    DEFAULT_CACHE_STALE_WHILE_REVALIDATE_MS
+                );
+            }
+            ResolvedStorage::Memory { .. } => panic!("expected postgresRedis storage"),
+        }
         let debug = format!("{config:?}");
         assert!(!debug.contains("postgres://secret"));
         assert!(!debug.contains("0123456789abcdef"));
@@ -497,5 +816,261 @@ mod tests {
         assert_eq!(config.runtime_worker_threads, 4);
         assert_eq!(config.storage.name(), "memory");
         assert_eq!(config.storage.shards(), 8);
+    }
+
+    #[test]
+    fn rejects_payload_limit_above_frame_limit() {
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": {
+            "listenAddr": "127.0.0.1:7800",
+            "authTokenEnv": "AUTH",
+            "maxFrameBytes": 1024,
+            "maxPayloadBytes": 2048
+          },
+          "storage": { "backend": "memory" }
+        }"#,
+        );
+        let error = load_config_with(&path, |name| {
+            (name == "AUTH").then(|| "memory-test-token".to_string())
+        })
+        .unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("server.maxPayloadBytes cannot exceed server.maxFrameBytes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_cache_fallback_limits() {
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "storage": {
+            "backend": "postgresRedis",
+            "postgresUrlEnv": "PG",
+            "redisUrlEnv": "REDIS",
+            "cacheFallbackConcurrency": 0,
+            "cacheFallbackTimeoutMs": 2000
+          }
+        }"#,
+        );
+        let error = load_config_with(&path, |_| Some("unused".to_string())).unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("storage.cacheFallbackConcurrency must be greater than zero"),
+            "unexpected error: {error}"
+        );
+
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "storage": {
+            "backend": "postgresRedis",
+            "postgresUrlEnv": "PG",
+            "redisUrlEnv": "REDIS",
+            "cacheFallbackConcurrency": 16,
+            "cacheFallbackTimeoutMs": 0
+          }
+        }"#,
+        );
+        let error = load_config_with(&path, |_| Some("unused".to_string())).unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("storage.cacheFallbackTimeoutMs must be greater than zero"),
+            "unexpected error: {error}"
+        );
+
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "storage": {
+            "backend": "postgresRedis",
+            "postgresUrlEnv": "PG",
+            "redisUrlEnv": "REDIS",
+            "cacheFallbackCircuitFailureThreshold": 0,
+            "cacheFallbackCircuitCooldownMs": 5000
+          }
+        }"#,
+        );
+        let error = load_config_with(&path, |_| Some("unused".to_string())).unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("storage.cacheFallbackCircuitFailureThreshold must be greater than zero")
+        );
+
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "storage": {
+            "backend": "postgresRedis",
+            "postgresUrlEnv": "PG",
+            "redisUrlEnv": "REDIS",
+            "cacheFallbackCircuitFailureThreshold": 5,
+            "cacheFallbackCircuitCooldownMs": 0
+          }
+        }"#,
+        );
+        let error = load_config_with(&path, |_| Some("unused".to_string())).unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("storage.cacheFallbackCircuitCooldownMs must be greater than zero")
+        );
+
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "storage": {
+            "backend": "postgresRedis",
+            "postgresUrlEnv": "PG",
+            "redisUrlEnv": "REDIS",
+            "cacheFallbackLockLeaseMs": 0,
+            "cacheFallbackLockWaitMs": 1000,
+            "cacheFallbackLockPollMs": 25
+          }
+        }"#,
+        );
+        let error = load_config_with(&path, |_| Some("unused".to_string())).unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("storage.cacheFallbackLockLeaseMs must be greater than zero")
+        );
+
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "storage": {
+            "backend": "postgresRedis",
+            "postgresUrlEnv": "PG",
+            "redisUrlEnv": "REDIS",
+            "cacheFallbackLockLeaseMs": 3000,
+            "cacheFallbackLockWaitMs": 0,
+            "cacheFallbackLockPollMs": 25
+          }
+        }"#,
+        );
+        let error = load_config_with(&path, |_| Some("unused".to_string())).unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("storage.cacheFallbackLockWaitMs must be greater than zero")
+        );
+
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "storage": {
+            "backend": "postgresRedis",
+            "postgresUrlEnv": "PG",
+            "redisUrlEnv": "REDIS",
+            "cacheFallbackLockLeaseMs": 3000,
+            "cacheFallbackLockWaitMs": 1000,
+            "cacheFallbackLockPollMs": 0
+          }
+        }"#,
+        );
+        let error = load_config_with(&path, |_| Some("unused".to_string())).unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("storage.cacheFallbackLockPollMs must be greater than zero")
+        );
+
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "storage": {
+            "backend": "postgresRedis",
+            "postgresUrlEnv": "PG",
+            "redisUrlEnv": "REDIS",
+            "cacheTtlMs": 0
+          }
+        }"#,
+        );
+        let error = load_config_with(&path, |_| Some("unused".to_string())).unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("storage.cacheTtlMs must be greater than zero")
+        );
+
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "storage": {
+            "backend": "postgresRedis",
+            "postgresUrlEnv": "PG",
+            "redisUrlEnv": "REDIS",
+            "cacheTtlMs": 1000,
+            "cacheTtlJitterMs": 0,
+            "cacheNegativeTtlMs": 0,
+            "cacheStaleWhileRevalidateMs": 0
+          }
+        }"#,
+        );
+        let config = load_config_with(&path, |_| Some("unused".to_string())).unwrap();
+        fs::remove_file(path).unwrap();
+        match config.storage {
+            ResolvedStorage::PostgresRedis {
+                cache_ttl_jitter_ms,
+                cache_negative_ttl_ms,
+                cache_stale_while_revalidate_ms,
+                ..
+            } => {
+                assert_eq!(cache_ttl_jitter_ms, 0);
+                assert_eq!(cache_negative_ttl_ms, 0);
+                assert_eq!(cache_stale_while_revalidate_ms, 0);
+            }
+            ResolvedStorage::Memory { .. } => panic!("expected postgresRedis storage"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_durable_queue_retry_policy() {
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "storage": { "backend": "memory" },
+          "cacheRepair": { "baseRetryDelayMs": 2000, "maxRetryDelayMs": 1000 }
+        }"#,
+        );
+        let error = load_config_with(&path, |name| {
+            (name == "AUTH").then(|| "memory-test-token".to_string())
+        })
+        .unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(
+            error.to_string().contains(
+                "cacheRepair.maxRetryDelayMs cannot be less than cacheRepair.baseRetryDelayMs"
+            ),
+            "unexpected error: {error}"
+        );
     }
 }

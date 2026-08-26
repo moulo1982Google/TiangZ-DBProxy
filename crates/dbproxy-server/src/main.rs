@@ -1,10 +1,16 @@
-use std::{env, error::Error, sync::Arc};
+use std::{
+    env,
+    error::Error,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use tiangz_dbproxy_server::{
     DbProxyBackend, DbProxyMetrics, DbProxyServer, MemoryBackend, ObservabilityServer,
-    ServerConfig, StorageBackend,
+    RetryWorkerPolicy, ServerConfig, StorageBackend, StorageBackendConfig,
     config::{ResolvedDbProxyConfig, ResolvedStorage, config_path_from_args, load_config},
-    run_backlog_worker_observed,
+    run_backlog_worker_observed, run_cache_repair_worker_observed, run_outbox_worker_observed,
+    run_storage_metrics_poller,
 };
 use tokio::{sync::watch, task::JoinSet};
 use tracing_subscriber::EnvFilter;
@@ -28,9 +34,51 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
             postgres_url,
             redis_url,
             shards,
+            cache_fallback_concurrency,
+            cache_fallback_timeout_ms,
+            cache_fallback_circuit_failure_threshold,
+            cache_fallback_circuit_cooldown_ms,
+            cache_fallback_lock_lease_ms,
+            cache_fallback_lock_wait_ms,
+            cache_fallback_lock_poll_ms,
+            cache_ttl_ms,
+            cache_ttl_jitter_ms,
+            cache_negative_ttl_ms,
+            cache_stale_while_revalidate_ms,
         } => {
-            let backend =
-                Arc::new(StorageBackend::connect(&postgres_url, &redis_url, shards).await?);
+            let backend = Arc::new(
+                StorageBackend::connect_with_config(
+                    &postgres_url,
+                    &redis_url,
+                    StorageBackendConfig {
+                        shard_count: shards,
+                        tiered: tiangz_dbproxy_storage::TieredSnapshotStoreConfig {
+                            fallback: tiangz_dbproxy_storage::CacheFallbackConfig {
+                                max_concurrent: cache_fallback_concurrency,
+                                timeout: Duration::from_millis(cache_fallback_timeout_ms),
+                            },
+                            circuit: tiangz_dbproxy_storage::CacheFallbackCircuitConfig {
+                                failure_threshold: cache_fallback_circuit_failure_threshold,
+                                cooldown: Duration::from_millis(cache_fallback_circuit_cooldown_ms),
+                            },
+                            lock: tiangz_dbproxy_storage::CacheFallbackLockConfig {
+                                lease: Duration::from_millis(cache_fallback_lock_lease_ms),
+                                wait: Duration::from_millis(cache_fallback_lock_wait_ms),
+                                poll_interval: Duration::from_millis(cache_fallback_lock_poll_ms),
+                            },
+                            cache: tiangz_dbproxy_storage::SnapshotCacheConfig {
+                                ttl: Duration::from_millis(cache_ttl_ms),
+                                ttl_jitter: Duration::from_millis(cache_ttl_jitter_ms),
+                                negative_ttl: Duration::from_millis(cache_negative_ttl_ms),
+                                stale_while_revalidate: Duration::from_millis(
+                                    cache_stale_while_revalidate_ms,
+                                ),
+                            },
+                        },
+                    },
+                )
+                .await?,
+            );
             let server_backend: Arc<dyn DbProxyBackend> = backend.clone();
             run_server(config, server_backend, Some(backend)).await
         }
@@ -48,6 +96,7 @@ async fn run_server(
 ) -> Result<(), Box<dyn Error>> {
     let mut server_config = ServerConfig::new(config.listen_addr, config.auth_token.clone());
     server_config.max_frame_bytes = config.max_frame_bytes;
+    server_config.max_payload_bytes = config.max_payload_bytes;
     server_config.handshake_timeout = config.handshake_timeout;
     server_config.shutdown_grace = config.shutdown_grace;
     let metrics = Arc::new(DbProxyMetrics::default());
@@ -78,12 +127,51 @@ async fn run_server(
 
     let mut workers = JoinSet::new();
     if let Some(backend) = durable_backend {
+        workers.spawn(run_storage_metrics_poller(
+            Arc::clone(&backend),
+            Arc::clone(&metrics),
+            Duration::from_secs(5),
+            shutdown_rx.clone(),
+        ));
         for _ in 0..config.backlog_workers {
             workers.spawn(run_backlog_worker_observed(
                 Arc::clone(&backend),
                 config.backlog_lease_ms,
                 config.backlog_idle_delay,
                 config.backlog_failure_delay,
+                shutdown_rx.clone(),
+                Some(Arc::clone(&metrics)),
+            ));
+        }
+        let instance = worker_instance_id();
+        let cache_repair_policy = RetryWorkerPolicy {
+            lease_ms: config.cache_repair.lease_ms,
+            base_retry_delay_ms: config.cache_repair.base_retry_delay_ms,
+            max_retry_delay_ms: config.cache_repair.max_retry_delay_ms,
+            max_attempts: config.cache_repair.max_attempts,
+        };
+        for index in 0..config.cache_repair.workers {
+            workers.spawn(run_cache_repair_worker_observed(
+                Arc::clone(&backend),
+                format!("cache-repair-{instance}-{index}"),
+                cache_repair_policy,
+                config.cache_repair.idle_delay,
+                shutdown_rx.clone(),
+                Some(Arc::clone(&metrics)),
+            ));
+        }
+        let outbox_policy = RetryWorkerPolicy {
+            lease_ms: config.outbox.lease_ms,
+            base_retry_delay_ms: config.outbox.base_retry_delay_ms,
+            max_retry_delay_ms: config.outbox.max_retry_delay_ms,
+            max_attempts: config.outbox.max_attempts,
+        };
+        for index in 0..config.outbox.workers {
+            workers.spawn(run_outbox_worker_observed(
+                Arc::clone(&backend),
+                format!("outbox-{instance}-{index}"),
+                outbox_policy,
+                config.outbox.idle_delay,
                 shutdown_rx.clone(),
                 Some(Arc::clone(&metrics)),
             ));
@@ -101,6 +189,16 @@ async fn run_server(
         } else {
             0
         },
+        cache_repair_worker_count = if matches!(config.storage, ResolvedStorage::PostgresRedis { .. }) {
+            config.cache_repair.workers
+        } else {
+            0
+        },
+        outbox_worker_count = if matches!(config.storage, ResolvedStorage::PostgresRedis { .. }) {
+            config.outbox.workers
+        } else {
+            0
+        },
         observability_addr = observability.as_ref().map(ObservabilityServer::local_addr).map(|value| value.to_string()),
         "TiangZ DBProxy started"
     );
@@ -110,7 +208,7 @@ async fn run_server(
     if tokio::time::timeout(config.shutdown_grace, async {
         while let Some(joined) = workers.join_next().await {
             if let Err(error) = joined {
-                tracing::error!(%error, "DBProxy backlog worker stopped unexpectedly");
+                tracing::error!(%error, "DBProxy background worker stopped unexpectedly");
             }
         }
     })
@@ -120,7 +218,7 @@ async fn run_server(
         workers.abort_all();
         tracing::warn!(
             shutdown_grace_ms = config.shutdown_grace.as_millis(),
-            "DBProxy backlog worker shutdown grace expired; Redis leases will recover unfinished work"
+            "DBProxy background worker shutdown grace expired; durable leases will recover unfinished work"
         );
     }
     if let Some(observability) = observability {
@@ -130,4 +228,11 @@ async fn run_server(
     metrics.mark_stopped();
     tracing::info!("TiangZ DBProxy stopped");
     Ok(())
+}
+
+fn worker_instance_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("{}-{nanos}", std::process::id())
 }

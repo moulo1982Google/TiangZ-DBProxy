@@ -126,6 +126,28 @@ fn snapshot(request_id: &str, record: RecordKey, payload: &[u8]) -> SnapshotWrit
     }
 }
 
+fn assert_postgres_unavailable(error: &StorageError) {
+    assert!(
+        matches!(
+            error,
+            StorageError::Postgres(_) | StorageError::PostgresConnectTimeout { .. }
+        ),
+        "expected a PostgreSQL outage error, got {error}"
+    );
+}
+
+async fn assert_redis_aof_enabled(redis_url: &str) {
+    let client = redis::Client::open(redis_url).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let values: Vec<String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("appendonly")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(values, ["appendonly", "yes"]);
+}
+
 #[tokio::test]
 #[ignore = "会停止并恢复本机 Redis；设置 DBPROXY_RUN_DOCKER_FAULTS=1 后显式运行"]
 async fn redis_outage_falls_back_and_retry_repairs_cache() {
@@ -167,11 +189,18 @@ async fn redis_outage_falls_back_and_retry_repairs_cache() {
         b"v2",
         b"committed-v2",
     );
-    let error = tokio::time::timeout(Duration::from_secs(5), store.apply(second.clone()))
+    let outcome = tokio::time::timeout(Duration::from_secs(5), store.apply(second.clone()))
         .await
         .expect("PostgreSQL commit plus Redis failure must not hang")
-        .unwrap_err();
-    assert!(matches!(error, StorageError::CacheSync(_)));
+        .unwrap();
+    assert_eq!(
+        outcome,
+        TransactionalWriteOutcome::Applied {
+            new_revision: Revision(2),
+            result: b"committed-v2".to_vec(),
+        },
+        "a durable cache repair row lets DBProxy report the authoritative commit"
+    );
 
     let durable = store.load(&key).await.unwrap().unwrap();
     assert_eq!(durable.revision, Revision(2));
@@ -180,6 +209,29 @@ async fn redis_outage_falls_back_and_retry_repairs_cache() {
     let mut recovered = TieredSnapshotStore::connect(&postgres_url, &redis_url)
         .await
         .unwrap();
+    let queue = recovered.cache_repair_queue();
+    let (postgres, connection) = tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move { connection.await.unwrap() });
+    postgres
+        .execute(
+            "UPDATE dbproxy_cache_repairs SET requested_at = to_timestamp(0) WHERE namespace = $1 AND record_key = $2",
+            &[&key.namespace, &key.key],
+        )
+        .await
+        .unwrap();
+    let lease = queue
+        .claim("fault-matrix-repair", 30_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.record, key);
+    assert_eq!(
+        recovered.repair_cache(&key).await.unwrap(),
+        Some(Revision(2))
+    );
+    assert!(queue.acknowledge(&lease).await.unwrap());
     assert_eq!(
         recovered.apply(second).await.unwrap(),
         TransactionalWriteOutcome::Duplicate {
@@ -232,15 +284,42 @@ async fn postgres_outage_never_reports_a_successful_write() {
         .await
         .expect("database outage must not hang the caller")
         .unwrap_err();
-    assert!(matches!(error, StorageError::Postgres(_)));
+    assert_postgres_unavailable(&error);
 
     postgres.restart();
-    let recovered = TieredSnapshotStore::connect(&postgres_url, &redis_url)
-        .await
-        .unwrap();
+    let recovery_write = transaction(
+        &format!("after-reconnect-{}", test_suffix()),
+        key.clone(),
+        Revision(1),
+        b"v2-after-reconnect",
+        b"reconnected",
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match store.apply(recovery_write.clone()).await {
+            Ok(
+                TransactionalWriteOutcome::Applied {
+                    new_revision: Revision(2),
+                    ..
+                }
+                | TransactionalWriteOutcome::Duplicate {
+                    new_revision: Revision(2),
+                    ..
+                },
+            ) => {
+                break;
+            }
+            Ok(outcome) => panic!("unexpected reconnect write outcome: {outcome:?}"),
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                eprintln!("waiting for PostgreSQL connection to reconnect: {error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("PostgreSQL connection did not recover: {error}"),
+        }
+    }
     assert_eq!(
-        recovered.load(&key).await.unwrap().unwrap().revision,
-        Revision(1)
+        store.load(&key).await.unwrap().unwrap().revision,
+        Revision(2)
     );
 }
 
@@ -288,12 +367,63 @@ async fn snapshot_queue_retries_after_postgres_recovers() {
 }
 
 #[tokio::test]
+#[ignore = "会停止并恢复本机 PostgreSQL；设置 DBPROXY_RUN_DOCKER_FAULTS=1 后显式运行"]
+async fn redis_aof_backlog_accumulates_while_postgres_is_down_and_drains_after_recovery() {
+    if !require_opt_in() {
+        return;
+    }
+    let (postgres_url, redis_url) = env_urls();
+    assert_redis_aof_enabled(&redis_url).await;
+    let key = RecordKey::new("fault-matrix-aof-drain", test_suffix()).unwrap();
+    let request = snapshot(
+        &format!("aof-drain-{}", test_suffix()),
+        key.clone(),
+        b"queued-while-postgres-down",
+    );
+    let backlog = RedisSnapshotBacklog::connect(&redis_url).await.unwrap();
+    backlog.enqueue(request.clone()).await.unwrap();
+    let mut store = TieredSnapshotStore::connect(&postgres_url, &redis_url)
+        .await
+        .unwrap();
+
+    let mut postgres = RestartGuard::stop(POSTGRES_CONTAINER);
+    let lease = backlog.claim(5_000).await.unwrap().unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(5), store.save(lease.request.clone()))
+        .await
+        .expect("PostgreSQL outage must not hang backlog processing")
+        .unwrap_err();
+    assert_postgres_unavailable(&error);
+    assert!(backlog.release(&lease).await.unwrap());
+
+    postgres.restart();
+    let mut recovered = TieredSnapshotStore::connect(&postgres_url, &redis_url)
+        .await
+        .unwrap();
+    let retried = backlog
+        .claim(5_000)
+        .await
+        .unwrap()
+        .expect("released AOF backlog item must remain pending");
+    assert_eq!(retried.request, request);
+    recovered.save(retried.request.clone()).await.unwrap();
+    assert_eq!(
+        backlog.ack(&retried).await.unwrap(),
+        SnapshotBacklogAck::Removed
+    );
+    assert_eq!(
+        recovered.load(&key).await.unwrap().unwrap().payload,
+        b"queued-while-postgres-down"
+    );
+}
+
+#[tokio::test]
 #[ignore = "会停止并恢复本机 Redis；设置 DBPROXY_RUN_DOCKER_FAULTS=1 后显式运行"]
 async fn durable_snapshot_backlog_survives_redis_restart() {
     if !require_opt_in() {
         return;
     }
     let (postgres_url, redis_url) = env_urls();
+    assert_redis_aof_enabled(&redis_url).await;
     let key = RecordKey::new("fault-matrix", test_suffix()).unwrap();
     let backlog = RedisSnapshotBacklog::connect(&redis_url)
         .await
@@ -306,17 +436,22 @@ async fn durable_snapshot_backlog_survives_redis_restart() {
         ))
         .await
         .unwrap();
-    drop(backlog);
 
     let mut redis = RestartGuard::stop(REDIS_CONTAINER);
     redis.restart();
 
-    let backlog = RedisSnapshotBacklog::connect(&redis_url).await.unwrap();
-    let lease = backlog
-        .claim(5_000)
-        .await
-        .unwrap()
-        .expect("AOF-backed backlog must survive Redis restart");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let lease = loop {
+        match backlog.claim(5_000).await {
+            Ok(Some(lease)) => break lease,
+            Ok(None) => panic!("AOF-backed backlog disappeared after Redis restart"),
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                eprintln!("waiting for Redis connection manager to reconnect: {error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("Redis connection manager did not recover: {error}"),
+        }
+    };
     assert_eq!(lease.request.record, key);
     assert_eq!(lease.request.payload, b"durable-v1");
 

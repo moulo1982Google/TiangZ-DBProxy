@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -9,8 +9,10 @@ use sha2::{Digest, Sha256};
 use tiangz_dbproxy_core::{
     MultiRecordTransactionReceipt, MultiRecordTransactionalWrite,
     MultiRecordTransactionalWriteOutcome, RecordKey, Revision, SnapshotEnvelope, SnapshotWrite,
-    SnapshotWriteOutcome, StoreError, TransactionReceipt, TransactionRecordReceipt,
+    SnapshotWriteOutcome, StoreError, TradeEnvelope, TradeReceipt, TradeTransaction,
+    TradeTransactionOutcome, TransactionReceipt, TransactionRecordReceipt,
     TransactionalRecordWrite, TransactionalWrite, TransactionalWriteOutcome,
+    normalize_trade_transaction,
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -23,9 +25,22 @@ struct MemoryShard {
 
 #[derive(Default)]
 struct ReceiptShard {
+    operation_kinds: HashMap<String, &'static str>,
     snapshots: HashMap<String, SnapshotReceipt>,
     transactions: HashMap<String, StoredTransactionReceipt>,
     multi_transactions: HashMap<String, StoredMultiTransactionReceipt>,
+    trade_transactions: HashMap<String, StoredTradeTransactionReceipt>,
+}
+
+#[derive(Default)]
+struct TradeShard {
+    trades: HashMap<String, TradeEnvelope>,
+}
+
+#[derive(Default)]
+struct TradeIdentifiers {
+    ledger_posting_ids: HashSet<String>,
+    outbox_event_ids: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -41,6 +56,7 @@ struct SnapshotFingerprint {
     schema_version: u32,
     payload_digest: [u8; 32],
     expected_revision: Option<Revision>,
+    updated_at_unix_ms: u64,
 }
 
 impl SnapshotFingerprint {
@@ -50,6 +66,7 @@ impl SnapshotFingerprint {
             schema_version: request.schema_version,
             payload_digest: digest(&request.payload),
             expected_revision: request.expected_revision,
+            updated_at_unix_ms: request.updated_at_unix_ms,
         }
     }
 }
@@ -91,6 +108,12 @@ struct StoredMultiTransactionReceipt {
     fingerprint: MultiTransactionFingerprint,
     records: Vec<TransactionRecordReceipt>,
     result: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct StoredTradeTransactionReceipt {
+    request: TradeTransaction,
+    receipt: TradeReceipt,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -138,6 +161,8 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 pub struct MemoryBackend {
     data_shards: Vec<Arc<Mutex<MemoryShard>>>,
     receipt_shards: Vec<Arc<Mutex<ReceiptShard>>>,
+    trade_shards: Vec<Arc<Mutex<TradeShard>>>,
+    trade_identifiers: Arc<Mutex<TradeIdentifiers>>,
 }
 
 impl MemoryBackend {
@@ -154,6 +179,10 @@ impl MemoryBackend {
             receipt_shards: (0..shards)
                 .map(|_| Arc::new(Mutex::new(ReceiptShard::default())))
                 .collect(),
+            trade_shards: (0..shards)
+                .map(|_| Arc::new(Mutex::new(TradeShard::default())))
+                .collect(),
+            trade_identifiers: Arc::new(Mutex::new(TradeIdentifiers::default())),
         })
     }
 
@@ -169,6 +198,10 @@ impl MemoryBackend {
 
     fn receipt_index(&self, operation_id: &str) -> usize {
         Self::hash_index(operation_id, self.receipt_shards.len())
+    }
+
+    fn trade_index(&self, trade_id: &str) -> usize {
+        Self::hash_index(trade_id, self.trade_shards.len())
     }
 
     async fn lock_data_shards(
@@ -214,6 +247,20 @@ impl MemoryBackend {
             }
         }
         Ok(request)
+    }
+
+    fn claim_operation(
+        receipts: &mut ReceiptShard,
+        operation_id: &str,
+        kind: &'static str,
+    ) -> Result<(), StoreError> {
+        match receipts.operation_kinds.get(operation_id) {
+            Some(existing) if *existing != kind => Err(StoreError::OperationIdConflict {
+                operation_id: operation_id.to_string(),
+            }),
+            Some(_) => Ok(()),
+            None => Ok(()),
+        }
     }
 }
 
@@ -346,6 +393,7 @@ impl DbProxyBackend for MemoryBackend {
         }
         let receipt_index = self.receipt_index(&request.operation_id);
         let mut receipts = self.receipt_shards[receipt_index].lock().await;
+        Self::claim_operation(&mut receipts, &request.operation_id, "single")?;
         let fingerprint = TransactionFingerprint::from_request(&request);
         if let Some(receipt) = receipts.transactions.get(&request.operation_id) {
             if receipt.fingerprint != fingerprint {
@@ -397,6 +445,9 @@ impl DbProxyBackend for MemoryBackend {
                 updated_at_unix_ms: request.updated_at_unix_ms,
             },
         );
+        receipts
+            .operation_kinds
+            .insert(request.operation_id.clone(), "single");
         receipts.transactions.insert(
             request.operation_id,
             StoredTransactionReceipt {
@@ -446,6 +497,7 @@ impl DbProxyBackend for MemoryBackend {
         let request = Self::normalize_multi(request)?;
         let receipt_index = self.receipt_index(&request.operation_id);
         let mut receipts = self.receipt_shards[receipt_index].lock().await;
+        Self::claim_operation(&mut receipts, &request.operation_id, "multi")?;
         let fingerprint = MultiTransactionFingerprint::from_request(&request);
         if let Some(receipt) = receipts.multi_transactions.get(&request.operation_id) {
             if receipt.fingerprint != fingerprint {
@@ -515,6 +567,9 @@ impl DbProxyBackend for MemoryBackend {
                 },
             );
         }
+        receipts
+            .operation_kinds
+            .insert(request.operation_id.clone(), "multi");
         receipts.multi_transactions.insert(
             request.operation_id,
             StoredMultiTransactionReceipt {
@@ -565,5 +620,206 @@ impl DbProxyBackend for MemoryBackend {
             records: receipt.records.clone(),
             result: receipt.result.clone(),
         }))
+    }
+
+    async fn load_trade(&self, trade_id: &str) -> Result<Option<TradeEnvelope>, BackendError> {
+        if trade_id.trim().is_empty() {
+            return Err(StoreError::EmptyTradeId.into());
+        }
+        let shard = self.trade_shards[self.trade_index(trade_id)].lock().await;
+        Ok(shard.trades.get(trade_id).cloned())
+    }
+
+    async fn apply_trade_transaction(
+        &self,
+        request: TradeTransaction,
+    ) -> Result<TradeTransactionOutcome, BackendError> {
+        let request = normalize_trade_transaction(request)?;
+        let receipt_index = self.receipt_index(&request.operation_id);
+        let mut receipts = self.receipt_shards[receipt_index].lock().await;
+        Self::claim_operation(&mut receipts, &request.operation_id, "trade")?;
+        if let Some(stored) = receipts.trade_transactions.get(&request.operation_id) {
+            if stored.request != request {
+                return Err(StoreError::OperationIdConflict {
+                    operation_id: request.operation_id,
+                }
+                .into());
+            }
+            return Ok(TradeTransactionOutcome::Duplicate(stored.receipt.clone()));
+        }
+
+        // PostgreSQL gives posting_id and event_id global primary keys. Keep the volatile backend
+        // behavior identical even when two trades hash to different trade shards.
+        let mut identifiers = self.trade_identifiers.lock().await;
+        let trade_index = self.trade_index(&request.transition.trade_id);
+        let mut trades = self.trade_shards[trade_index].lock().await;
+        let current = trades.trades.get(&request.transition.trade_id);
+        let actual_version = current.map_or(Revision::ZERO, |trade| trade.version);
+        let actual_state = current.map(|trade| trade.state);
+        if actual_version != request.transition.expected_version {
+            return Err(StoreError::TradeVersionConflict {
+                trade_id: request.transition.trade_id,
+                expected: request.transition.expected_version,
+                actual: actual_version,
+            }
+            .into());
+        }
+        if actual_state != request.transition.expected_state {
+            return Err(StoreError::TradeStateConflict {
+                trade_id: request.transition.trade_id,
+                expected: request.transition.expected_state,
+                actual: actual_state,
+            }
+            .into());
+        }
+        for posting in &request.ledger_postings {
+            if identifiers.ledger_posting_ids.contains(&posting.posting_id) {
+                return Err(StoreError::LedgerPostingConflict {
+                    posting_id: posting.posting_id.clone(),
+                }
+                .into());
+            }
+        }
+        for event in &request.outbox_events {
+            if identifiers.outbox_event_ids.contains(&event.event_id) {
+                return Err(StoreError::OutboxEventConflict {
+                    event_id: event.event_id.clone(),
+                }
+                .into());
+            }
+        }
+
+        let mut data = self.lock_data_shards(&request.writes).await;
+        let mut committed = Vec::with_capacity(request.writes.len());
+        for write in &request.writes {
+            let index = self.data_index(&write.record);
+            let shard = &data
+                .iter()
+                .find(|(candidate, _)| *candidate == index)
+                .expect("locked data shard missing")
+                .1;
+            let actual = shard
+                .snapshots
+                .get(&write.record)
+                .map_or(Revision::ZERO, |snapshot| snapshot.revision);
+            if actual != write.expected_revision {
+                return Err(StoreError::RevisionConflict {
+                    record: write.record.clone(),
+                    expected: Some(write.expected_revision),
+                    actual,
+                }
+                .into());
+            }
+            committed.push(TransactionRecordReceipt {
+                record: write.record.clone(),
+                new_revision: Revision(actual.0.checked_add(1).ok_or_else(|| {
+                    StoreError::RevisionExhausted {
+                        record: write.record.clone(),
+                    }
+                })?),
+            });
+        }
+        let new_trade_version = Revision(actual_version.0.checked_add(1).ok_or_else(|| {
+            StoreError::TradeVersionExhausted {
+                trade_id: request.transition.trade_id.clone(),
+            }
+        })?);
+
+        for (write, receipt) in request.writes.iter().zip(&committed) {
+            let index = self.data_index(&write.record);
+            let shard = &mut data
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == index)
+                .expect("locked data shard missing")
+                .1;
+            shard.snapshots.insert(
+                write.record.clone(),
+                SnapshotEnvelope {
+                    record: write.record.clone(),
+                    schema: write.schema.clone(),
+                    schema_version: write.schema_version,
+                    revision: receipt.new_revision,
+                    payload: write.payload.clone(),
+                    updated_at_unix_ms: write.updated_at_unix_ms,
+                },
+            );
+        }
+        trades.trades.insert(
+            request.transition.trade_id.clone(),
+            TradeEnvelope {
+                trade_id: request.transition.trade_id.clone(),
+                version: new_trade_version,
+                state: request.transition.next_state,
+                payload: request.transition.payload.clone(),
+                updated_at_unix_ms: request.transition.updated_at_unix_ms,
+            },
+        );
+        identifiers.ledger_posting_ids.extend(
+            request
+                .ledger_postings
+                .iter()
+                .map(|posting| posting.posting_id.clone()),
+        );
+        identifiers.outbox_event_ids.extend(
+            request
+                .outbox_events
+                .iter()
+                .map(|event| event.event_id.clone()),
+        );
+        let receipt = TradeReceipt {
+            operation_id: request.operation_id.clone(),
+            trade_id: request.transition.trade_id.clone(),
+            new_trade_version,
+            state: request.transition.next_state,
+            records: committed,
+            ledger_posting_ids: request
+                .ledger_postings
+                .iter()
+                .map(|posting| posting.posting_id.clone())
+                .collect(),
+            outbox_event_ids: request
+                .outbox_events
+                .iter()
+                .map(|event| event.event_id.clone())
+                .collect(),
+            result: request.result.clone(),
+        };
+        receipts
+            .operation_kinds
+            .insert(request.operation_id.clone(), "trade");
+        receipts.trade_transactions.insert(
+            request.operation_id.clone(),
+            StoredTradeTransactionReceipt {
+                request,
+                receipt: receipt.clone(),
+            },
+        );
+        Ok(TradeTransactionOutcome::Applied(receipt))
+    }
+
+    async fn load_trade_transaction(
+        &self,
+        operation_id: &str,
+        trade_id: &str,
+    ) -> Result<Option<TradeReceipt>, BackendError> {
+        if operation_id.trim().is_empty() {
+            return Err(StoreError::EmptyOperationId.into());
+        }
+        if trade_id.trim().is_empty() {
+            return Err(StoreError::EmptyTradeId.into());
+        }
+        let receipts = self.receipt_shards[self.receipt_index(operation_id)]
+            .lock()
+            .await;
+        let Some(stored) = receipts.trade_transactions.get(operation_id) else {
+            return Ok(None);
+        };
+        if stored.receipt.trade_id != trade_id {
+            return Err(StoreError::OperationIdConflict {
+                operation_id: operation_id.to_string(),
+            }
+            .into());
+        }
+        Ok(Some(stored.receipt.clone()))
     }
 }

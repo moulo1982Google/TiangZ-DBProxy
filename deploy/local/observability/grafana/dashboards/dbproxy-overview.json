@@ -78,6 +78,75 @@
       "id": 10,
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
       "targets": [{ "expr": "sum by (process, from_endpoint, to_endpoint) (increase(tiangz_dbproxy_endpoint_failovers_total[5m]))", "legendFormat": "{{process}} {{from_endpoint}} -> {{to_endpoint}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis Cache Lifecycle Rate",
+      "id": 11,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "targets": [
+        { "expr": "sum by (instance) (rate(dbproxy_cache_hits_total[5m]))", "legendFormat": "{{instance}} hits" },
+        { "expr": "sum by (instance) (rate(dbproxy_cache_misses_total[5m]))", "legendFormat": "{{instance}} misses" },
+        { "expr": "sum by (instance) (rate(dbproxy_cache_negative_hits_total[5m]))", "legendFormat": "{{instance}} negative hits" },
+        { "expr": "sum by (instance) (rate(dbproxy_cache_stale_hits_total[5m]))", "legendFormat": "{{instance}} stale hits" },
+        { "expr": "sum by (instance) (rate(dbproxy_cache_negative_writes_total[5m]))", "legendFormat": "{{instance}} negative writes" },
+        { "expr": "sum by (instance) (rate(dbproxy_cache_refresh_started_total[5m]))", "legendFormat": "{{instance}} refresh started" },
+        { "expr": "sum by (instance) (rate(dbproxy_cache_refresh_completed_total[5m]))", "legendFormat": "{{instance}} refresh completed" },
+        { "expr": "sum by (instance) (rate(dbproxy_cache_refresh_errors_total[5m]))", "legendFormat": "{{instance}} refresh errors" },
+        { "expr": "sum by (instance) (rate(dbproxy_cache_read_errors_total[5m]))", "legendFormat": "{{instance}} read errors" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "PostgreSQL Fallbacks and Timeouts",
+      "id": 12,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "targets": [
+        { "expr": "sum by (instance) (rate(dbproxy_postgres_fallbacks_total[5m]))", "legendFormat": "{{instance}} fallbacks" },
+        { "expr": "sum by (instance) (rate(dbproxy_postgres_fallback_errors_total[5m]))", "legendFormat": "{{instance}} errors" },
+        { "expr": "sum by (instance) (rate(dbproxy_postgres_fallback_timeouts_total[5m]))", "legendFormat": "{{instance}} timeouts" },
+        { "expr": "sum by (instance) (rate(dbproxy_postgres_fallback_circuit_open_total[5m]))", "legendFormat": "{{instance}} circuit open" },
+        { "expr": "sum by (instance) (rate(dbproxy_cache_fallback_lock_contention_total[5m]))", "legendFormat": "{{instance}} lock contention" },
+        { "expr": "sum by (instance) (rate(dbproxy_cache_fallback_lock_timeouts_total[5m]))", "legendFormat": "{{instance}} lock timeouts" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Durable Backlog Depth and Age",
+      "id": 13,
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 36 },
+      "targets": [
+        { "expr": "dbproxy_backlog_pending", "legendFormat": "{{instance}} pending" },
+        { "expr": "dbproxy_backlog_processing", "legendFormat": "{{instance}} processing" },
+        { "expr": "dbproxy_backlog_oldest_pending_age_seconds", "legendFormat": "{{instance}} oldest age" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache Repair and Outbox State",
+      "id": 14,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
+      "targets": [
+        { "expr": "dbproxy_cache_repair_pending", "legendFormat": "{{instance}} cache repair pending" },
+        { "expr": "dbproxy_cache_repair_processing", "legendFormat": "{{instance}} cache repair processing" },
+        { "expr": "dbproxy_cache_repair_dead_lettered", "legendFormat": "{{instance}} cache repair dead" },
+        { "expr": "dbproxy_cache_repair_oldest_age_seconds", "legendFormat": "{{instance}} cache repair oldest seconds" },
+        { "expr": "dbproxy_outbox_pending", "legendFormat": "{{instance}} outbox pending" },
+        { "expr": "dbproxy_outbox_processing", "legendFormat": "{{instance}} outbox processing" },
+        { "expr": "dbproxy_outbox_dead_lettered", "legendFormat": "{{instance}} outbox dead" },
+        { "expr": "dbproxy_outbox_oldest_age_seconds", "legendFormat": "{{instance}} outbox oldest seconds" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Durable Queue Worker Outcomes",
+      "id": 15,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
+      "targets": [
+        { "expr": "sum by (instance, result) (rate(dbproxy_cache_repair_worker_polls_total[5m]))", "legendFormat": "{{instance}} repair {{result}}" },
+        { "expr": "sum by (instance, result) (rate(dbproxy_outbox_worker_polls_total[5m]))", "legendFormat": "{{instance}} outbox {{result}}" }
+      ]
     }
   ],
   "refresh": "5s",
@@ -88,5 +157,5 @@
   "timezone": "browser",
   "title": "TiangZ DBProxy Overview",
   "uid": "tiangz-dbproxy-overview",
-  "version": 1
+  "version": 6
 }

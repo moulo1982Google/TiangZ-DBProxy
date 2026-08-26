@@ -1,8 +1,8 @@
 //! DBProxy 网络服务实现。
 //! DBProxy network service implementation.
 //!
-//! 服务端只调度通用快照和记录事务。游戏 Repository、Entity 生命周期与业务校验
-//! 必须留在 TiangZ。The server only dispatches generic snapshots and record transactions;
+//! 服务端只调度通用快照、记录事务和交易持久化原语。游戏 Repository、Entity 生命周期与业务校验
+//! 必须留在 TiangZ。The server only dispatches generic snapshots, record transactions, and trade persistence primitives;
 //! game repositories, entity lifecycle, and business validation stay in TiangZ.
 
 pub mod config;
@@ -25,17 +25,22 @@ use std::{
 use async_trait::async_trait;
 use thiserror::Error;
 use tiangz_dbproxy_core::{
-    AsyncMultiRecordTransactionStore, AsyncSnapshotStore, AsyncTransactionalStore,
+    AsyncMultiRecordTransactionStore, AsyncSnapshotStore, AsyncTradeStore, AsyncTransactionalStore,
     MultiRecordTransactionalWrite, MultiRecordTransactionalWriteOutcome, RecordKey, Revision,
-    SnapshotEnvelope, SnapshotWrite, SnapshotWriteOutcome, StoreError, TransactionReceipt,
+    SnapshotEnvelope, SnapshotWrite, SnapshotWriteOutcome, StoreError, TradeEnvelope, TradeReceipt,
+    TradeTransaction, TradeTransactionOutcome, TransactionReceipt, TransactionalRecordWrite,
     TransactionalWrite, TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_protocol::{
-    DEFAULT_MAX_FRAME_BYTES, MAX_AUTH_TOKEN_BYTES, MAX_CLIENT_NAME_BYTES, PROTOCOL_FINGERPRINT,
-    PROTOCOL_VERSION, ProtocolError, read_message, wire, write_message,
+    DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_PAYLOAD_BYTES, MAX_AUTH_TOKEN_BYTES,
+    MAX_CLIENT_NAME_BYTES, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION, ProtocolError, read_message,
+    wire, write_message,
 };
 use tiangz_dbproxy_storage::{
-    RedisSnapshotBacklog, SnapshotBacklogAck, StorageError, TieredSnapshotStore,
+    CacheRepairStats, DEFAULT_OUTBOX_STREAM_PREFIX, OutboxStats, PostgresCacheRepairQueue,
+    PostgresOutboxQueue, PostgresSnapshotStore, RedisOutboxPublisher, RedisSnapshotBacklog,
+    RedisSnapshotBacklogStats, SnapshotBacklogAck, StorageError, StorageMetrics,
+    TieredSnapshotStore, TieredSnapshotStoreConfig,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -44,7 +49,10 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use observability::{BacklogMetricResult, HandshakeRejection, RpcOperation};
+use observability::{
+    BacklogMetricResult, DurableQueueMetricKind, DurableQueueMetricResult, HandshakeRejection,
+    RpcOperation,
+};
 
 #[derive(Debug, Error)]
 pub enum BackendError {
@@ -123,6 +131,31 @@ pub trait DbProxyBackend: Send + Sync + 'static {
             "multi-record transactions are not supported by this backend",
         ))
     }
+    async fn load_trade(&self, trade_id: &str) -> Result<Option<TradeEnvelope>, BackendError> {
+        let _ = trade_id;
+        Err(BackendError::InvalidConfig(
+            "trade transactions are not supported by this backend",
+        ))
+    }
+    async fn apply_trade_transaction(
+        &self,
+        request: TradeTransaction,
+    ) -> Result<TradeTransactionOutcome, BackendError> {
+        let _ = request;
+        Err(BackendError::InvalidConfig(
+            "trade transactions are not supported by this backend",
+        ))
+    }
+    async fn load_trade_transaction(
+        &self,
+        operation_id: &str,
+        trade_id: &str,
+    ) -> Result<Option<TradeReceipt>, BackendError> {
+        let _ = (operation_id, trade_id);
+        Err(BackendError::InvalidConfig(
+            "trade transactions are not supported by this backend",
+        ))
+    }
 }
 
 /// 真实 PostgreSQL/Redis 后端。每个 shard 使用独立数据库连接，并按 RecordKey 稳定路由，
@@ -131,6 +164,17 @@ pub trait DbProxyBackend: Send + Sync + 'static {
 pub struct StorageBackend {
     shards: Vec<TieredSnapshotStore>,
     backlog: RedisSnapshotBacklog,
+    cache_repairs: PostgresCacheRepairQueue,
+    outbox: PostgresOutboxQueue,
+    outbox_publisher: RedisOutboxPublisher,
+    metrics: Arc<StorageMetrics>,
+}
+
+/// Connection layout and cache policies for the real storage backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorageBackendConfig {
+    pub shard_count: usize,
+    pub tiered: TieredSnapshotStoreConfig,
 }
 
 impl StorageBackend {
@@ -141,17 +185,72 @@ impl StorageBackend {
         redis_url: &str,
         shard_count: usize,
     ) -> Result<Self, BackendError> {
-        if shard_count == 0 {
+        Self::connect_with_config(
+            postgres_url,
+            redis_url,
+            StorageBackendConfig {
+                shard_count,
+                tiered: TieredSnapshotStoreConfig::default(),
+            },
+        )
+        .await
+    }
+
+    /// Create fixed connection shards with explicit cache policies.
+    pub async fn connect_with_config(
+        postgres_url: &str,
+        redis_url: &str,
+        config: StorageBackendConfig,
+    ) -> Result<Self, BackendError> {
+        if config.shard_count == 0 {
             return Err(BackendError::InvalidConfig("storage shard count is zero"));
         }
-        let mut shards = Vec::with_capacity(shard_count);
-        for _ in 0..shard_count {
-            shards.push(TieredSnapshotStore::connect(postgres_url, redis_url).await?);
+        let metrics = Arc::new(StorageMetrics::default());
+        let mut shards = Vec::with_capacity(config.shard_count);
+        for _ in 0..config.shard_count {
+            shards.push(
+                TieredSnapshotStore::connect_with_config(
+                    postgres_url,
+                    redis_url,
+                    config.tiered,
+                    Arc::clone(&metrics),
+                )
+                .await?,
+            );
         }
+        // Queue polling uses one dedicated PostgreSQL connection so background maintenance never
+        // holds the mutex of a request shard. Both queues share it because claims are short.
+        let maintenance = PostgresSnapshotStore::connect(postgres_url).await?;
+        let cache_repairs = maintenance.cache_repair_queue();
+        let outbox = maintenance.outbox_queue();
         Ok(Self {
             shards,
             backlog: RedisSnapshotBacklog::connect(redis_url).await?,
+            cache_repairs,
+            outbox,
+            outbox_publisher: RedisOutboxPublisher::connect(
+                redis_url,
+                DEFAULT_OUTBOX_STREAM_PREFIX,
+            )
+            .await?,
+            metrics,
         })
+    }
+
+    pub fn metrics(&self) -> &StorageMetrics {
+        &self.metrics
+    }
+
+    pub async fn backlog_stats(&self) -> Result<RedisSnapshotBacklogStats, BackendError> {
+        Ok(self.backlog.stats().await?)
+    }
+
+    pub async fn cache_repair_stats(&self) -> Result<CacheRepairStats, BackendError> {
+        Ok(self.cache_repairs.stats().await?)
+    }
+
+    pub async fn outbox_stats(&self) -> Result<OutboxStats, BackendError> {
+        Ok(self.outbox.stats().await?)
     }
 
     fn shard_index(&self, record: &RecordKey) -> usize {
@@ -190,6 +289,80 @@ impl StorageBackend {
                     tracing::error!(%release_error, "failed to release snapshot backlog lease");
                 }
                 Err(error)
+            }
+        }
+    }
+
+    pub async fn process_cache_repair_once(
+        &self,
+        worker_id: &str,
+        policy: RetryWorkerPolicy,
+    ) -> Result<DurableQueueProcessOutcome, BackendError> {
+        let policy = policy.validate()?;
+        let Some(lease) = self.cache_repairs.claim(worker_id, policy.lease_ms).await? else {
+            return Ok(DurableQueueProcessOutcome::Empty);
+        };
+        match self.shard(&lease.record).repair_cache(&lease.record).await {
+            Ok(_) => {
+                if self.cache_repairs.acknowledge(&lease).await? {
+                    Ok(DurableQueueProcessOutcome::Committed)
+                } else {
+                    Ok(DurableQueueProcessOutcome::LeaseLost)
+                }
+            }
+            Err(error) => {
+                let dead_lettered =
+                    lease.attempt_count.saturating_add(1) >= u64::from(policy.max_attempts);
+                let retry_delay = policy.retry_delay_ms(lease.attempt_count);
+                if !self
+                    .cache_repairs
+                    .fail(&lease, &error.to_string(), retry_delay, policy.max_attempts)
+                    .await?
+                {
+                    return Ok(DurableQueueProcessOutcome::LeaseLost);
+                }
+                if dead_lettered {
+                    Ok(DurableQueueProcessOutcome::DeadLettered)
+                } else {
+                    Ok(DurableQueueProcessOutcome::RetryScheduled)
+                }
+            }
+        }
+    }
+
+    pub async fn process_outbox_once(
+        &self,
+        worker_id: &str,
+        policy: RetryWorkerPolicy,
+    ) -> Result<DurableQueueProcessOutcome, BackendError> {
+        let policy = policy.validate()?;
+        let Some(lease) = self.outbox.claim(worker_id, policy.lease_ms).await? else {
+            return Ok(DurableQueueProcessOutcome::Empty);
+        };
+        match self.outbox_publisher.publish(&lease).await {
+            Ok(_) => {
+                if self.outbox.acknowledge(&lease).await? {
+                    Ok(DurableQueueProcessOutcome::Committed)
+                } else {
+                    Ok(DurableQueueProcessOutcome::LeaseLost)
+                }
+            }
+            Err(error) => {
+                let dead_lettered =
+                    lease.attempt_count.saturating_add(1) >= u64::from(policy.max_attempts);
+                let retry_delay = policy.retry_delay_ms(lease.attempt_count);
+                if !self
+                    .outbox
+                    .fail(&lease, &error.to_string(), retry_delay, policy.max_attempts)
+                    .await?
+                {
+                    return Ok(DurableQueueProcessOutcome::LeaseLost);
+                }
+                if dead_lettered {
+                    Ok(DurableQueueProcessOutcome::DeadLettered)
+                } else {
+                    Ok(DurableQueueProcessOutcome::RetryScheduled)
+                }
             }
         }
     }
@@ -344,12 +517,83 @@ impl DbProxyBackend for StorageBackend {
             .load_multi_receipt(operation_id, records)
             .await?)
     }
+
+    async fn load_trade(&self, trade_id: &str) -> Result<Option<TradeEnvelope>, BackendError> {
+        Ok(self
+            .shard_for_operation(trade_id)
+            .load_trade(trade_id)
+            .await?)
+    }
+
+    async fn apply_trade_transaction(
+        &self,
+        request: TradeTransaction,
+    ) -> Result<TradeTransactionOutcome, BackendError> {
+        let mut store = self.shard_for_operation(&request.operation_id);
+        Ok(store.apply_trade(request).await?)
+    }
+
+    async fn load_trade_transaction(
+        &self,
+        operation_id: &str,
+        trade_id: &str,
+    ) -> Result<Option<TradeReceipt>, BackendError> {
+        Ok(self
+            .shard_for_operation(operation_id)
+            .load_trade_receipt(operation_id, trade_id)
+            .await?)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BacklogProcessOutcome {
     Empty,
     Committed(SnapshotBacklogAck),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryWorkerPolicy {
+    pub lease_ms: u64,
+    pub base_retry_delay_ms: u64,
+    pub max_retry_delay_ms: u64,
+    pub max_attempts: u32,
+}
+
+impl RetryWorkerPolicy {
+    fn validate(self) -> Result<Self, BackendError> {
+        if self.lease_ms == 0
+            || self.base_retry_delay_ms == 0
+            || self.max_retry_delay_ms < self.base_retry_delay_ms
+            || self.max_attempts == 0
+        {
+            return Err(BackendError::InvalidConfig(
+                "durable retry worker policy is invalid",
+            ));
+        }
+        Ok(self)
+    }
+
+    fn retry_delay_ms(self, previous_attempts: u64) -> u64 {
+        let exponent = u32::try_from(previous_attempts.min(20)).unwrap_or(20);
+        self.base_retry_delay_ms
+            .saturating_mul(1_u64 << exponent)
+            .min(self.max_retry_delay_ms)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableQueueProcessOutcome {
+    Empty,
+    Committed,
+    RetryScheduled,
+    DeadLettered,
+    LeaseLost,
+}
+
+#[derive(Clone, Copy)]
+enum DurableWorkerKind {
+    CacheRepair,
+    Outbox,
 }
 
 /// 持续消费普通快照积压。停机只停止领取新项；已领取项要么完成 ACK，要么由 lease 回收。
@@ -409,6 +653,167 @@ pub async fn run_backlog_worker_observed(
     }
 }
 
+pub async fn run_cache_repair_worker_observed(
+    backend: Arc<StorageBackend>,
+    worker_id: String,
+    policy: RetryWorkerPolicy,
+    idle_delay: Duration,
+    shutdown: watch::Receiver<bool>,
+    metrics: Option<Arc<DbProxyMetrics>>,
+) {
+    run_durable_queue_worker(
+        backend,
+        DurableWorkerKind::CacheRepair,
+        worker_id,
+        policy,
+        idle_delay,
+        shutdown,
+        metrics,
+    )
+    .await;
+}
+
+pub async fn run_outbox_worker_observed(
+    backend: Arc<StorageBackend>,
+    worker_id: String,
+    policy: RetryWorkerPolicy,
+    idle_delay: Duration,
+    shutdown: watch::Receiver<bool>,
+    metrics: Option<Arc<DbProxyMetrics>>,
+) {
+    run_durable_queue_worker(
+        backend,
+        DurableWorkerKind::Outbox,
+        worker_id,
+        policy,
+        idle_delay,
+        shutdown,
+        metrics,
+    )
+    .await;
+}
+
+async fn run_durable_queue_worker(
+    backend: Arc<StorageBackend>,
+    kind: DurableWorkerKind,
+    worker_id: String,
+    policy: RetryWorkerPolicy,
+    idle_delay: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    metrics: Option<Arc<DbProxyMetrics>>,
+) {
+    let metric_kind = match kind {
+        DurableWorkerKind::CacheRepair => DurableQueueMetricKind::CacheRepair,
+        DurableWorkerKind::Outbox => DurableQueueMetricKind::Outbox,
+    };
+    let queue_name = match kind {
+        DurableWorkerKind::CacheRepair => "cache repair",
+        DurableWorkerKind::Outbox => "outbox",
+    };
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let outcome = match kind {
+            DurableWorkerKind::CacheRepair => {
+                backend.process_cache_repair_once(&worker_id, policy).await
+            }
+            DurableWorkerKind::Outbox => backend.process_outbox_once(&worker_id, policy).await,
+        };
+        let (metric_result, should_idle) = match outcome {
+            Ok(DurableQueueProcessOutcome::Committed) => {
+                (DurableQueueMetricResult::Committed, false)
+            }
+            Ok(DurableQueueProcessOutcome::RetryScheduled) => {
+                (DurableQueueMetricResult::RetryScheduled, false)
+            }
+            Ok(DurableQueueProcessOutcome::DeadLettered) => {
+                tracing::error!(worker = %worker_id, queue = queue_name, "durable queue item moved to dead letter");
+                (DurableQueueMetricResult::DeadLettered, false)
+            }
+            Ok(DurableQueueProcessOutcome::LeaseLost) => {
+                (DurableQueueMetricResult::LeaseLost, false)
+            }
+            Ok(DurableQueueProcessOutcome::Empty) => (DurableQueueMetricResult::Empty, true),
+            Err(error) => {
+                tracing::error!(%error, worker = %worker_id, queue = queue_name, "durable queue worker failed");
+                (DurableQueueMetricResult::Failure, true)
+            }
+        };
+        if let Some(metrics) = &metrics {
+            metrics.durable_queue_finished(metric_kind, metric_result);
+        }
+        if should_idle {
+            let delay = if matches!(metric_result, DurableQueueMetricResult::Failure) {
+                Duration::from_millis(policy.base_retry_delay_ms)
+            } else {
+                idle_delay
+            };
+            tokio::select! {
+                _ = sleep(delay) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Periodically refresh storage counters and durable backlog gauges for the Prometheus endpoint.
+///
+/// Storage counters are maintained in the storage layer so every connection shard contributes to
+/// one aggregate. Backlog depth is sampled instead of attached to each request, which keeps the
+/// request path free of extra Redis round trips.
+pub async fn run_storage_metrics_poller(
+    backend: Arc<StorageBackend>,
+    metrics: Arc<DbProxyMetrics>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        metrics.storage_metrics_updated(backend.metrics().snapshot());
+        match backend.backlog_stats().await {
+            Ok(stats) => metrics.backlog_depth_updated(
+                stats.pending,
+                stats.processing,
+                stats.oldest_pending_age_ms,
+            ),
+            Err(error) => tracing::warn!(%error, "failed to sample snapshot backlog metrics"),
+        }
+        match backend.cache_repair_stats().await {
+            Ok(stats) => metrics.cache_repair_depth_updated(
+                stats.pending,
+                stats.processing,
+                stats.dead_lettered,
+                stats.oldest_age_ms,
+            ),
+            Err(error) => tracing::warn!(%error, "failed to sample cache repair metrics"),
+        }
+        match backend.outbox_stats().await {
+            Ok(stats) => metrics.outbox_depth_updated(
+                stats.pending,
+                stats.processing,
+                stats.dead_lettered,
+                stats.oldest_age_ms,
+            ),
+            Err(error) => tracing::warn!(%error, "failed to sample outbox metrics"),
+        }
+        tokio::select! {
+            _ = sleep(interval) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// TCP 服务配置。认证令牌必须通过部署密钥注入，禁止使用仓库中的本地示例密码。
 /// TCP server settings. Inject the auth token as a deployment secret, never from sample credentials.
 #[derive(Clone)]
@@ -416,6 +821,7 @@ pub struct ServerConfig {
     pub listen_addr: SocketAddr,
     pub auth_token: String,
     pub max_frame_bytes: usize,
+    pub max_payload_bytes: usize,
     pub handshake_timeout: Duration,
     pub shutdown_grace: Duration,
     pub metrics: Arc<DbProxyMetrics>,
@@ -428,6 +834,7 @@ impl fmt::Debug for ServerConfig {
             .field("listen_addr", &self.listen_addr)
             .field("auth_token", &"[REDACTED]")
             .field("max_frame_bytes", &self.max_frame_bytes)
+            .field("max_payload_bytes", &self.max_payload_bytes)
             .field("handshake_timeout", &self.handshake_timeout)
             .field("shutdown_grace", &self.shutdown_grace)
             .field("metrics", &"[PROMETHEUS]")
@@ -441,6 +848,7 @@ impl ServerConfig {
             listen_addr,
             auth_token: auth_token.into(),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             handshake_timeout: Duration::from_secs(5),
             shutdown_grace: Duration::from_secs(5),
             metrics: Arc::new(DbProxyMetrics::default()),
@@ -455,6 +863,14 @@ impl ServerConfig {
         }
         if self.max_frame_bytes == 0 {
             return Err(ServerError::InvalidConfig("max frame bytes is zero"));
+        }
+        if self.max_payload_bytes == 0 {
+            return Err(ServerError::InvalidConfig("max payload bytes is zero"));
+        }
+        if self.max_payload_bytes > self.max_frame_bytes {
+            return Err(ServerError::InvalidConfig(
+                "max payload bytes exceeds max frame bytes",
+            ));
         }
         Ok(())
     }
@@ -663,7 +1079,13 @@ async fn handle_connection(
         let Some(wire::client_frame::Body::Request(request)) = frame.body else {
             return Err(ConnectionError::MissingHandshake);
         };
-        let response = dispatch(request, backend.as_ref(), &config.metrics).await;
+        let response = dispatch(
+            request,
+            backend.as_ref(),
+            &config.metrics,
+            config.max_payload_bytes,
+        )
+        .await;
         write_message(&mut stream, &response, config.max_frame_bytes).await?;
     }
 }
@@ -693,15 +1115,23 @@ async fn dispatch(
     request: wire::RequestEnvelope,
     backend: &dyn DbProxyBackend,
     metrics: &DbProxyMetrics,
+    max_payload_bytes: usize,
 ) -> wire::ServerFrame {
     let rpc_id = request.rpc_id;
     let operation = RpcOperation::from_body(request.body.as_ref());
     let record_count = RpcOperation::record_count(request.body.as_ref());
+    let payload_bytes = RpcOperation::payload_bytes(request.body.as_ref());
     let started_at = Instant::now();
     metrics.request_started();
-    let result = dispatch_body(request.body, backend).await;
+    let result = dispatch_body(request.body, backend, max_payload_bytes).await;
     let error_code = result.as_ref().err().map(|failure| failure.code);
-    metrics.request_finished(operation, record_count, started_at.elapsed(), error_code);
+    metrics.request_finished(
+        operation,
+        record_count,
+        payload_bytes,
+        started_at.elapsed(),
+        error_code,
+    );
     tracing::debug!(
         rpc_id,
         operation = operation.name(),
@@ -734,6 +1164,7 @@ async fn dispatch(
 async fn dispatch_body(
     body: Option<wire::request_envelope::Body>,
     backend: &dyn DbProxyBackend,
+    max_payload_bytes: usize,
 ) -> Result<wire::response_envelope::Body, RpcFailure> {
     match body.ok_or_else(|| RpcFailure::invalid("request body is missing"))? {
         wire::request_envelope::Body::LoadSnapshot(request) => {
@@ -793,6 +1224,11 @@ async fn dispatch_body(
             ))
         }
         wire::request_envelope::Body::SaveSnapshot(request) => {
+            validate_payload_size(
+                "save_snapshot.payload",
+                request.payload.len(),
+                max_payload_bytes,
+            )?;
             let request = request.try_into().map_err(RpcFailure::from_protocol)?;
             let outcome = backend
                 .save(request)
@@ -822,6 +1258,7 @@ async fn dispatch_body(
                 .collect::<Result<Vec<SnapshotWrite>, _>>()
                 .map_err(RpcFailure::from_protocol)?;
             validate_snapshot_write_batch(&writes)?;
+            validate_snapshot_payloads(&writes, max_payload_bytes)?;
             let expected_count = writes.len();
             let outcomes = backend
                 .save_multi(writes)
@@ -856,11 +1293,16 @@ async fn dispatch_body(
             ))
         }
         wire::request_envelope::Body::EnqueueSnapshot(request) => {
-            let request = request
+            let request: SnapshotWrite = request
                 .write
                 .ok_or_else(|| RpcFailure::invalid("enqueue_snapshot.write is missing"))?
                 .try_into()
                 .map_err(RpcFailure::from_protocol)?;
+            validate_payload_size(
+                "enqueue_snapshot.payload",
+                request.payload.len(),
+                max_payload_bytes,
+            )?;
             backend
                 .enqueue_snapshot(request)
                 .await
@@ -887,6 +1329,7 @@ async fn dispatch_body(
                 .collect::<Result<Vec<SnapshotWrite>, _>>()
                 .map_err(RpcFailure::from_protocol)?;
             validate_snapshot_write_batch(&writes)?;
+            validate_snapshot_payloads(&writes, max_payload_bytes)?;
             let expected_count = writes.len();
             let outcomes = backend
                 .enqueue_multi_snapshot(writes)
@@ -915,6 +1358,16 @@ async fn dispatch_body(
             ))
         }
         wire::request_envelope::Body::ApplyTransaction(request) => {
+            validate_payload_size(
+                "apply_transaction.payload",
+                request.payload.len(),
+                max_payload_bytes,
+            )?;
+            validate_payload_size(
+                "apply_transaction.result",
+                request.result.len(),
+                max_payload_bytes,
+            )?;
             let request = request.try_into().map_err(RpcFailure::from_protocol)?;
             let outcome = backend
                 .apply_transaction(request)
@@ -930,6 +1383,11 @@ async fn dispatch_body(
             ))
         }
         wire::request_envelope::Body::LoadTransaction(request) => {
+            validate_text_field(
+                "load_transaction.operation_id",
+                &request.operation_id,
+                tiangz_dbproxy_protocol::MAX_IDEMPOTENCY_KEY_BYTES,
+            )?;
             let record = request
                 .record
                 .ok_or_else(|| RpcFailure::invalid("load_transaction.record is missing"))?
@@ -946,11 +1404,11 @@ async fn dispatch_body(
             ))
         }
         wire::request_envelope::Body::ApplyMultiTransaction(request) => {
-            if request.operation_id.trim().is_empty() {
-                return Err(RpcFailure::invalid(
-                    "apply_multi_transaction.operation_id is empty",
-                ));
-            }
+            validate_text_field(
+                "apply_multi_transaction.operation_id",
+                &request.operation_id,
+                tiangz_dbproxy_protocol::MAX_IDEMPOTENCY_KEY_BYTES,
+            )?;
             if request.writes.is_empty() {
                 return Err(RpcFailure::invalid(
                     "apply_multi_transaction.writes is empty",
@@ -967,6 +1425,12 @@ async fn dispatch_body(
                 .map(TryInto::try_into)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(RpcFailure::from_protocol)?;
+            validate_transaction_payloads(&writes, max_payload_bytes)?;
+            validate_payload_size(
+                "apply_multi_transaction.result",
+                request.result.len(),
+                max_payload_bytes,
+            )?;
             let outcome = backend
                 .apply_multi_transaction(MultiRecordTransactionalWrite {
                     operation_id: request.operation_id,
@@ -980,11 +1444,11 @@ async fn dispatch_body(
             ))
         }
         wire::request_envelope::Body::LoadMultiTransaction(request) => {
-            if request.operation_id.trim().is_empty() {
-                return Err(RpcFailure::invalid(
-                    "load_multi_transaction.operation_id is empty",
-                ));
-            }
+            validate_text_field(
+                "load_multi_transaction.operation_id",
+                &request.operation_id,
+                tiangz_dbproxy_protocol::MAX_IDEMPOTENCY_KEY_BYTES,
+            )?;
             if request.records.is_empty() {
                 return Err(RpcFailure::invalid(
                     "load_multi_transaction.records is empty",
@@ -1011,6 +1475,100 @@ async fn dispatch_body(
                 },
             ))
         }
+        wire::request_envelope::Body::ApplyTradeTransaction(request) => {
+            if let Some(transition) = &request.transition {
+                validate_payload_size(
+                    "apply_trade_transaction.transition.payload",
+                    transition.payload.len(),
+                    max_payload_bytes,
+                )?;
+            }
+            for write in &request.writes {
+                validate_payload_size(
+                    "apply_trade_transaction.write.payload",
+                    write.payload.len(),
+                    max_payload_bytes,
+                )?;
+            }
+            for posting in &request.ledger_postings {
+                validate_payload_size(
+                    "apply_trade_transaction.ledger_posting.metadata",
+                    posting.metadata.len(),
+                    max_payload_bytes,
+                )?;
+            }
+            for event in &request.outbox_events {
+                validate_payload_size(
+                    "apply_trade_transaction.outbox_event.payload",
+                    event.payload.len(),
+                    max_payload_bytes,
+                )?;
+            }
+            validate_payload_size(
+                "apply_trade_transaction.result",
+                request.result.len(),
+                max_payload_bytes,
+            )?;
+            let request: TradeTransaction =
+                request.try_into().map_err(RpcFailure::from_protocol)?;
+            let outcome = backend
+                .apply_trade_transaction(request)
+                .await
+                .map_err(RpcFailure::from_backend)?;
+            Ok(wire::response_envelope::Body::ApplyTradeTransaction(
+                trade_transaction_outcome(outcome),
+            ))
+        }
+        wire::request_envelope::Body::LoadTrade(request) => {
+            validate_text_field(
+                "load_trade.trade_id",
+                &request.trade_id,
+                tiangz_dbproxy_protocol::MAX_TRADE_ID_BYTES,
+            )?;
+            let trade = backend
+                .load_trade(&request.trade_id)
+                .await
+                .map_err(RpcFailure::from_backend)?;
+            Ok(wire::response_envelope::Body::LoadTrade(
+                wire::LoadTradeResponse {
+                    trade: trade.as_ref().map(Into::into),
+                },
+            ))
+        }
+        wire::request_envelope::Body::LoadTradeTransaction(request) => {
+            validate_text_field(
+                "load_trade_transaction.operation_id",
+                &request.operation_id,
+                tiangz_dbproxy_protocol::MAX_IDEMPOTENCY_KEY_BYTES,
+            )?;
+            validate_text_field(
+                "load_trade_transaction.trade_id",
+                &request.trade_id,
+                tiangz_dbproxy_protocol::MAX_TRADE_ID_BYTES,
+            )?;
+            let receipt = backend
+                .load_trade_transaction(&request.operation_id, &request.trade_id)
+                .await
+                .map_err(RpcFailure::from_backend)?;
+            Ok(wire::response_envelope::Body::LoadTradeTransaction(
+                wire::LoadTradeTransactionResponse {
+                    receipt: receipt.as_ref().map(Into::into),
+                },
+            ))
+        }
+    }
+}
+
+fn trade_transaction_outcome(
+    outcome: TradeTransactionOutcome,
+) -> wire::ApplyTradeTransactionResponse {
+    let (disposition, receipt) = match outcome {
+        TradeTransactionOutcome::Applied(receipt) => (wire::WriteDisposition::Applied, receipt),
+        TradeTransactionOutcome::Duplicate(receipt) => (wire::WriteDisposition::Duplicate, receipt),
+    };
+    wire::ApplyTradeTransactionResponse {
+        disposition: disposition.into(),
+        receipt: Some((&receipt).into()),
     }
 }
 
@@ -1098,6 +1656,48 @@ fn validate_snapshot_write_batch(writes: &[SnapshotWrite]) -> Result<(), RpcFail
         return Err(RpcFailure::invalid(
             "snapshot batch contains duplicate request ids",
         ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_payloads(
+    writes: &[SnapshotWrite],
+    max_payload_bytes: usize,
+) -> Result<(), RpcFailure> {
+    for write in writes {
+        validate_payload_size("snapshot payload", write.payload.len(), max_payload_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_transaction_payloads(
+    writes: &[TransactionalRecordWrite],
+    max_payload_bytes: usize,
+) -> Result<(), RpcFailure> {
+    for write in writes {
+        validate_payload_size(
+            "transaction payload",
+            write.payload.len(),
+            max_payload_bytes,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_payload_size(field: &str, length: usize, maximum: usize) -> Result<(), RpcFailure> {
+    if length > maximum {
+        return Err(RpcFailure::invalid(format!(
+            "{field} exceeds maxPayloadBytes ({length} > {maximum})"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_text_field(field: &str, value: &str, maximum: usize) -> Result<(), RpcFailure> {
+    if value.trim().is_empty() || value.len() > maximum {
+        return Err(RpcFailure::invalid(format!(
+            "{field} is empty or exceeds {maximum} bytes"
+        )));
     }
     Ok(())
 }
@@ -1195,7 +1795,15 @@ impl RpcFailure {
             | StoreError::EmptyRequestId
             | StoreError::EmptyOperationId
             | StoreError::EmptyTransactionRecords
+            | StoreError::EmptyTradeId
+            | StoreError::EmptyTradeRecords
             | StoreError::DuplicateTransactionRecord { .. }
+            | StoreError::InvalidTradeStateTransition { .. }
+            | StoreError::InvalidLedgerPosting(_)
+            | StoreError::DuplicateLedgerPosting { .. }
+            | StoreError::UnbalancedLedger { .. }
+            | StoreError::InvalidOutboxEvent(_)
+            | StoreError::DuplicateOutboxEvent { .. }
             | StoreError::QueuedSnapshotRequiresUnconditionalWrite { .. } => {
                 Self::invalid(error.to_string())
             }
@@ -1214,7 +1822,27 @@ impl RpcFailure {
                 public_message: error.to_string(),
                 actual_revision: Some(actual.0),
             },
-            StoreError::RevisionExhausted { .. } => {
+            StoreError::TradeVersionConflict { actual, .. } => Self {
+                code: wire::ErrorCode::TradeConflict,
+                public_message: error.to_string(),
+                actual_revision: Some(actual.0),
+            },
+            StoreError::TradeStateConflict { .. } => Self {
+                code: wire::ErrorCode::TradeConflict,
+                public_message: error.to_string(),
+                actual_revision: None,
+            },
+            StoreError::LedgerPostingConflict { .. } => Self {
+                code: wire::ErrorCode::LedgerConflict,
+                public_message: error.to_string(),
+                actual_revision: None,
+            },
+            StoreError::OutboxEventConflict { .. } => Self {
+                code: wire::ErrorCode::OutboxConflict,
+                public_message: error.to_string(),
+                actual_revision: None,
+            },
+            StoreError::RevisionExhausted { .. } | StoreError::TradeVersionExhausted { .. } => {
                 tracing::error!(%error, "DBProxy revision exhausted");
                 Self {
                     code: wire::ErrorCode::Internal,
@@ -1290,6 +1918,13 @@ mod tests {
     }
 
     #[test]
+    fn text_fields_are_bounded_before_backend_dispatch() {
+        assert!(validate_text_field("operation_id", "valid", 5).is_ok());
+        assert!(validate_text_field("operation_id", "", 5).is_err());
+        assert!(validate_text_field("operation_id", "123456", 5).is_err());
+    }
+
+    #[test]
     fn stable_hasher_is_repeatable() {
         let record = RecordKey::new("player", "1001").unwrap();
         let mut first = StableHasher::default();
@@ -1320,5 +1955,68 @@ mod tests {
             config.validate(),
             Err(ServerError::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn server_rejects_invalid_payload_limits() {
+        let mut config = ServerConfig::new("127.0.0.1:7800".parse().unwrap(), "0123456789abcdef");
+        config.max_payload_bytes = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(ServerError::InvalidConfig("max payload bytes is zero"))
+        ));
+
+        config.max_payload_bytes = config.max_frame_bytes + 1;
+        assert!(matches!(
+            config.validate(),
+            Err(ServerError::InvalidConfig(
+                "max payload bytes exceeds max frame bytes"
+            ))
+        ));
+    }
+
+    #[test]
+    fn durable_queue_retry_policy_is_bounded() {
+        let policy = RetryWorkerPolicy {
+            lease_ms: 30_000,
+            base_retry_delay_ms: 1_000,
+            max_retry_delay_ms: 60_000,
+            max_attempts: 20,
+        };
+        assert!(policy.validate().is_ok());
+        assert_eq!(policy.retry_delay_ms(0), 1_000);
+        assert_eq!(policy.retry_delay_ms(1), 2_000);
+        assert_eq!(policy.retry_delay_ms(6), 60_000);
+        assert_eq!(policy.retry_delay_ms(u64::MAX), 60_000);
+
+        let invalid = RetryWorkerPolicy {
+            max_retry_delay_ms: 999,
+            ..policy
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_oversized_snapshot_payload() {
+        let backend = MemoryBackend::new(1).unwrap();
+        let result = dispatch_body(
+            Some(wire::request_envelope::Body::SaveSnapshot(
+                wire::SaveSnapshotRequest {
+                    request_id: "request-1".to_string(),
+                    record: None,
+                    schema: "player".to_string(),
+                    schema_version: 1,
+                    payload: vec![0; 4],
+                    expected_revision: None,
+                    updated_at_unix_ms: 1,
+                },
+            )),
+            &backend,
+            3,
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert_eq!(error.code, wire::ErrorCode::InvalidRequest);
+        assert!(error.public_message.contains("maxPayloadBytes"));
     }
 }

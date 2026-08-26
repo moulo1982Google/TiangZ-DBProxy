@@ -5,13 +5,16 @@
 //! The protocol only carries generic persistence data and must not reference TiangZ scenes,
 //! entities, or gameplay types.
 
-use std::io;
+use std::{collections::HashSet, io};
 
 use prost::Message;
 use thiserror::Error;
 use tiangz_dbproxy_core::{
-    RecordKey as CoreRecordKey, Revision, SnapshotEnvelope as CoreSnapshotEnvelope, SnapshotWrite,
-    StoreError, TransactionalRecordWrite, TransactionalWrite,
+    LedgerPosting as CoreLedgerPosting, OutboxEvent as CoreOutboxEvent, RecordKey as CoreRecordKey,
+    Revision, SnapshotEnvelope as CoreSnapshotEnvelope, SnapshotWrite, StoreError,
+    TradeEnvelope as CoreTradeEnvelope, TradeReceipt as CoreTradeReceipt,
+    TradeState as CoreTradeState, TradeTransaction, TradeTransition as CoreTradeTransition,
+    TransactionRecordReceipt, TransactionalRecordWrite, TransactionalWrite,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -23,11 +26,14 @@ include!(concat!(env!("OUT_DIR"), "/protocol_fingerprint.rs"));
 
 /// 第一版公开网络协议。修改不兼容字段时必须提升版本，而不能只改实现。
 /// First public wire version. Incompatible schema changes must increment this value.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 默认单帧上限；业务快照超过该值应拆分领域记录，而不是无限放大网络缓冲。
 /// Default frame limit; larger snapshots should be split by domain instead of growing buffers.
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Default application-level limit for one binary payload or transaction result.
+/// This is deliberately lower than the frame limit so storage/WAL/cache amplification is bounded.
+pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_AUTH_TOKEN_BYTES: usize = 512;
 pub const MAX_CLIENT_NAME_BYTES: usize = 128;
 pub const MAX_NAMESPACE_BYTES: usize = 128;
@@ -39,6 +45,12 @@ pub const MAX_TRANSACTION_RECORDS: usize = 256;
 pub const MAX_BATCH_LOAD_RECORDS: usize = 64;
 /// Ordinary snapshot batches are bounded independently from atomic multi-record transactions.
 pub const MAX_BATCH_SNAPSHOT_WRITES: usize = 64;
+pub const MAX_TRADE_ID_BYTES: usize = 256;
+pub const MAX_LEDGER_POSTINGS: usize = 512;
+pub const MAX_LEDGER_FIELD_BYTES: usize = 256;
+pub const MAX_OUTBOX_EVENTS: usize = 64;
+pub const MAX_OUTBOX_TOPIC_BYTES: usize = 128;
+pub const MAX_OUTBOX_PARTITION_KEY_BYTES: usize = 512;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -273,6 +285,362 @@ impl TryFrom<wire::TransactionalRecordWrite> for TransactionalRecordWrite {
     }
 }
 
+impl From<CoreTradeState> for wire::TradeState {
+    fn from(value: CoreTradeState) -> Self {
+        match value {
+            CoreTradeState::Proposed => Self::Proposed,
+            CoreTradeState::Escrowed => Self::Escrowed,
+            CoreTradeState::Settled => Self::Settled,
+            CoreTradeState::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+fn core_trade_state(value: i32) -> Result<CoreTradeState, ProtocolError> {
+    match wire::TradeState::try_from(value).ok() {
+        Some(wire::TradeState::Proposed) => Ok(CoreTradeState::Proposed),
+        Some(wire::TradeState::Escrowed) => Ok(CoreTradeState::Escrowed),
+        Some(wire::TradeState::Settled) => Ok(CoreTradeState::Settled),
+        Some(wire::TradeState::Cancelled) => Ok(CoreTradeState::Cancelled),
+        Some(wire::TradeState::Unspecified) | None => {
+            Err(ProtocolError::InvalidField("trade.state"))
+        }
+    }
+}
+
+impl From<&CoreTradeEnvelope> for wire::TradeEnvelope {
+    fn from(value: &CoreTradeEnvelope) -> Self {
+        Self {
+            trade_id: value.trade_id.clone(),
+            version: value.version.0,
+            state: wire::TradeState::from(value.state) as i32,
+            payload: value.payload.clone(),
+            updated_at_unix_ms: value.updated_at_unix_ms,
+        }
+    }
+}
+
+impl TryFrom<wire::TradeEnvelope> for CoreTradeEnvelope {
+    type Error = ProtocolError;
+
+    fn try_from(value: wire::TradeEnvelope) -> Result<Self, Self::Error> {
+        validate_text(&value.trade_id, "trade.trade_id", MAX_TRADE_ID_BYTES)?;
+        Ok(Self {
+            trade_id: value.trade_id,
+            version: Revision(value.version),
+            state: core_trade_state(value.state)?,
+            payload: value.payload,
+            updated_at_unix_ms: value.updated_at_unix_ms,
+        })
+    }
+}
+
+impl From<&CoreTradeTransition> for wire::TradeTransition {
+    fn from(value: &CoreTradeTransition) -> Self {
+        Self {
+            trade_id: value.trade_id.clone(),
+            expected_version: value.expected_version.0,
+            expected_state: value
+                .expected_state
+                .map(|state| wire::TradeState::from(state) as i32),
+            next_state: wire::TradeState::from(value.next_state) as i32,
+            payload: value.payload.clone(),
+            updated_at_unix_ms: value.updated_at_unix_ms,
+        }
+    }
+}
+
+impl TryFrom<wire::TradeTransition> for CoreTradeTransition {
+    type Error = ProtocolError;
+
+    fn try_from(value: wire::TradeTransition) -> Result<Self, Self::Error> {
+        validate_text(
+            &value.trade_id,
+            "trade_transition.trade_id",
+            MAX_TRADE_ID_BYTES,
+        )?;
+        Ok(Self {
+            trade_id: value.trade_id,
+            expected_version: Revision(value.expected_version),
+            expected_state: value.expected_state.map(core_trade_state).transpose()?,
+            next_state: core_trade_state(value.next_state)?,
+            payload: value.payload,
+            updated_at_unix_ms: value.updated_at_unix_ms,
+        })
+    }
+}
+
+impl From<&CoreLedgerPosting> for wire::LedgerPosting {
+    fn from(value: &CoreLedgerPosting) -> Self {
+        Self {
+            posting_id: value.posting_id.clone(),
+            account_id: value.account_id.clone(),
+            asset: value.asset.clone(),
+            amount: value.amount,
+            metadata: value.metadata.clone(),
+        }
+    }
+}
+
+impl TryFrom<wire::LedgerPosting> for CoreLedgerPosting {
+    type Error = ProtocolError;
+
+    fn try_from(value: wire::LedgerPosting) -> Result<Self, Self::Error> {
+        validate_text(
+            &value.posting_id,
+            "ledger_posting.posting_id",
+            MAX_LEDGER_FIELD_BYTES,
+        )?;
+        validate_text(
+            &value.account_id,
+            "ledger_posting.account_id",
+            MAX_LEDGER_FIELD_BYTES,
+        )?;
+        validate_text(&value.asset, "ledger_posting.asset", MAX_LEDGER_FIELD_BYTES)?;
+        Ok(Self {
+            posting_id: value.posting_id,
+            account_id: value.account_id,
+            asset: value.asset,
+            amount: value.amount,
+            metadata: value.metadata,
+        })
+    }
+}
+
+impl From<&CoreOutboxEvent> for wire::OutboxEvent {
+    fn from(value: &CoreOutboxEvent) -> Self {
+        Self {
+            event_id: value.event_id.clone(),
+            topic: value.topic.clone(),
+            partition_key: value.partition_key.clone(),
+            payload: value.payload.clone(),
+            occurred_at_unix_ms: value.occurred_at_unix_ms,
+        }
+    }
+}
+
+impl TryFrom<wire::OutboxEvent> for CoreOutboxEvent {
+    type Error = ProtocolError;
+
+    fn try_from(value: wire::OutboxEvent) -> Result<Self, Self::Error> {
+        validate_text(
+            &value.event_id,
+            "outbox_event.event_id",
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_text(&value.topic, "outbox_event.topic", MAX_OUTBOX_TOPIC_BYTES)?;
+        validate_text(
+            &value.partition_key,
+            "outbox_event.partition_key",
+            MAX_OUTBOX_PARTITION_KEY_BYTES,
+        )?;
+        if !value
+            .topic
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(ProtocolError::InvalidField("outbox_event.topic"));
+        }
+        Ok(Self {
+            event_id: value.event_id,
+            topic: value.topic,
+            partition_key: value.partition_key,
+            payload: value.payload,
+            occurred_at_unix_ms: value.occurred_at_unix_ms,
+        })
+    }
+}
+
+impl From<&TradeTransaction> for wire::ApplyTradeTransactionRequest {
+    fn from(value: &TradeTransaction) -> Self {
+        Self {
+            operation_id: value.operation_id.clone(),
+            transition: Some((&value.transition).into()),
+            writes: value.writes.iter().map(Into::into).collect(),
+            ledger_postings: value.ledger_postings.iter().map(Into::into).collect(),
+            outbox_events: value.outbox_events.iter().map(Into::into).collect(),
+            result: value.result.clone(),
+        }
+    }
+}
+
+impl TryFrom<wire::ApplyTradeTransactionRequest> for TradeTransaction {
+    type Error = ProtocolError;
+
+    fn try_from(value: wire::ApplyTradeTransactionRequest) -> Result<Self, Self::Error> {
+        validate_text(
+            &value.operation_id,
+            "apply_trade_transaction.operation_id",
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        if value.writes.len() > MAX_TRANSACTION_RECORDS {
+            return Err(ProtocolError::InvalidField(
+                "apply_trade_transaction.writes",
+            ));
+        }
+        if value.ledger_postings.len() > MAX_LEDGER_POSTINGS {
+            return Err(ProtocolError::InvalidField(
+                "apply_trade_transaction.ledger_postings",
+            ));
+        }
+        if value.outbox_events.len() > MAX_OUTBOX_EVENTS {
+            return Err(ProtocolError::InvalidField(
+                "apply_trade_transaction.outbox_events",
+            ));
+        }
+        Ok(Self {
+            operation_id: value.operation_id,
+            transition: value
+                .transition
+                .ok_or(ProtocolError::MissingField(
+                    "apply_trade_transaction.transition",
+                ))?
+                .try_into()?,
+            writes: value
+                .writes
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            ledger_postings: value
+                .ledger_postings
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            outbox_events: value
+                .outbox_events
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            result: value.result,
+        })
+    }
+}
+
+impl From<&CoreTradeReceipt> for wire::TradeReceipt {
+    fn from(value: &CoreTradeReceipt) -> Self {
+        Self {
+            operation_id: value.operation_id.clone(),
+            trade_id: value.trade_id.clone(),
+            new_trade_version: value.new_trade_version.0,
+            state: wire::TradeState::from(value.state) as i32,
+            records: value
+                .records
+                .iter()
+                .map(|record| wire::MultiTransactionRecordReceipt {
+                    record: Some((&record.record).into()),
+                    new_revision: record.new_revision.0,
+                })
+                .collect(),
+            ledger_posting_ids: value.ledger_posting_ids.clone(),
+            outbox_event_ids: value.outbox_event_ids.clone(),
+            result: value.result.clone(),
+        }
+    }
+}
+
+impl TryFrom<wire::TradeReceipt> for CoreTradeReceipt {
+    type Error = ProtocolError;
+
+    fn try_from(value: wire::TradeReceipt) -> Result<Self, Self::Error> {
+        validate_text(
+            &value.operation_id,
+            "trade_receipt.operation_id",
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_text(
+            &value.trade_id,
+            "trade_receipt.trade_id",
+            MAX_TRADE_ID_BYTES,
+        )?;
+        if value.new_trade_version == 0 {
+            return Err(ProtocolError::InvalidField(
+                "trade_receipt.new_trade_version",
+            ));
+        }
+        if value.records.is_empty() || value.records.len() > MAX_TRANSACTION_RECORDS {
+            return Err(ProtocolError::InvalidField("trade_receipt.records"));
+        }
+        if value.ledger_posting_ids.len() > MAX_LEDGER_POSTINGS {
+            return Err(ProtocolError::InvalidField(
+                "trade_receipt.ledger_posting_ids",
+            ));
+        }
+        if value.outbox_event_ids.len() > MAX_OUTBOX_EVENTS {
+            return Err(ProtocolError::InvalidField(
+                "trade_receipt.outbox_event_ids",
+            ));
+        }
+        for id in &value.ledger_posting_ids {
+            validate_text(
+                id,
+                "trade_receipt.ledger_posting_id",
+                MAX_LEDGER_FIELD_BYTES,
+            )?;
+        }
+        for id in &value.outbox_event_ids {
+            validate_text(
+                id,
+                "trade_receipt.outbox_event_id",
+                MAX_IDEMPOTENCY_KEY_BYTES,
+            )?;
+        }
+        if value
+            .ledger_posting_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>()
+            .len()
+            != value.ledger_posting_ids.len()
+            || value
+                .outbox_event_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+                .len()
+                != value.outbox_event_ids.len()
+        {
+            return Err(ProtocolError::InvalidField("trade_receipt.identifiers"));
+        }
+        let records = value
+            .records
+            .into_iter()
+            .map(|record| {
+                if record.new_revision == 0 {
+                    return Err(ProtocolError::InvalidField(
+                        "trade_receipt.record.new_revision",
+                    ));
+                }
+                Ok(TransactionRecordReceipt {
+                    record: record
+                        .record
+                        .ok_or(ProtocolError::MissingField("trade_receipt.record"))?
+                        .try_into()?,
+                    new_revision: Revision(record.new_revision),
+                })
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?;
+        if records
+            .iter()
+            .map(|record| &record.record)
+            .collect::<HashSet<_>>()
+            .len()
+            != records.len()
+        {
+            return Err(ProtocolError::InvalidField("trade_receipt.records"));
+        }
+        Ok(Self {
+            operation_id: value.operation_id,
+            trade_id: value.trade_id,
+            new_trade_version: Revision(value.new_trade_version),
+            state: core_trade_state(value.state)?,
+            records,
+            ledger_posting_ids: value.ledger_posting_ids,
+            outbox_event_ids: value.outbox_event_ids,
+            result: value.result,
+        })
+    }
+}
+
 fn validate_text(value: &str, field: &'static str, maximum: usize) -> Result<(), ProtocolError> {
     if value.trim().is_empty() || value.len() > maximum {
         return Err(ProtocolError::InvalidField(field));
@@ -330,5 +698,29 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(error, ProtocolError::InvalidField("record.key")));
+    }
+
+    #[test]
+    fn trade_receipt_rejects_duplicate_untrusted_identifiers() {
+        let receipt = wire::TradeReceipt {
+            operation_id: "operation-1".to_string(),
+            trade_id: "trade-1".to_string(),
+            new_trade_version: 1,
+            state: wire::TradeState::Escrowed as i32,
+            records: vec![wire::MultiTransactionRecordReceipt {
+                record: Some(wire::RecordKey {
+                    namespace: "wallet".to_string(),
+                    key: "buyer".to_string(),
+                }),
+                new_revision: 1,
+            }],
+            ledger_posting_ids: vec!["posting-1".to_string(), "posting-1".to_string()],
+            outbox_event_ids: Vec::new(),
+            result: Vec::new(),
+        };
+        assert!(matches!(
+            CoreTradeReceipt::try_from(receipt),
+            Err(ProtocolError::InvalidField("trade_receipt.identifiers"))
+        ));
     }
 }

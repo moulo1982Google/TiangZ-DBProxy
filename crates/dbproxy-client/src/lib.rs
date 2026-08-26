@@ -16,11 +16,11 @@ use std::{
 use async_trait::async_trait;
 use thiserror::Error;
 use tiangz_dbproxy_core::{
-    AsyncMultiRecordTransactionStore, AsyncSnapshotStore, AsyncTransactionalStore,
+    AsyncMultiRecordTransactionStore, AsyncSnapshotStore, AsyncTradeStore, AsyncTransactionalStore,
     MultiRecordTransactionReceipt, MultiRecordTransactionalWrite,
     MultiRecordTransactionalWriteOutcome, RecordKey, Revision, SnapshotEnvelope, SnapshotWrite,
-    SnapshotWriteOutcome, TransactionReceipt, TransactionRecordReceipt, TransactionalWrite,
-    TransactionalWriteOutcome,
+    SnapshotWriteOutcome, TradeEnvelope, TradeReceipt, TradeTransaction, TradeTransactionOutcome,
+    TransactionReceipt, TransactionRecordReceipt, TransactionalWrite, TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_protocol::{
     DEFAULT_MAX_FRAME_BYTES, MAX_AUTH_TOKEN_BYTES, MAX_BATCH_LOAD_RECORDS,
@@ -309,6 +309,31 @@ impl DbProxyClientPool {
     ) -> Result<Option<MultiRecordTransactionReceipt>, ClientError> {
         self.client_for_operation(operation_id)
             .load_multi_transaction(operation_id, records)
+            .await
+    }
+
+    pub async fn load_trade(&self, trade_id: &str) -> Result<Option<TradeEnvelope>, ClientError> {
+        self.client_for_operation(trade_id)
+            .load_trade(trade_id)
+            .await
+    }
+
+    pub async fn apply_trade_transaction(
+        &self,
+        request: TradeTransaction,
+    ) -> Result<TradeTransactionOutcome, ClientError> {
+        self.client_for_operation(&request.operation_id)
+            .apply_trade_transaction(request)
+            .await
+    }
+
+    pub async fn load_trade_transaction(
+        &self,
+        operation_id: &str,
+        trade_id: &str,
+    ) -> Result<Option<TradeReceipt>, ClientError> {
+        self.client_for_operation(operation_id)
+            .load_trade_transaction(operation_id, trade_id)
             .await
     }
 
@@ -921,6 +946,177 @@ impl DbProxyClient {
             result: receipt.result,
         }))
     }
+
+    pub async fn load_trade(&self, trade_id: &str) -> Result<Option<TradeEnvelope>, ClientError> {
+        let response = self
+            .call(wire::request_envelope::Body::LoadTrade(
+                wire::LoadTradeRequest {
+                    trade_id: trade_id.to_string(),
+                },
+            ))
+            .await?;
+        let Some(wire::response_envelope::Body::LoadTrade(result)) = response.body else {
+            return Err(ClientError::UnexpectedResponse(
+                "trade lookup returned another response type",
+            ));
+        };
+        result
+            .trade
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub async fn apply_trade_transaction(
+        &self,
+        request: TradeTransaction,
+    ) -> Result<TradeTransactionOutcome, ClientError> {
+        let operation_id = request.operation_id.clone();
+        let trade_id = request.transition.trade_id.clone();
+        let response = self
+            .call(wire::request_envelope::Body::ApplyTradeTransaction(
+                (&request).into(),
+            ))
+            .await?;
+        let Some(wire::response_envelope::Body::ApplyTradeTransaction(result)) = response.body
+        else {
+            return Err(ClientError::UnexpectedResponse(
+                "trade transaction returned another response type",
+            ));
+        };
+        let receipt: TradeReceipt = result
+            .receipt
+            .ok_or(ClientError::UnexpectedResponse(
+                "trade transaction response is missing its receipt",
+            ))?
+            .try_into()?;
+        if receipt.operation_id != operation_id
+            || receipt.trade_id != trade_id
+            || !trade_receipt_matches_request(&receipt, &request)
+        {
+            return Err(ClientError::UnexpectedResponse(
+                "trade transaction receipt does not match the request",
+            ));
+        }
+        match wire::WriteDisposition::try_from(result.disposition).ok() {
+            Some(wire::WriteDisposition::Applied) => Ok(TradeTransactionOutcome::Applied(receipt)),
+            Some(wire::WriteDisposition::Duplicate) => {
+                Ok(TradeTransactionOutcome::Duplicate(receipt))
+            }
+            _ => Err(ClientError::UnexpectedResponse(
+                "trade transaction returned an invalid disposition",
+            )),
+        }
+    }
+
+    pub async fn load_trade_transaction(
+        &self,
+        operation_id: &str,
+        trade_id: &str,
+    ) -> Result<Option<TradeReceipt>, ClientError> {
+        let response = self
+            .call(wire::request_envelope::Body::LoadTradeTransaction(
+                wire::LoadTradeTransactionRequest {
+                    operation_id: operation_id.to_string(),
+                    trade_id: trade_id.to_string(),
+                },
+            ))
+            .await?;
+        let Some(wire::response_envelope::Body::LoadTradeTransaction(result)) = response.body
+        else {
+            return Err(ClientError::UnexpectedResponse(
+                "trade transaction lookup returned another response type",
+            ));
+        };
+        let receipt = result
+            .receipt
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(ClientError::from)?;
+        if receipt.as_ref().is_some_and(|receipt: &TradeReceipt| {
+            receipt.operation_id != operation_id || receipt.trade_id != trade_id
+        }) {
+            return Err(ClientError::UnexpectedResponse(
+                "trade transaction lookup identity mismatch",
+            ));
+        }
+        Ok(receipt)
+    }
+}
+
+fn trade_receipt_matches_request(receipt: &TradeReceipt, request: &TradeTransaction) -> bool {
+    let Some(expected_trade_version) = request.transition.expected_version.0.checked_add(1) else {
+        return false;
+    };
+    if receipt.new_trade_version != Revision(expected_trade_version)
+        || receipt.state != request.transition.next_state
+        || receipt.result != request.result
+    {
+        return false;
+    }
+
+    let mut expected_records = request
+        .writes
+        .iter()
+        .filter_map(|write| {
+            write
+                .expected_revision
+                .0
+                .checked_add(1)
+                .map(|revision| (&write.record, Revision(revision)))
+        })
+        .collect::<Vec<_>>();
+    if expected_records.len() != request.writes.len() {
+        return false;
+    }
+    expected_records.sort_by(|left, right| {
+        left.0
+            .namespace
+            .cmp(&right.0.namespace)
+            .then_with(|| left.0.key.cmp(&right.0.key))
+    });
+    let mut actual_records = receipt.records.iter().collect::<Vec<_>>();
+    actual_records.sort_by(|left, right| {
+        left.record
+            .namespace
+            .cmp(&right.record.namespace)
+            .then_with(|| left.record.key.cmp(&right.record.key))
+    });
+    if expected_records.len() != actual_records.len()
+        || expected_records.iter().zip(actual_records).any(
+            |((expected_record, expected_revision), actual)| {
+                *expected_record != &actual.record || *expected_revision != actual.new_revision
+            },
+        )
+    {
+        return false;
+    }
+
+    let mut expected_postings = request
+        .ledger_postings
+        .iter()
+        .map(|posting| posting.posting_id.as_str())
+        .collect::<Vec<_>>();
+    expected_postings.sort_unstable();
+    let mut actual_postings = receipt
+        .ledger_posting_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    actual_postings.sort_unstable();
+    let mut expected_events = request
+        .outbox_events
+        .iter()
+        .map(|event| event.event_id.as_str())
+        .collect::<Vec<_>>();
+    expected_events.sort_unstable();
+    let mut actual_events = receipt
+        .outbox_event_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    actual_events.sort_unstable();
+    expected_postings == actual_postings && expected_events == actual_events
 }
 
 #[async_trait]
@@ -977,6 +1173,30 @@ impl AsyncMultiRecordTransactionStore for DbProxyClient {
 }
 
 #[async_trait]
+impl AsyncTradeStore for DbProxyClient {
+    type Error = ClientError;
+
+    async fn load_trade(&self, trade_id: &str) -> Result<Option<TradeEnvelope>, Self::Error> {
+        DbProxyClient::load_trade(self, trade_id).await
+    }
+
+    async fn load_trade_receipt(
+        &self,
+        operation_id: &str,
+        trade_id: &str,
+    ) -> Result<Option<TradeReceipt>, Self::Error> {
+        self.load_trade_transaction(operation_id, trade_id).await
+    }
+
+    async fn apply_trade(
+        &mut self,
+        request: TradeTransaction,
+    ) -> Result<TradeTransactionOutcome, Self::Error> {
+        self.apply_trade_transaction(request).await
+    }
+}
+
+#[async_trait]
 impl AsyncSnapshotStore for DbProxyClientPool {
     type Error = ClientError;
 
@@ -1026,6 +1246,30 @@ impl AsyncMultiRecordTransactionStore for DbProxyClientPool {
         request: MultiRecordTransactionalWrite,
     ) -> Result<MultiRecordTransactionalWriteOutcome, Self::Error> {
         self.apply_multi_transaction(request).await
+    }
+}
+
+#[async_trait]
+impl AsyncTradeStore for DbProxyClientPool {
+    type Error = ClientError;
+
+    async fn load_trade(&self, trade_id: &str) -> Result<Option<TradeEnvelope>, Self::Error> {
+        DbProxyClientPool::load_trade(self, trade_id).await
+    }
+
+    async fn load_trade_receipt(
+        &self,
+        operation_id: &str,
+        trade_id: &str,
+    ) -> Result<Option<TradeReceipt>, Self::Error> {
+        self.load_trade_transaction(operation_id, trade_id).await
+    }
+
+    async fn apply_trade(
+        &mut self,
+        request: TradeTransaction,
+    ) -> Result<TradeTransactionOutcome, Self::Error> {
+        self.apply_trade_transaction(request).await
     }
 }
 
@@ -1120,6 +1364,9 @@ fn request_operation(body: &wire::request_envelope::Body) -> &'static str {
         wire::request_envelope::Body::LoadTransaction(_) => "load_transaction",
         wire::request_envelope::Body::ApplyMultiTransaction(_) => "apply_multi_transaction",
         wire::request_envelope::Body::LoadMultiTransaction(_) => "load_multi_transaction",
+        wire::request_envelope::Body::ApplyTradeTransaction(_) => "apply_trade_transaction",
+        wire::request_envelope::Body::LoadTrade(_) => "load_trade",
+        wire::request_envelope::Body::LoadTradeTransaction(_) => "load_trade_transaction",
     }
 }
 
@@ -1204,5 +1451,50 @@ mod tests {
             config.endpoint_candidates().unwrap(),
             vec!["127.0.0.1:7800", "127.0.0.1:7801"]
         );
+    }
+
+    #[test]
+    fn trade_receipt_must_match_the_submitted_transaction() {
+        let record = RecordKey::new("wallet", "buyer").unwrap();
+        let request = TradeTransaction {
+            operation_id: "trade-op".to_string(),
+            transition: tiangz_dbproxy_core::TradeTransition {
+                trade_id: "trade-1".to_string(),
+                expected_version: Revision::ZERO,
+                expected_state: None,
+                next_state: tiangz_dbproxy_core::TradeState::Escrowed,
+                payload: Vec::new(),
+                updated_at_unix_ms: 1,
+            },
+            writes: vec![tiangz_dbproxy_core::TransactionalRecordWrite {
+                record: record.clone(),
+                schema: "wallet.snapshot".to_string(),
+                schema_version: 1,
+                expected_revision: Revision::ZERO,
+                payload: Vec::new(),
+                updated_at_unix_ms: 1,
+            }],
+            ledger_postings: Vec::new(),
+            outbox_events: Vec::new(),
+            result: b"committed".to_vec(),
+        };
+        let receipt = TradeReceipt {
+            operation_id: request.operation_id.clone(),
+            trade_id: request.transition.trade_id.clone(),
+            new_trade_version: Revision(1),
+            state: tiangz_dbproxy_core::TradeState::Escrowed,
+            records: vec![TransactionRecordReceipt {
+                record,
+                new_revision: Revision(1),
+            }],
+            ledger_posting_ids: Vec::new(),
+            outbox_event_ids: Vec::new(),
+            result: b"committed".to_vec(),
+        };
+        assert!(trade_receipt_matches_request(&receipt, &request));
+
+        let mut tampered = receipt;
+        tampered.records[0].new_revision = Revision(2);
+        assert!(!trade_receipt_matches_request(&tampered, &request));
     }
 }

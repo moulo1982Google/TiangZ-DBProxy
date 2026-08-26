@@ -10,6 +10,7 @@ use std::{
 };
 
 use tiangz_dbproxy_protocol::wire;
+use tiangz_dbproxy_storage::StorageMetricsSnapshot;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -35,11 +36,14 @@ pub(crate) enum RpcOperation {
     LoadTransaction,
     ApplyMultiTransaction,
     LoadMultiTransaction,
+    ApplyTradeTransaction,
+    LoadTrade,
+    LoadTradeTransaction,
     Invalid,
 }
 
 impl RpcOperation {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 14] = [
         Self::LoadSnapshot,
         Self::LoadMultiSnapshot,
         Self::SaveSnapshot,
@@ -50,6 +54,9 @@ impl RpcOperation {
         Self::LoadTransaction,
         Self::ApplyMultiTransaction,
         Self::LoadMultiTransaction,
+        Self::ApplyTradeTransaction,
+        Self::LoadTrade,
+        Self::LoadTradeTransaction,
         Self::Invalid,
     ];
 
@@ -69,6 +76,9 @@ impl RpcOperation {
             Self::LoadTransaction => "load_transaction",
             Self::ApplyMultiTransaction => "apply_multi_transaction",
             Self::LoadMultiTransaction => "load_multi_transaction",
+            Self::ApplyTradeTransaction => "apply_trade_transaction",
+            Self::LoadTrade => "load_trade",
+            Self::LoadTradeTransaction => "load_trade_transaction",
             Self::Invalid => "invalid",
         }
     }
@@ -91,6 +101,13 @@ impl RpcOperation {
             Some(wire::request_envelope::Body::LoadMultiTransaction(_)) => {
                 Self::LoadMultiTransaction
             }
+            Some(wire::request_envelope::Body::ApplyTradeTransaction(_)) => {
+                Self::ApplyTradeTransaction
+            }
+            Some(wire::request_envelope::Body::LoadTrade(_)) => Self::LoadTrade,
+            Some(wire::request_envelope::Body::LoadTradeTransaction(_)) => {
+                Self::LoadTradeTransaction
+            }
             None => Self::Invalid,
         }
     }
@@ -112,8 +129,72 @@ impl RpcOperation {
             Some(wire::request_envelope::Body::LoadMultiTransaction(request)) => {
                 request.records.len() as u64
             }
+            Some(wire::request_envelope::Body::ApplyTradeTransaction(request)) => {
+                request.writes.len() as u64
+            }
             Some(_) => 1,
             None => 0,
+        }
+    }
+
+    pub(crate) fn payload_bytes(body: Option<&wire::request_envelope::Body>) -> u64 {
+        fn bytes(length: usize) -> u64 {
+            u64::try_from(length).unwrap_or(u64::MAX)
+        }
+
+        match body {
+            Some(wire::request_envelope::Body::SaveSnapshot(request)) => {
+                bytes(request.payload.len())
+            }
+            Some(wire::request_envelope::Body::SaveMultiSnapshot(request)) => request
+                .writes
+                .iter()
+                .map(|write| bytes(write.payload.len()))
+                .sum(),
+            Some(wire::request_envelope::Body::EnqueueSnapshot(request)) => request
+                .write
+                .as_ref()
+                .map_or(0, |write| bytes(write.payload.len())),
+            Some(wire::request_envelope::Body::EnqueueMultiSnapshot(request)) => request
+                .writes
+                .iter()
+                .map(|write| bytes(write.payload.len()))
+                .sum(),
+            Some(wire::request_envelope::Body::ApplyTransaction(request)) => {
+                bytes(request.payload.len().saturating_add(request.result.len()))
+            }
+            Some(wire::request_envelope::Body::ApplyMultiTransaction(request)) => request
+                .writes
+                .iter()
+                .map(|write| bytes(write.payload.len()))
+                .fold(bytes(request.result.len()), u64::saturating_add),
+            Some(wire::request_envelope::Body::ApplyTradeTransaction(request)) => {
+                let transition = request
+                    .transition
+                    .as_ref()
+                    .map_or(0, |transition| bytes(transition.payload.len()));
+                request
+                    .writes
+                    .iter()
+                    .map(|write| bytes(write.payload.len()))
+                    .chain(
+                        request
+                            .ledger_postings
+                            .iter()
+                            .map(|posting| bytes(posting.metadata.len())),
+                    )
+                    .chain(
+                        request
+                            .outbox_events
+                            .iter()
+                            .map(|event| bytes(event.payload.len())),
+                    )
+                    .fold(
+                        transition.saturating_add(bytes(request.result.len())),
+                        u64::saturating_add,
+                    )
+            }
+            _ => 0,
         }
     }
 }
@@ -123,9 +204,10 @@ struct OperationMetrics {
     requests: AtomicU64,
     failures: AtomicU64,
     records: AtomicU64,
+    payload_bytes: AtomicU64,
     duration_micros: AtomicU64,
     duration_buckets: [AtomicU64; DURATION_BUCKETS_SECONDS.len()],
-    error_codes: [AtomicU64; 8],
+    error_codes: [AtomicU64; 11],
 }
 
 /// 指标只按固定操作名、错误码和实例维度聚合，禁止加入 RecordKey 或业务幂等ID。
@@ -144,6 +226,39 @@ pub struct DbProxyMetrics {
     backlog_empty_polls: AtomicU64,
     backlog_failures: AtomicU64,
     backlog_duration_micros: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    cache_read_errors: AtomicU64,
+    cache_writes: AtomicU64,
+    cache_write_errors: AtomicU64,
+    cache_negative_hits: AtomicU64,
+    cache_stale_hits: AtomicU64,
+    cache_negative_writes: AtomicU64,
+    cache_refresh_started: AtomicU64,
+    cache_refresh_completed: AtomicU64,
+    cache_refresh_errors: AtomicU64,
+    postgres_fallbacks: AtomicU64,
+    postgres_fallback_errors: AtomicU64,
+    postgres_fallback_timeouts: AtomicU64,
+    postgres_fallback_circuit_open: AtomicU64,
+    cache_fallback_lock_acquired: AtomicU64,
+    cache_fallback_lock_contention: AtomicU64,
+    cache_fallback_lock_timeouts: AtomicU64,
+    cache_fallback_lock_errors: AtomicU64,
+    cache_fallback_lock_release_errors: AtomicU64,
+    backlog_pending: AtomicU64,
+    backlog_processing: AtomicU64,
+    backlog_oldest_pending_age_ms: AtomicU64,
+    cache_repair_results: [AtomicU64; DURABLE_QUEUE_RESULT_NAMES.len()],
+    cache_repair_pending: AtomicU64,
+    cache_repair_processing: AtomicU64,
+    cache_repair_dead_lettered: AtomicU64,
+    cache_repair_oldest_age_ms: AtomicU64,
+    outbox_results: [AtomicU64; DURABLE_QUEUE_RESULT_NAMES.len()],
+    outbox_pending: AtomicU64,
+    outbox_processing: AtomicU64,
+    outbox_dead_lettered: AtomicU64,
+    outbox_oldest_age_ms: AtomicU64,
 }
 
 impl Default for DbProxyMetrics {
@@ -162,6 +277,39 @@ impl Default for DbProxyMetrics {
             backlog_empty_polls: AtomicU64::new(0),
             backlog_failures: AtomicU64::new(0),
             backlog_duration_micros: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            cache_read_errors: AtomicU64::new(0),
+            cache_writes: AtomicU64::new(0),
+            cache_write_errors: AtomicU64::new(0),
+            cache_negative_hits: AtomicU64::new(0),
+            cache_stale_hits: AtomicU64::new(0),
+            cache_negative_writes: AtomicU64::new(0),
+            cache_refresh_started: AtomicU64::new(0),
+            cache_refresh_completed: AtomicU64::new(0),
+            cache_refresh_errors: AtomicU64::new(0),
+            postgres_fallbacks: AtomicU64::new(0),
+            postgres_fallback_errors: AtomicU64::new(0),
+            postgres_fallback_timeouts: AtomicU64::new(0),
+            postgres_fallback_circuit_open: AtomicU64::new(0),
+            cache_fallback_lock_acquired: AtomicU64::new(0),
+            cache_fallback_lock_contention: AtomicU64::new(0),
+            cache_fallback_lock_timeouts: AtomicU64::new(0),
+            cache_fallback_lock_errors: AtomicU64::new(0),
+            cache_fallback_lock_release_errors: AtomicU64::new(0),
+            backlog_pending: AtomicU64::new(0),
+            backlog_processing: AtomicU64::new(0),
+            backlog_oldest_pending_age_ms: AtomicU64::new(0),
+            cache_repair_results: std::array::from_fn(|_| AtomicU64::new(0)),
+            cache_repair_pending: AtomicU64::new(0),
+            cache_repair_processing: AtomicU64::new(0),
+            cache_repair_dead_lettered: AtomicU64::new(0),
+            cache_repair_oldest_age_ms: AtomicU64::new(0),
+            outbox_results: std::array::from_fn(|_| AtomicU64::new(0)),
+            outbox_pending: AtomicU64::new(0),
+            outbox_processing: AtomicU64::new(0),
+            outbox_dead_lettered: AtomicU64::new(0),
+            outbox_oldest_age_ms: AtomicU64::new(0),
         }
     }
 }
@@ -208,6 +356,7 @@ impl DbProxyMetrics {
         &self,
         operation: RpcOperation,
         records: u64,
+        payload_bytes: u64,
         elapsed: Duration,
         error: Option<wire::ErrorCode>,
     ) {
@@ -215,6 +364,9 @@ impl DbProxyMetrics {
         let metric = &self.operations[operation.index()];
         metric.requests.fetch_add(1, Ordering::Relaxed);
         metric.records.fetch_add(records, Ordering::Relaxed);
+        metric
+            .payload_bytes
+            .fetch_add(payload_bytes, Ordering::Relaxed);
         let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
         metric.duration_micros.fetch_add(micros, Ordering::Relaxed);
         for (index, bound) in DURATION_BUCKETS_SECONDS.iter().enumerate() {
@@ -239,6 +391,106 @@ impl DbProxyMetrics {
             elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
         );
+    }
+
+    pub(crate) fn storage_metrics_updated(&self, snapshot: StorageMetricsSnapshot) {
+        self.cache_hits
+            .store(snapshot.cache_hits, Ordering::Relaxed);
+        self.cache_misses
+            .store(snapshot.cache_misses, Ordering::Relaxed);
+        self.cache_read_errors
+            .store(snapshot.cache_read_errors, Ordering::Relaxed);
+        self.cache_writes
+            .store(snapshot.cache_writes, Ordering::Relaxed);
+        self.cache_write_errors
+            .store(snapshot.cache_write_errors, Ordering::Relaxed);
+        self.cache_negative_hits
+            .store(snapshot.cache_negative_hits, Ordering::Relaxed);
+        self.cache_stale_hits
+            .store(snapshot.cache_stale_hits, Ordering::Relaxed);
+        self.cache_negative_writes
+            .store(snapshot.cache_negative_writes, Ordering::Relaxed);
+        self.cache_refresh_started
+            .store(snapshot.cache_refresh_started, Ordering::Relaxed);
+        self.cache_refresh_completed
+            .store(snapshot.cache_refresh_completed, Ordering::Relaxed);
+        self.cache_refresh_errors
+            .store(snapshot.cache_refresh_errors, Ordering::Relaxed);
+        self.postgres_fallbacks
+            .store(snapshot.postgres_fallbacks, Ordering::Relaxed);
+        self.postgres_fallback_errors
+            .store(snapshot.postgres_fallback_errors, Ordering::Relaxed);
+        self.postgres_fallback_timeouts
+            .store(snapshot.postgres_fallback_timeouts, Ordering::Relaxed);
+        self.postgres_fallback_circuit_open
+            .store(snapshot.postgres_fallback_circuit_open, Ordering::Relaxed);
+        self.cache_fallback_lock_acquired
+            .store(snapshot.cache_fallback_lock_acquired, Ordering::Relaxed);
+        self.cache_fallback_lock_contention
+            .store(snapshot.cache_fallback_lock_contention, Ordering::Relaxed);
+        self.cache_fallback_lock_timeouts
+            .store(snapshot.cache_fallback_lock_timeouts, Ordering::Relaxed);
+        self.cache_fallback_lock_errors
+            .store(snapshot.cache_fallback_lock_errors, Ordering::Relaxed);
+        self.cache_fallback_lock_release_errors.store(
+            snapshot.cache_fallback_lock_release_errors,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn backlog_depth_updated(
+        &self,
+        pending: u64,
+        processing: u64,
+        oldest_pending_age_ms: Option<u64>,
+    ) {
+        self.backlog_pending.store(pending, Ordering::Relaxed);
+        self.backlog_processing.store(processing, Ordering::Relaxed);
+        self.backlog_oldest_pending_age_ms
+            .store(oldest_pending_age_ms.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    pub(crate) fn durable_queue_finished(
+        &self,
+        queue: DurableQueueMetricKind,
+        result: DurableQueueMetricResult,
+    ) {
+        let counters = match queue {
+            DurableQueueMetricKind::CacheRepair => &self.cache_repair_results,
+            DurableQueueMetricKind::Outbox => &self.outbox_results,
+        };
+        counters[result as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn cache_repair_depth_updated(
+        &self,
+        pending: u64,
+        processing: u64,
+        dead_lettered: u64,
+        oldest_age_ms: Option<u64>,
+    ) {
+        self.cache_repair_pending.store(pending, Ordering::Relaxed);
+        self.cache_repair_processing
+            .store(processing, Ordering::Relaxed);
+        self.cache_repair_dead_lettered
+            .store(dead_lettered, Ordering::Relaxed);
+        self.cache_repair_oldest_age_ms
+            .store(oldest_age_ms.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    pub(crate) fn outbox_depth_updated(
+        &self,
+        pending: u64,
+        processing: u64,
+        dead_lettered: u64,
+        oldest_age_ms: Option<u64>,
+    ) {
+        self.outbox_pending.store(pending, Ordering::Relaxed);
+        self.outbox_processing.store(processing, Ordering::Relaxed);
+        self.outbox_dead_lettered
+            .store(dead_lettered, Ordering::Relaxed);
+        self.outbox_oldest_age_ms
+            .store(oldest_age_ms.unwrap_or(0), Ordering::Relaxed);
     }
 
     fn is_live(&self) -> bool {
@@ -331,6 +583,147 @@ impl DbProxyMetrics {
             &self.requests_in_flight,
         );
 
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_hits_total",
+            "Redis cache results served without waiting for an authoritative lookup",
+            "counter",
+            &self.cache_hits,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_misses_total",
+            "Initial Redis snapshot cache misses",
+            "counter",
+            &self.cache_misses,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_read_errors_total",
+            "Redis snapshot cache read or decode errors",
+            "counter",
+            &self.cache_read_errors,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_writes_total",
+            "Successful Redis snapshot cache writes",
+            "counter",
+            &self.cache_writes,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_write_errors_total",
+            "Redis snapshot cache write or delete errors",
+            "counter",
+            &self.cache_write_errors,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_negative_hits_total",
+            "Redis negative cache hits",
+            "counter",
+            &self.cache_negative_hits,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_stale_hits_total",
+            "Stale Redis snapshot cache entries served while refreshing",
+            "counter",
+            &self.cache_stale_hits,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_negative_writes_total",
+            "Negative cache entries written to Redis",
+            "counter",
+            &self.cache_negative_writes,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_refresh_started_total",
+            "Background cache refreshes started",
+            "counter",
+            &self.cache_refresh_started,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_refresh_completed_total",
+            "Background cache refreshes completed successfully",
+            "counter",
+            &self.cache_refresh_completed,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_refresh_errors_total",
+            "Background cache refresh errors",
+            "counter",
+            &self.cache_refresh_errors,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_postgres_fallbacks_total",
+            "PostgreSQL fallback attempts after a Redis cache miss",
+            "counter",
+            &self.postgres_fallbacks,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_postgres_fallback_errors_total",
+            "PostgreSQL fallback read errors",
+            "counter",
+            &self.postgres_fallback_errors,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_postgres_fallback_timeouts_total",
+            "PostgreSQL fallback reads that exceeded the configured timeout",
+            "counter",
+            &self.postgres_fallback_timeouts,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_postgres_fallback_circuit_open_total",
+            "PostgreSQL fallback requests rejected while the circuit was open",
+            "counter",
+            &self.postgres_fallback_circuit_open,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_fallback_lock_acquired_total",
+            "Redis distributed locks acquired for PostgreSQL cache fallbacks",
+            "counter",
+            &self.cache_fallback_lock_acquired,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_fallback_lock_contention_total",
+            "Redis distributed lock acquisition contentions",
+            "counter",
+            &self.cache_fallback_lock_contention,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_fallback_lock_timeouts_total",
+            "Redis distributed lock waits that expired before acquisition",
+            "counter",
+            &self.cache_fallback_lock_timeouts,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_fallback_lock_errors_total",
+            "Redis distributed lock command or recheck errors",
+            "counter",
+            &self.cache_fallback_lock_errors,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_cache_fallback_lock_release_errors_total",
+            "Redis distributed lock release errors",
+            "counter",
+            &self.cache_fallback_lock_release_errors,
+        );
+
         metric_header(
             &mut output,
             "dbproxy_rpc_requests_total",
@@ -347,6 +740,12 @@ impl DbProxyMetrics {
             &mut output,
             "dbproxy_rpc_records_total",
             "Logical records processed by DBProxy RPC operations",
+            "counter",
+        );
+        metric_header(
+            &mut output,
+            "dbproxy_rpc_payload_bytes_total",
+            "Binary request payload and transaction result bytes by operation",
             "counter",
         );
         metric_header(
@@ -380,6 +779,12 @@ impl DbProxyMetrics {
                 output,
                 "dbproxy_rpc_records_total{{operation=\"{name}\"}} {}",
                 metric.records.load(Ordering::Relaxed)
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "dbproxy_rpc_payload_bytes_total{{operation=\"{name}\"}} {}",
+                metric.payload_bytes.load(Ordering::Relaxed)
             )
             .unwrap();
             for (index, bound) in DURATION_BUCKETS_SECONDS.iter().enumerate() {
@@ -446,6 +851,51 @@ impl DbProxyMetrics {
             "counter",
             &AtomicSeconds(&self.backlog_duration_micros),
         );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_backlog_pending",
+            "Current Redis snapshot backlog items waiting for PostgreSQL",
+            "gauge",
+            &self.backlog_pending,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_backlog_processing",
+            "Current Redis snapshot backlog items leased by workers",
+            "gauge",
+            &self.backlog_processing,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_backlog_oldest_pending_age_seconds",
+            "Age of the oldest pending Redis snapshot backlog item",
+            "gauge",
+            &AtomicMilliseconds(&self.backlog_oldest_pending_age_ms),
+        );
+        write_queue_metrics(
+            &mut output,
+            "cache_repair",
+            "PostgreSQL durable cache repair queue",
+            DurableQueueMetricRefs {
+                results: &self.cache_repair_results,
+                pending: &self.cache_repair_pending,
+                processing: &self.cache_repair_processing,
+                dead_lettered: &self.cache_repair_dead_lettered,
+                oldest_age_ms: &self.cache_repair_oldest_age_ms,
+            },
+        );
+        write_queue_metrics(
+            &mut output,
+            "outbox",
+            "PostgreSQL transactional outbox",
+            DurableQueueMetricRefs {
+                results: &self.outbox_results,
+                pending: &self.outbox_pending,
+                processing: &self.outbox_processing,
+                dead_lettered: &self.outbox_dead_lettered,
+                oldest_age_ms: &self.outbox_oldest_age_ms,
+            },
+        );
         output
     }
 }
@@ -456,22 +906,109 @@ pub(crate) enum BacklogMetricResult {
     Failure,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum DurableQueueMetricKind {
+    CacheRepair,
+    Outbox,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DurableQueueMetricResult {
+    Committed,
+    RetryScheduled,
+    DeadLettered,
+    LeaseLost,
+    Empty,
+    Failure,
+}
+
 pub(crate) enum HandshakeRejection {
     ProtocolMismatch,
     Unauthorized,
     InvalidClient,
 }
 
-const ERROR_CODE_NAMES: [&str; 8] = [
+const ERROR_CODE_NAMES: [&str; 11] = [
     "invalid_request",
     "unauthorized",
     "protocol_mismatch",
     "revision_conflict",
     "idempotency_conflict",
     "operation_conflict",
+    "trade_conflict",
+    "ledger_conflict",
+    "outbox_conflict",
     "storage_unavailable",
     "internal",
 ];
+
+const DURABLE_QUEUE_RESULT_NAMES: [&str; 6] = [
+    "committed",
+    "retry_scheduled",
+    "dead_lettered",
+    "lease_lost",
+    "empty",
+    "failure",
+];
+
+struct DurableQueueMetricRefs<'a> {
+    results: &'a [AtomicU64; DURABLE_QUEUE_RESULT_NAMES.len()],
+    pending: &'a AtomicU64,
+    processing: &'a AtomicU64,
+    dead_lettered: &'a AtomicU64,
+    oldest_age_ms: &'a AtomicU64,
+}
+
+fn write_queue_metrics(
+    output: &mut String,
+    prefix: &str,
+    help_prefix: &str,
+    metrics: DurableQueueMetricRefs<'_>,
+) {
+    let attempts = format!("dbproxy_{prefix}_worker_polls_total");
+    metric_header(
+        output,
+        &attempts,
+        &format!("{help_prefix} worker outcomes"),
+        "counter",
+    );
+    for (index, result) in DURABLE_QUEUE_RESULT_NAMES.iter().enumerate() {
+        writeln!(
+            output,
+            "{attempts}{{result=\"{result}\"}} {}",
+            metrics.results[index].load(Ordering::Relaxed)
+        )
+        .unwrap();
+    }
+    write_atomic_metric(
+        output,
+        &format!("dbproxy_{prefix}_pending"),
+        &format!("{help_prefix} items ready or waiting for retry"),
+        "gauge",
+        metrics.pending,
+    );
+    write_atomic_metric(
+        output,
+        &format!("dbproxy_{prefix}_processing"),
+        &format!("{help_prefix} items currently leased"),
+        "gauge",
+        metrics.processing,
+    );
+    write_atomic_metric(
+        output,
+        &format!("dbproxy_{prefix}_dead_lettered"),
+        &format!("{help_prefix} dead-letter items"),
+        "gauge",
+        metrics.dead_lettered,
+    );
+    write_atomic_metric(
+        output,
+        &format!("dbproxy_{prefix}_oldest_age_seconds"),
+        &format!("Age of the oldest active {help_prefix} item"),
+        "gauge",
+        &AtomicMilliseconds(metrics.oldest_age_ms),
+    );
+}
 
 fn error_code_index(code: wire::ErrorCode) -> usize {
     match code {
@@ -481,8 +1018,11 @@ fn error_code_index(code: wire::ErrorCode) -> usize {
         wire::ErrorCode::RevisionConflict => 3,
         wire::ErrorCode::IdempotencyConflict => 4,
         wire::ErrorCode::OperationConflict => 5,
-        wire::ErrorCode::StorageUnavailable => 6,
-        wire::ErrorCode::Internal | wire::ErrorCode::Unspecified => 7,
+        wire::ErrorCode::TradeConflict => 6,
+        wire::ErrorCode::LedgerConflict => 7,
+        wire::ErrorCode::OutboxConflict => 8,
+        wire::ErrorCode::StorageUnavailable => 9,
+        wire::ErrorCode::Internal | wire::ErrorCode::Unspecified => 10,
     }
 }
 
@@ -517,6 +1057,14 @@ struct AtomicSeconds<'a>(&'a AtomicU64);
 impl AtomicMetricValue for AtomicSeconds<'_> {
     fn metric_value(&self) -> String {
         format!("{:.6}", self.0.load(Ordering::Relaxed) as f64 / 1_000_000.0)
+    }
+}
+
+struct AtomicMilliseconds<'a>(&'a AtomicU64);
+
+impl AtomicMetricValue for AtomicMilliseconds<'_> {
+    fn metric_value(&self) -> String {
+        format!("{:.3}", self.0.load(Ordering::Relaxed) as f64 / 1_000.0)
     }
 }
 
@@ -659,16 +1207,79 @@ mod tests {
         metrics.request_finished(
             RpcOperation::LoadMultiSnapshot,
             30,
+            4,
             Duration::from_millis(4),
             Some(wire::ErrorCode::StorageUnavailable),
         );
+        metrics.storage_metrics_updated(StorageMetricsSnapshot {
+            cache_hits: 7,
+            cache_misses: 3,
+            cache_read_errors: 1,
+            cache_writes: 5,
+            cache_write_errors: 2,
+            cache_negative_hits: 8,
+            cache_stale_hits: 9,
+            cache_negative_writes: 10,
+            cache_refresh_started: 11,
+            cache_refresh_completed: 12,
+            cache_refresh_errors: 13,
+            postgres_fallbacks: 3,
+            postgres_fallback_errors: 1,
+            postgres_fallback_timeouts: 1,
+            postgres_fallback_circuit_open: 2,
+            cache_fallback_lock_acquired: 3,
+            cache_fallback_lock_contention: 4,
+            cache_fallback_lock_timeouts: 5,
+            cache_fallback_lock_errors: 6,
+            cache_fallback_lock_release_errors: 7,
+        });
+        metrics.backlog_depth_updated(4, 2, Some(2_500));
+        metrics.durable_queue_finished(
+            DurableQueueMetricKind::CacheRepair,
+            DurableQueueMetricResult::RetryScheduled,
+        );
+        metrics.cache_repair_depth_updated(5, 1, 2, Some(3_500));
+        metrics.durable_queue_finished(
+            DurableQueueMetricKind::Outbox,
+            DurableQueueMetricResult::Committed,
+        );
+        metrics.outbox_depth_updated(6, 2, 1, Some(4_500));
         let output = metrics.prometheus("memory");
         assert!(output.contains("dbproxy_ready 1"));
         assert!(output.contains("dbproxy_rpc_records_total{operation=\"load_multi_snapshot\"} 30"));
+        assert!(
+            output.contains("dbproxy_rpc_payload_bytes_total{operation=\"load_multi_snapshot\"} 4")
+        );
         assert!(output.contains("dbproxy_rpc_errors_total{operation=\"load_multi_snapshot\",code=\"storage_unavailable\"} 1"));
         assert!(output.contains(
             "dbproxy_rpc_duration_seconds_bucket{operation=\"load_multi_snapshot\",le=\"0.005\"} 1"
         ));
+        assert!(output.contains("dbproxy_cache_hits_total 7"));
+        assert!(output.contains("dbproxy_cache_read_errors_total 1"));
+        assert!(output.contains("dbproxy_cache_negative_hits_total 8"));
+        assert!(output.contains("dbproxy_cache_stale_hits_total 9"));
+        assert!(output.contains("dbproxy_cache_negative_writes_total 10"));
+        assert!(output.contains("dbproxy_cache_refresh_started_total 11"));
+        assert!(output.contains("dbproxy_cache_refresh_completed_total 12"));
+        assert!(output.contains("dbproxy_cache_refresh_errors_total 13"));
+        assert!(output.contains("dbproxy_postgres_fallback_timeouts_total 1"));
+        assert!(output.contains("dbproxy_postgres_fallback_circuit_open_total 2"));
+        assert!(output.contains("dbproxy_cache_fallback_lock_acquired_total 3"));
+        assert!(output.contains("dbproxy_cache_fallback_lock_contention_total 4"));
+        assert!(output.contains("dbproxy_backlog_pending 4"));
+        assert!(output.contains("dbproxy_backlog_oldest_pending_age_seconds 2.500"));
+        assert!(
+            output
+                .contains("dbproxy_cache_repair_worker_polls_total{result=\"retry_scheduled\"} 1")
+        );
+        assert!(output.contains("dbproxy_cache_repair_pending 5"));
+        assert!(output.contains("dbproxy_cache_repair_dead_lettered 2"));
+        assert!(output.contains("dbproxy_cache_repair_oldest_age_seconds 3.500"));
+        assert!(output.contains("dbproxy_outbox_worker_polls_total{result=\"committed\"} 1"));
+        assert!(output.contains("dbproxy_outbox_pending 6"));
+        assert!(output.contains("dbproxy_outbox_dead_lettered 1"));
+        assert!(output.contains("dbproxy_outbox_oldest_age_seconds 4.500"));
+        assert!(!output.contains("hot-key"));
     }
 
     #[tokio::test]

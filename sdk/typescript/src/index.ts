@@ -20,6 +20,14 @@ const MAX_IDEMPOTENCY_KEY_BYTES = 256;
 const MAX_TRANSACTION_RECORDS = 256;
 const MAX_BATCH_LOAD_RECORDS = 64;
 const MAX_BATCH_SNAPSHOT_WRITES = 64;
+const MAX_TRADE_ID_BYTES = 256;
+const MAX_LEDGER_POSTINGS = 512;
+const MAX_LEDGER_FIELD_BYTES = 256;
+const MAX_OUTBOX_EVENTS = 64;
+const MAX_OUTBOX_TOPIC_BYTES = 128;
+const MAX_OUTBOX_PARTITION_KEY_BYTES = 512;
+const INT64_MIN = -0x8000_0000_0000_0000n;
+const INT64_MAX = 0x7fff_ffff_ffff_ffffn;
 
 export enum DbProxyErrorCode {
   InvalidRequest = 1001,
@@ -28,6 +36,9 @@ export enum DbProxyErrorCode {
   RevisionConflict = 2001,
   IdempotencyConflict = 2002,
   OperationConflict = 2003,
+  TradeConflict = 2004,
+  LedgerConflict = 2005,
+  OutboxConflict = 2006,
   StorageUnavailable = 3001,
   Internal = 9000,
 }
@@ -134,6 +145,66 @@ export interface DbProxyMultiTransactionReceipt {
   readonly result: Uint8Array;
 }
 
+export type DbProxyTradeState = "proposed" | "escrowed" | "settled" | "cancelled";
+
+export interface DbProxyTradeEnvelope {
+  readonly tradeId: string;
+  readonly version: bigint;
+  readonly state: DbProxyTradeState;
+  readonly payload: Uint8Array;
+  readonly updatedAtUnixMs: bigint;
+}
+
+export interface DbProxyTradeTransition {
+  readonly tradeId: string;
+  readonly expectedVersion: bigint;
+  readonly expectedState?: DbProxyTradeState;
+  readonly nextState: DbProxyTradeState;
+  readonly payload: Uint8Array;
+  readonly updatedAtUnixMs: bigint;
+}
+
+export interface DbProxyLedgerPosting {
+  readonly postingId: string;
+  readonly accountId: string;
+  readonly asset: string;
+  readonly amount: bigint;
+  readonly metadata: Uint8Array;
+}
+
+export interface DbProxyOutboxEvent {
+  readonly eventId: string;
+  readonly topic: string;
+  readonly partitionKey: string;
+  readonly payload: Uint8Array;
+  readonly occurredAtUnixMs: bigint;
+}
+
+export interface DbProxyTradeTransaction {
+  readonly operationId: string;
+  readonly transition: DbProxyTradeTransition;
+  readonly writes: readonly DbProxyTransactionalRecordWrite[];
+  readonly ledgerPostings: readonly DbProxyLedgerPosting[];
+  readonly outboxEvents: readonly DbProxyOutboxEvent[];
+  readonly result: Uint8Array;
+}
+
+export interface DbProxyTradeReceipt {
+  readonly operationId: string;
+  readonly tradeId: string;
+  readonly newTradeVersion: bigint;
+  readonly state: DbProxyTradeState;
+  readonly records: readonly DbProxyMultiTransactionRecordReceipt[];
+  readonly ledgerPostingIds: readonly string[];
+  readonly outboxEventIds: readonly string[];
+  readonly result: Uint8Array;
+}
+
+export interface DbProxyTradeTransactionResult {
+  readonly disposition: DbProxyWriteDisposition;
+  readonly receipt: DbProxyTradeReceipt;
+}
+
 /**
  * 每个宿主实现一个Transport。实现必须保留DBProxy的ACK语义，不能把Enqueue成功
  * 解释成PostgreSQL已经提交，也不能在超时后复用状态不明的连接。
@@ -169,6 +240,14 @@ export interface DbProxyTransport {
     operationId: string,
     records: readonly DbProxyRecordKey[],
   ): Promise<DbProxyMultiTransactionReceipt | undefined>;
+  loadTrade(tradeId: string): Promise<DbProxyTradeEnvelope | undefined>;
+  applyTradeTransaction(
+    transaction: DbProxyTradeTransaction,
+  ): Promise<DbProxyTradeTransactionResult>;
+  loadTradeTransaction(
+    operationId: string,
+    tradeId: string,
+  ): Promise<DbProxyTradeReceipt | undefined>;
 }
 
 export class DbProxyRemoteError extends Error {
@@ -298,6 +377,42 @@ export class DbProxyClient {
     return this.transport
       .loadMultiTransaction(stableOperationId, stableRecords)
       .then((receipt) => receipt ? cloneMultiTransactionReceipt(receipt) : undefined);
+  }
+
+  LoadTrade(tradeId: string): Promise<DbProxyTradeEnvelope | undefined> {
+    const stableTradeId = requireText(tradeId, "trade.tradeId", MAX_TRADE_ID_BYTES);
+    return this.transport.loadTrade(stableTradeId).then((trade) =>
+      trade ? cloneTradeEnvelope(trade) : undefined
+    );
+  }
+
+  ApplyTradeTransaction(
+    transaction: DbProxyTradeTransaction,
+  ): Promise<DbProxyTradeTransactionResult> {
+    const stable = cloneTradeTransaction(transaction);
+    return this.transport.applyTradeTransaction(stable).then((result) => {
+      if (result.disposition !== "applied" && result.disposition !== "duplicate") {
+        throw new TypeError("trade transaction returned an invalid disposition");
+      }
+      const receipt = cloneTradeReceipt(result.receipt);
+      requireTradeReceiptMatches(stable, receipt);
+      return { disposition: result.disposition, receipt };
+    });
+  }
+
+  LoadTradeTransaction(
+    operationId: string,
+    tradeId: string,
+  ): Promise<DbProxyTradeReceipt | undefined> {
+    const stableOperationId = requireText(
+      operationId,
+      "tradeTransaction.operationId",
+      MAX_IDEMPOTENCY_KEY_BYTES,
+    );
+    const stableTradeId = requireText(tradeId, "trade.tradeId", MAX_TRADE_ID_BYTES);
+    return this.transport
+      .loadTradeTransaction(stableOperationId, stableTradeId)
+      .then((receipt) => receipt ? cloneTradeReceipt(receipt) : undefined);
   }
 }
 
@@ -542,6 +657,283 @@ function cloneMultiTransactionReceipt(
   };
 }
 
+function cloneTradeEnvelope(trade: DbProxyTradeEnvelope): DbProxyTradeEnvelope {
+  return {
+    tradeId: requireText(trade.tradeId, "trade.tradeId", MAX_TRADE_ID_BYTES),
+    version: requireUint64(trade.version, "trade.version"),
+    state: requireTradeState(trade.state, "trade.state"),
+    payload: copyBytes(trade.payload),
+    updatedAtUnixMs: requireUint64(trade.updatedAtUnixMs, "trade.updatedAtUnixMs"),
+  };
+}
+
+function cloneTradeTransaction(
+  transaction: DbProxyTradeTransaction,
+): DbProxyTradeTransaction {
+  const operationId = requireText(
+    transaction.operationId,
+    "tradeTransaction.operationId",
+    MAX_IDEMPOTENCY_KEY_BYTES,
+  );
+  const transition = cloneTradeTransition(transaction.transition);
+  if (!Array.isArray(transaction.writes)
+    || transaction.writes.length === 0
+    || transaction.writes.length > MAX_TRANSACTION_RECORDS) {
+    throw new RangeError(
+      `tradeTransaction.writes must contain 1..${MAX_TRANSACTION_RECORDS} records`,
+    );
+  }
+  const writes = transaction.writes.map(cloneMultiTransactionalRecordWrite);
+  const records = new Set(
+    writes.map((write) => `${write.record.namespace}\u0000${write.record.key}`),
+  );
+  if (records.size !== writes.length) {
+    throw new TypeError("tradeTransaction.writes cannot contain duplicate records");
+  }
+  if (!Array.isArray(transaction.ledgerPostings)
+    || transaction.ledgerPostings.length > MAX_LEDGER_POSTINGS) {
+    throw new RangeError(
+      `tradeTransaction.ledgerPostings cannot exceed ${MAX_LEDGER_POSTINGS}`,
+    );
+  }
+  const ledgerPostings = transaction.ledgerPostings.map(cloneLedgerPosting);
+  const postingIds = new Set(ledgerPostings.map((posting) => posting.postingId));
+  if (postingIds.size !== ledgerPostings.length) {
+    throw new TypeError("tradeTransaction.ledgerPostings contain duplicate postingIds");
+  }
+  const balances = new Map<string, bigint>();
+  for (const posting of ledgerPostings) {
+    balances.set(posting.asset, (balances.get(posting.asset) ?? 0n) + posting.amount);
+  }
+  for (const [asset, balance] of balances) {
+    if (balance !== 0n) {
+      throw new RangeError(`tradeTransaction ledger is not balanced for asset ${asset}`);
+    }
+  }
+  if (!Array.isArray(transaction.outboxEvents)
+    || transaction.outboxEvents.length > MAX_OUTBOX_EVENTS) {
+    throw new RangeError(
+      `tradeTransaction.outboxEvents cannot exceed ${MAX_OUTBOX_EVENTS}`,
+    );
+  }
+  const outboxEvents = transaction.outboxEvents.map(cloneOutboxEvent);
+  const eventIds = new Set(outboxEvents.map((event) => event.eventId));
+  if (eventIds.size !== outboxEvents.length) {
+    throw new TypeError("tradeTransaction.outboxEvents contain duplicate eventIds");
+  }
+  return {
+    operationId,
+    transition,
+    writes,
+    ledgerPostings,
+    outboxEvents,
+    result: copyBytes(transaction.result),
+  };
+}
+
+function cloneTradeTransition(
+  transition: DbProxyTradeTransition,
+): DbProxyTradeTransition {
+  const expectedVersion = requireUint64(
+    transition.expectedVersion,
+    "tradeTransition.expectedVersion",
+  );
+  const expectedState = transition.expectedState === undefined
+    ? undefined
+    : requireTradeState(transition.expectedState, "tradeTransition.expectedState");
+  const nextState = requireTradeState(transition.nextState, "tradeTransition.nextState");
+  if ((expectedVersion === 0n) !== (expectedState === undefined)
+    || !isValidTradeTransition(expectedState, nextState)) {
+    throw new TypeError("tradeTransition contains an illegal state transition");
+  }
+  return {
+    tradeId: requireText(transition.tradeId, "tradeTransition.tradeId", MAX_TRADE_ID_BYTES),
+    expectedVersion,
+    expectedState,
+    nextState,
+    payload: copyBytes(transition.payload),
+    updatedAtUnixMs: requireUint64(
+      transition.updatedAtUnixMs,
+      "tradeTransition.updatedAtUnixMs",
+    ),
+  };
+}
+
+function cloneLedgerPosting(posting: DbProxyLedgerPosting): DbProxyLedgerPosting {
+  const amount = requireInt64(posting.amount, "ledgerPosting.amount");
+  if (amount === 0n) throw new RangeError("ledgerPosting.amount cannot be zero");
+  return {
+    postingId: requireText(
+      posting.postingId,
+      "ledgerPosting.postingId",
+      MAX_LEDGER_FIELD_BYTES,
+    ),
+    accountId: requireText(
+      posting.accountId,
+      "ledgerPosting.accountId",
+      MAX_LEDGER_FIELD_BYTES,
+    ),
+    asset: requireText(posting.asset, "ledgerPosting.asset", MAX_LEDGER_FIELD_BYTES),
+    amount,
+    metadata: copyBytes(posting.metadata),
+  };
+}
+
+function cloneOutboxEvent(event: DbProxyOutboxEvent): DbProxyOutboxEvent {
+  const topic = requireText(event.topic, "outboxEvent.topic", MAX_OUTBOX_TOPIC_BYTES);
+  if (!/^[A-Za-z0-9._-]+$/.test(topic)) {
+    throw new TypeError("outboxEvent.topic contains unsupported characters");
+  }
+  return {
+    eventId: requireText(
+      event.eventId,
+      "outboxEvent.eventId",
+      MAX_IDEMPOTENCY_KEY_BYTES,
+    ),
+    topic,
+    partitionKey: requireText(
+      event.partitionKey,
+      "outboxEvent.partitionKey",
+      MAX_OUTBOX_PARTITION_KEY_BYTES,
+    ),
+    payload: copyBytes(event.payload),
+    occurredAtUnixMs: requireUint64(
+      event.occurredAtUnixMs,
+      "outboxEvent.occurredAtUnixMs",
+    ),
+  };
+}
+
+function cloneTradeReceipt(receipt: DbProxyTradeReceipt): DbProxyTradeReceipt {
+  if (!Array.isArray(receipt.records)
+    || receipt.records.length === 0
+    || receipt.records.length > MAX_TRANSACTION_RECORDS) {
+    throw new RangeError(
+      `tradeReceipt.records must contain 1..${MAX_TRANSACTION_RECORDS} records`,
+    );
+  }
+  if (!Array.isArray(receipt.ledgerPostingIds)
+    || receipt.ledgerPostingIds.length > MAX_LEDGER_POSTINGS
+    || !Array.isArray(receipt.outboxEventIds)
+    || receipt.outboxEventIds.length > MAX_OUTBOX_EVENTS) {
+    throw new RangeError("tradeReceipt identifier counts exceed protocol limits");
+  }
+  const newTradeVersion = requireUint64(
+    receipt.newTradeVersion,
+    "tradeReceipt.newTradeVersion",
+  );
+  if (newTradeVersion === 0n) {
+    throw new RangeError("tradeReceipt.newTradeVersion must be greater than zero");
+  }
+  const records = receipt.records.map(cloneMultiTransactionRecordReceipt);
+  if (records.some((record) => record.newRevision === 0n)
+    || new Set(records.map((record) =>
+      `${record.record.namespace}\u0000${record.record.key}`
+    )).size !== records.length) {
+    throw new TypeError("tradeReceipt records are invalid or duplicated");
+  }
+  const ledgerPostingIds = receipt.ledgerPostingIds.map((id) =>
+    requireText(id, "tradeReceipt.ledgerPostingId", MAX_LEDGER_FIELD_BYTES)
+  );
+  const outboxEventIds = receipt.outboxEventIds.map((id) =>
+    requireText(id, "tradeReceipt.outboxEventId", MAX_IDEMPOTENCY_KEY_BYTES)
+  );
+  if (new Set(ledgerPostingIds).size !== ledgerPostingIds.length
+    || new Set(outboxEventIds).size !== outboxEventIds.length) {
+    throw new TypeError("tradeReceipt identifiers cannot contain duplicates");
+  }
+  return {
+    operationId: requireText(
+      receipt.operationId,
+      "tradeReceipt.operationId",
+      MAX_IDEMPOTENCY_KEY_BYTES,
+    ),
+    tradeId: requireText(receipt.tradeId, "tradeReceipt.tradeId", MAX_TRADE_ID_BYTES),
+    newTradeVersion,
+    state: requireTradeState(receipt.state, "tradeReceipt.state"),
+    records,
+    ledgerPostingIds,
+    outboxEventIds,
+    result: copyBytes(receipt.result),
+  };
+}
+
+function requireTradeReceiptMatches(
+  transaction: DbProxyTradeTransaction,
+  receipt: DbProxyTradeReceipt,
+): void {
+  if (receipt.operationId !== transaction.operationId
+    || receipt.tradeId !== transaction.transition.tradeId
+    || receipt.newTradeVersion !== transaction.transition.expectedVersion + 1n
+    || receipt.state !== transaction.transition.nextState
+    || !bytesEqual(receipt.result, transaction.result)) {
+    throw new TypeError("trade transaction receipt does not match the request");
+  }
+
+  const expectedRecords = transaction.writes
+    .map((write) => ({
+      record: write.record,
+      newRevision: write.expectedRevision + 1n,
+    }))
+    .sort(compareRecordReceipts);
+  const actualRecords = [...receipt.records].sort(compareRecordReceipts);
+  if (expectedRecords.length !== actualRecords.length
+    || expectedRecords.some((expected, index) => {
+      const actual = actualRecords[index];
+      return expected.record.namespace !== actual.record.namespace
+        || expected.record.key !== actual.record.key
+        || expected.newRevision !== actual.newRevision;
+    })) {
+    throw new TypeError("trade transaction receipt records do not match the request");
+  }
+
+  const expectedPostingIds = transaction.ledgerPostings
+    .map((posting) => posting.postingId)
+    .sort();
+  const actualPostingIds = [...receipt.ledgerPostingIds].sort();
+  const expectedEventIds = transaction.outboxEvents.map((event) => event.eventId).sort();
+  const actualEventIds = [...receipt.outboxEventIds].sort();
+  if (!stringArraysEqual(expectedPostingIds, actualPostingIds)
+    || !stringArraysEqual(expectedEventIds, actualEventIds)) {
+    throw new TypeError("trade transaction receipt identifiers do not match the request");
+  }
+}
+
+function compareRecordReceipts(
+  left: DbProxyMultiTransactionRecordReceipt,
+  right: DbProxyMultiTransactionRecordReceipt,
+): number {
+  return left.record.namespace.localeCompare(right.record.namespace)
+    || left.record.key.localeCompare(right.record.key);
+}
+
+function stringArraysEqual(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function requireTradeState(value: string, name: string): DbProxyTradeState {
+  if (value !== "proposed"
+    && value !== "escrowed"
+    && value !== "settled"
+    && value !== "cancelled") {
+    throw new TypeError(`${name} is not a valid trade state`);
+  }
+  return value;
+}
+
+function isValidTradeTransition(
+  from: DbProxyTradeState | undefined,
+  to: DbProxyTradeState,
+): boolean {
+  return (from === undefined && (to === "proposed" || to === "escrowed"))
+    || (from === "proposed" && (to === "escrowed" || to === "cancelled"))
+    || (from === "escrowed" && (to === "settled" || to === "cancelled"));
+}
+
 function requireText(value: string, name: string, maximumBytes: number): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new TypeError(`${name} must be a non-empty string`);
@@ -595,6 +987,13 @@ function requireUint32(value: number, name: string): number {
 function requireUint64(value: bigint, name: string): bigint {
   if (typeof value !== "bigint" || value < 0n || value > UINT64_MAX) {
     throw new RangeError(`${name} must be uint64 bigint`);
+  }
+  return value;
+}
+
+function requireInt64(value: bigint, name: string): bigint {
+  if (typeof value !== "bigint" || value < INT64_MIN || value > INT64_MAX) {
+    throw new RangeError(`${name} must be int64 bigint`);
   }
   return value;
 }

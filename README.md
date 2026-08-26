@@ -14,7 +14,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 
 ## 当前状态
 
-`v0.5.0` 是当前工作版本。`v0.1.x` 冻结核心语义、真实存储、关键事务和 Redis AOF 持久积压；`v0.2.0` 第一次把这些能力作为独立网络服务暴露，`v0.3.x` 增加运行时无关的 TypeScript SDK并适配裸V8，`v0.4.0` 增加已提交事务回执查询，`v0.5.0` 增加多 Endpoint 故障切换和跨记录原子事务：
+`v0.6.0` 是当前工作版本。它在已有快照、关键事务、多 Endpoint 和跨记录原子事务之上，增加持久缓存修复队列、AOF 确认与重连、交易托管状态机、不可变账本和 PostgreSQL Outbox：
 
 - `RecordKey`：`namespace + key`
 - `Revision`：由 DBProxy 生成的单调版本号
@@ -28,20 +28,23 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 - `InMemoryTransactionalStore`：验证事务提交、CAS 冲突和原始结果重试语义
 - `PostgresSnapshotStore`：PostgreSQL 权威快照、CAS、幂等写入和关键事务收据
 - `RedisSnapshotCache`：只缓存 PostgreSQL 已提交的快照
-- `TieredSnapshotStore`：固定按照 PostgreSQL -> Redis 的顺序写入，并在事务重试后修复缓存
+- `TieredSnapshotStore`：先提交 PostgreSQL 和 durable repair，再尽力刷新 Redis；缓存失败不改变权威提交结果
+- `PostgresCacheRepairQueue`：与权威写入同事务提交的缓存修复目标，支持租约、指数退避、死信和定点重放
 - `TieredSnapshotStore::repair_cache`：从 PostgreSQL 重建缓存，或删除数据库中已不存在的旧缓存
 - `SnapshotFlushQueue`：按 `RecordKey` 合并普通快照，只保留最新值；关键事务不进入该队列
 - `SnapshotFlushQueue::flush` 与 `flush_until_empty`：限制每轮写入量和最大轮数，失败保留请求并返回剩余积压
 - `RedisSnapshotBacklog`：把尚未落 PostgreSQL 的普通快照保存到独立 Redis backlog，支持 lease、ACK、释放、续租和过期回收
-- `dbproxy-protocol`：版本化 Protobuf、协议指纹和 8 MiB 默认有界帧
-- `dbproxy-server`：内部令牌握手、按 RecordKey 分片的真实存储连接和持久积压消费者
+- `TradeTransaction`：原子提交交易状态、多记录CAS、不可变平衡账本、Outbox和完整回执
+- `PostgresOutboxQueue`：租约/重试/死信 worker，把交易事件至少一次发布到 AOF 确认的 Redis Stream
+- `dbproxy-protocol`：v2 Protobuf、协议指纹、8 MiB frame 和 1 MiB 应用 Payload 默认上限
+- `dbproxy-server`：内部令牌握手、按 RecordKey 分片的真实存储连接，以及 backlog/cache-repair/outbox worker
 - `MemoryBackend`：保留Revision、CAS、幂等和多记录原子语义的易失后端，用于隔离网络/协议/调度成本；不会连接PostgreSQL或Redis
 - `dbproxy-client`：Rust 异步客户端及多连接池；TiangZ 不需要引用存储 crate
 - `@tiangz/dbproxy-sdk`：TypeScript稳定类型、参数校验、防御性Payload复制、多记录事务和可插拔Transport；不绑定Node、Deno或TiangZ
-- `fault_matrix.ps1`：显式停止/恢复本机容器，验证 Redis、PostgreSQL 和快照积压恢复边界
+- `fault_matrix.ps1`：在笔记本限额容器中显式停止/恢复 Redis/PostgreSQL，验证 AOF、积压、自动重连和缓存修复边界
 - `network_smoke.ps1`：验证 Rust SDK -> TCP -> DBProxy -> Redis/PostgreSQL 完整闭环
 
-TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transport适配，并完成真实重启恢复冒烟；这些领域Payload与恢复逻辑不属于本仓库，DBProxy仍不依赖TiangZ。当前多记录事务已经在 Core、协议、PostgreSQL/Redis、Rust客户端和 TypeScript SDK 中完成；TiangZ 领域层如何编排交易、奖励转移和跨玩家 revision，仍由主工程的领域 Repository 决定。
+TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transport适配；这些领域Payload与恢复逻辑不属于本仓库。交易 API 只提供通用状态/CAS/账本/Outbox 原子边界，所有权、价格、余额和风控仍由主工程的领域 Repository 决定。架构、演练和审视结果分别见[架构说明](docs/architecture.md)、[恢复手册](docs/durability-recovery-runbook.md)、[交易安全说明](docs/trade-safety-and-outbox.md)和[代码审视记录](docs/dbproxy-code-review.md)。
 
 ## 启动配置
 
@@ -156,7 +159,7 @@ $env:DBPROXY_AUTH_TOKEN = "local-perf-token-1234"
 1. DBProxy 只理解记录地址、Schema、Revision 和二进制 Payload，不理解游戏业务字段。
 2. 快照写入必须支持重试，重试不能导致重复扣物品、重复发奖励或重复保存。
 3. Redis 不是最终一致性的替代品。缓存和持久库的责任、故障恢复顺序必须由适配器明确实现。
-4. 单记录关键事务与普通快照分开；多记录事务、事件 Outbox 和跨域一致性等更高阶能力，等故障矩阵和单记录语义稳定后再扩展。
+4. 普通快照、关键事务和至少一次事件投递使用不同 ACK；同库多记录/交易事务不能被普通批量写入替代。
 5. TiangZ 的主工程不直接依赖 DBProxy 的内部模块，只依赖版本化协议或客户端 SDK。
 6. 普通Entity可以由TiangZ的`.native`生成版本化Codec和通用Repository；DBProxy仍只维护固定通用表。复杂查询、二级索引和跨玩家事务必须使用专门的领域存储设计。
 
@@ -176,7 +179,7 @@ const snapshot = await client.Load({ namespace: "player", key: "1001" });
 
 ## 网络边界
 
-当前协议提供八类 RPC：
+当前 v2 协议提供十三类 RPC：
 
 ```text
 LoadSnapshot       读取已提交权威快照
@@ -189,13 +192,16 @@ ApplyTransaction   提交单记录关键事务并保存原始业务结果
 LoadTransaction    按operationId与RecordKey读取已提交事务回执
 ApplyMultiTransaction  在一个 PostgreSQL 事务中原子提交多条记录
 LoadMultiTransaction   按operationId和记录集合读取跨记录事务回执
+ApplyTradeTransaction  原子提交交易状态、多记录、账本、Outbox和回执
+LoadTrade              读取交易当前版本、状态和不透明Payload
+LoadTradeTransaction   按operationId和tradeId读取已提交交易回执
 ```
 
 每条连接先校验`protocol_version + protocol_fingerprint + auth_token`，之后才允许 RPC。帧使用大端四字节长度前缀，默认上限 8 MiB。客户端连接内按顺序执行请求；`DbProxyClientPool`按`RecordKey`稳定分配到多条连接。服务端存储连接也按相同原则分片，避免所有玩家共享一个事务锁。
 
 详细错误码、ACK语义、Endpoint故障切换和跨记录限制见[网络协议说明](docs/network-protocol.md)。
 
-`SnapshotFlushQueue`是 DBProxy 进程内的协调器；`RedisSnapshotBacklog`是独立的 Redis AOF 持久积压区。前者适合当前进程短暂排空，进程崩溃会丢失；后者保存尚未落 PostgreSQL 的普通快照，DBProxy 重启后可以重新领取。两者都只适合等级、任务进度、角色位置等允许小范围回退的数据，关键经济事务必须走 PostgreSQL 事务。Redis AOF、数据卷和故障监控属于部署责任，不能因为使用了 Redis backlog 就声称实现了完整多副本高可用。
+`SnapshotFlushQueue`是 DBProxy 进程内的协调器；`RedisSnapshotBacklog`是独立的 Redis AOF 持久积压区。前者随进程消失，后者只有在入队脚本后通过 `WAITAOF` 才返回成功，DBProxy/Redis 重启后可以重新领取。两者都只适合等级、任务进度、角色位置等允许小范围回退的数据；关键经济事务必须走 PostgreSQL 事务。AOF 和本地数据卷不等于 Redis 多副本高可用。
 
 ## 许可证
 

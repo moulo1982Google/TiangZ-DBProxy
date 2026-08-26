@@ -12,11 +12,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use redis::Script;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use tiangz_dbproxy_core::{RecordKey, SnapshotWrite, StoreError};
 use tokio::sync::Mutex;
 
-use crate::StorageError;
+use crate::{DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS, StorageError, open_redis_connection_manager};
 
 const PENDING_KEY: &str = "dbproxy:snapshot-backlog:pending";
 const PROCESSING_KEY: &str = "dbproxy:snapshot-backlog:processing";
@@ -116,19 +116,26 @@ pub enum SnapshotBacklogAck {
     LeaseLost,
 }
 
+/// Point-in-time depth information for the durable Redis snapshot backlog.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RedisSnapshotBacklogStats {
+    pub pending: u64,
+    pub processing: u64,
+    pub oldest_pending_age_ms: Option<u64>,
+}
+
 /// Redis AOF-backed ordinary snapshot backlog.
 /// 基于 Redis AOF 的普通快照持久积压队列。
 #[derive(Clone)]
 pub struct RedisSnapshotBacklog {
-    connection: Arc<Mutex<MultiplexedConnection>>,
+    connection: Arc<Mutex<ConnectionManager>>,
 }
 
 impl RedisSnapshotBacklog {
     /// 连接 Redis；不会自动改变 Redis 的持久化配置。
     /// Connect to Redis; persistence configuration remains a deployment responsibility.
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
-        let client = redis::Client::open(url)?;
-        let connection = client.get_multiplexed_async_connection().await?;
+        let connection = open_redis_connection_manager(url).await?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -215,6 +222,7 @@ impl RedisSnapshotBacklog {
             .arg(member)
             .invoke_async(&mut *connection)
             .await?;
+        wait_for_local_aof(&mut connection).await?;
         Ok(())
     }
 
@@ -250,7 +258,53 @@ return (#ARGV - 1) / 3
                 "batch enqueue returned an invalid count".to_string(),
             ));
         }
+        wait_for_local_aof(&mut connection).await?;
         Ok(())
+    }
+
+    /// Read backlog depth and the age of the oldest pending item without mutating the queue.
+    pub async fn stats(&self) -> Result<RedisSnapshotBacklogStats, StorageError> {
+        let now = Self::now_unix_ms()?;
+        let mut connection = self.connection.lock().await;
+        let pending: i64 = redis::cmd("ZCARD")
+            .arg(PENDING_KEY)
+            .query_async(&mut *connection)
+            .await?;
+        let processing: i64 = redis::cmd("ZCARD")
+            .arg(PROCESSING_KEY)
+            .query_async(&mut *connection)
+            .await?;
+        let oldest_values: Vec<String> = redis::cmd("ZRANGE")
+            .arg(PENDING_KEY)
+            .arg(0)
+            .arg(0)
+            .arg("WITHSCORES")
+            .query_async(&mut *connection)
+            .await?;
+        let pending = u64::try_from(pending)
+            .map_err(|_| StorageError::BacklogProtocol("pending depth is negative".to_string()))?;
+        let processing = u64::try_from(processing).map_err(|_| {
+            StorageError::BacklogProtocol("processing depth is negative".to_string())
+        })?;
+        let oldest_pending_age_ms = match oldest_values.as_slice() {
+            [] => None,
+            [_, score] => {
+                let score = score.parse::<i64>().map_err(|error| {
+                    StorageError::BacklogProtocol(format!("invalid pending score: {error}"))
+                })?;
+                Some(now.saturating_sub(score).max(0) as u64)
+            }
+            _ => {
+                return Err(StorageError::BacklogProtocol(
+                    "ZRANGE returned an invalid score tuple".to_string(),
+                ));
+            }
+        };
+        Ok(RedisSnapshotBacklogStats {
+            pending,
+            processing,
+            oldest_pending_age_ms,
+        })
     }
 
     /// 领取一条积压并设置 lease；会先把过期 lease 重新放回 pending。
@@ -375,4 +429,20 @@ return (#ARGV - 1) / 3
             .await?;
         Ok(result == 1)
     }
+}
+
+async fn wait_for_local_aof(connection: &mut ConnectionManager) -> Result<(), StorageError> {
+    let timeout_ms = i64::try_from(DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS).unwrap_or(i64::MAX);
+    let (local, _replicas): (i64, i64) = redis::cmd("WAITAOF")
+        .arg(1)
+        .arg(0)
+        .arg(timeout_ms)
+        .query_async(connection)
+        .await?;
+    if local < 1 {
+        return Err(StorageError::RedisAofNotDurable {
+            timeout_ms: DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS,
+        });
+    }
+    Ok(())
 }

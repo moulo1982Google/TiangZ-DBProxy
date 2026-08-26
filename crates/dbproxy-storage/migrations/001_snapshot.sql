@@ -17,5 +17,6 @@ CREATE TABLE IF NOT EXISTS dbproxy_idempotency (
     schema_version BIGINT NOT NULL,
     payload BYTEA NOT NULL,
     expected_revision BIGINT NULL,
-    revision BIGINT NOT NULL
+    revision BIGINT NOT NULL,
+    updated_at_unix_ms BIGINT NULL
 );

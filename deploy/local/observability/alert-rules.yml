@@ -45,3 +45,120 @@ groups:
         annotations:
           summary: "DBProxy snapshot backlog processing is failing"
           description: "{{ $labels.instance }} cannot flush ordinary snapshot backlog work."
+
+      - alert: TiangZDbProxyCacheFallbackTimeouts
+        expr: sum by (instance) (rate(dbproxy_postgres_fallback_timeouts_total[2m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy PostgreSQL fallback is timing out"
+          description: "{{ $labels.instance }} is shedding cache misses because the fallback limit or timeout is exhausted."
+
+      - alert: TiangZDbProxyCacheFallbackCircuitOpen
+        expr: sum by (instance) (rate(dbproxy_postgres_fallback_circuit_open_total[2m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy PostgreSQL fallback circuit is open"
+          description: "{{ $labels.instance }} is rejecting cache-miss fallback reads while PostgreSQL failures recover."
+
+      - alert: TiangZDbProxyCacheFallbackLockErrors
+        expr: sum by (instance) (rate(dbproxy_cache_fallback_lock_errors_total[2m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy distributed cache fallback locks are unavailable"
+          description: "{{ $labels.instance }} is falling back without cross-instance lock coordination because Redis lock commands or rechecks are failing."
+
+      - alert: TiangZDbProxyCacheFallbackLockTimeouts
+        expr: sum by (instance) (rate(dbproxy_cache_fallback_lock_timeouts_total[2m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy distributed cache fallback lock waits are expiring"
+          description: "{{ $labels.instance }} is seeing cross-instance cache-miss contention beyond the configured lock wait window."
+
+      - alert: TiangZDbProxyCacheReadErrors
+        expr: sum by (instance) (rate(dbproxy_cache_read_errors_total[2m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy Redis cache reads are failing"
+          description: "{{ $labels.instance }} is falling back to PostgreSQL because Redis reads or snapshot decoding are failing."
+
+      - alert: TiangZDbProxyCacheWriteErrors
+        expr: sum by (instance) (rate(dbproxy_cache_write_errors_total[2m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy Redis cache writes are failing"
+          description: "{{ $labels.instance }} committed data but could not update or delete a Redis cache entry."
+
+      - alert: TiangZDbProxyCacheRefreshErrors
+        expr: sum by (instance) (rate(dbproxy_cache_refresh_errors_total[2m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy stale cache refreshes are failing"
+          description: "{{ $labels.instance }} cannot refresh stale Redis snapshots from PostgreSQL. Stale hits alone are not alerted."
+
+      - alert: TiangZDbProxyBacklogDepthHigh
+        expr: dbproxy_backlog_pending > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy snapshot backlog is growing"
+          description: "{{ $labels.instance }} has more than 1000 pending ordinary snapshots."
+
+      - alert: TiangZDbProxyBacklogOldestTooOld
+        expr: dbproxy_backlog_oldest_pending_age_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy snapshot backlog is stale"
+          description: "{{ $labels.instance }} has a pending ordinary snapshot older than five minutes."
+
+      - alert: TiangZDbProxyCacheRepairDeadLetters
+        expr: dbproxy_cache_repair_dead_lettered > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "DBProxy cache repair has dead letters"
+          description: "{{ $labels.instance }} exhausted automatic retries. Inspect last_error, fix Redis, then requeue the specific RecordKey."
+
+      - alert: TiangZDbProxyCacheRepairStalled
+        expr: dbproxy_cache_repair_oldest_age_seconds > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy cache repair queue is stalled"
+          description: "{{ $labels.instance }} has an unrepaired committed snapshot older than one minute."
+
+      - alert: TiangZDbProxyOutboxDeadLetters
+        expr: dbproxy_outbox_dead_lettered > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "DBProxy outbox has dead letters"
+          description: "{{ $labels.instance }} exhausted event publication retries. Inspect the event and consumer contract before requeueing its event_id."
+
+      - alert: TiangZDbProxyOutboxStalled
+        expr: dbproxy_outbox_oldest_age_seconds > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DBProxy outbox is stalled"
+          description: "{{ $labels.instance }} has an unpublished committed event older than one minute."
