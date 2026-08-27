@@ -42,6 +42,7 @@ pub use backlog::{
 pub use cache_repair::{CacheRepairLease, CacheRepairStats, PostgresCacheRepairQueue};
 pub use outbox::{OutboxLease, OutboxStats, PostgresOutboxQueue, RedisOutboxPublisher};
 
+const SCHEMA_MIGRATION_BOOTSTRAP: &str = include_str!("../migrations/000_schema_migrations.sql");
 const SNAPSHOT_MIGRATION: &str = include_str!("../migrations/001_snapshot.sql");
 const TRANSACTION_MIGRATION: &str = include_str!("../migrations/002_transactional.sql");
 const MULTI_TRANSACTION_MIGRATION: &str = include_str!("../migrations/003_multi_transactional.sql");
@@ -50,6 +51,7 @@ const TRADE_OUTBOX_MIGRATION: &str = include_str!("../migrations/005_trade_outbo
 const OPERATION_REGISTRY_MIGRATION: &str = include_str!("../migrations/006_operation_registry.sql");
 const HARDENING_MIGRATION: &str = include_str!("../migrations/007_hardening.sql");
 const MIGRATION_LOCK_ID: i64 = 8_390_417_203;
+pub const SNAPSHOT_PARTITION_COUNT: usize = 32;
 pub const DEFAULT_CACHE_FALLBACK_CONCURRENCY: usize = 16;
 pub const DEFAULT_CACHE_FALLBACK_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_CACHE_FALLBACK_CIRCUIT_FAILURE_THRESHOLD: u32 = 5;
@@ -389,6 +391,14 @@ pub enum StorageError {
     TradeProtocol(String),
     #[error("trade version is too large for {trade_id}")]
     TradeVersionTooLarge { trade_id: String },
+    #[error("snapshot partition layout is invalid: {0}")]
+    InvalidSnapshotPartitionLayout(String),
+    #[error("schema migration {version} is registered as {actual:?}, expected {expected:?}")]
+    SchemaMigrationConflict {
+        version: i32,
+        expected: &'static str,
+        actual: String,
+    },
 }
 
 /// Limits applied when Redis misses force a read from PostgreSQL.
@@ -917,6 +927,100 @@ async fn open_postgres(url: &str) -> Result<Client, StorageError> {
     Ok(client)
 }
 
+async fn apply_schema_migration(
+    transaction: &Transaction<'_>,
+    version: i32,
+    name: &'static str,
+    sql: &str,
+) -> Result<(), StorageError> {
+    if let Some(row) = transaction
+        .query_opt(
+            "SELECT name FROM dbproxy_schema_migrations WHERE version = $1",
+            &[&version],
+        )
+        .await?
+    {
+        let actual: String = row.get(0);
+        if actual != name {
+            return Err(StorageError::SchemaMigrationConflict {
+                version,
+                expected: name,
+                actual,
+            });
+        }
+        return Ok(());
+    }
+
+    transaction.batch_execute(sql).await?;
+    transaction
+        .execute(
+            "INSERT INTO dbproxy_schema_migrations (version, name) VALUES ($1, $2)",
+            &[&version, &name],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn validate_snapshot_partition_layout(
+    transaction: &Transaction<'_>,
+) -> Result<(), StorageError> {
+    let Some(parent) = transaction
+        .query_opt(
+            r#"
+SELECT relation.relkind::TEXT, pg_get_partkeydef(relation.oid)
+FROM pg_class AS relation
+WHERE relation.oid = to_regclass('dbproxy_snapshots')
+"#,
+            &[],
+        )
+        .await?
+    else {
+        return Err(StorageError::InvalidSnapshotPartitionLayout(
+            "dbproxy_snapshots does not exist".to_string(),
+        ));
+    };
+    let relation_kind: String = parent.get(0);
+    let partition_key: Option<String> = parent.get(1);
+    if relation_kind != "p" || partition_key.as_deref() != Some("HASH (namespace, record_key)") {
+        return Err(StorageError::InvalidSnapshotPartitionLayout(format!(
+            "expected a HASH (namespace, record_key) parent, found kind={relation_kind:?}, key={partition_key:?}"
+        )));
+    }
+
+    let rows = transaction
+        .query(
+            r#"
+SELECT child.relname, pg_get_expr(child.relpartbound, child.oid)
+FROM pg_inherits AS inheritance
+JOIN pg_class AS child ON child.oid = inheritance.inhrelid
+WHERE inheritance.inhparent = to_regclass('dbproxy_snapshots')
+"#,
+            &[],
+        )
+        .await?;
+    let actual = rows
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<HashSet<_>>();
+    let expected = (0..SNAPSHOT_PARTITION_COUNT)
+        .map(|remainder| {
+            (
+                format!("dbproxy_snapshots_p{remainder:02}"),
+                format!(
+                    "FOR VALUES WITH (modulus {SNAPSHOT_PARTITION_COUNT}, remainder {remainder})"
+                ),
+            )
+        })
+        .collect::<HashSet<_>>();
+    if actual != expected {
+        return Err(StorageError::InvalidSnapshotPartitionLayout(format!(
+            "expected {SNAPSHOT_PARTITION_COUNT} canonical hash partitions, found {}",
+            actual.len()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) type SharedPostgresClient = Arc<Mutex<ReconnectingPostgresClient>>;
 
 /// PostgreSQL 快照存储。
@@ -940,8 +1044,8 @@ impl PostgresSnapshotStore {
         Ok(store)
     }
 
-    /// 执行幂等的建表脚本；重复执行不会破坏已有数据。
-    /// Apply an idempotent schema migration without modifying existing data.
+    /// 在全局迁移锁下仅执行尚未登记的 schema migration。
+    /// Apply each schema migration once while holding the global migration lock.
     pub async fn migrate(&self) -> Result<(), StorageError> {
         let mut client = self.client.lock().await;
         client.ensure_connected().await?;
@@ -951,17 +1055,38 @@ impl PostgresSnapshotStore {
         transaction
             .execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])
             .await?;
-        transaction.batch_execute(SNAPSHOT_MIGRATION).await?;
-        transaction.batch_execute(TRANSACTION_MIGRATION).await?;
-        transaction
-            .batch_execute(MULTI_TRANSACTION_MIGRATION)
-            .await?;
-        transaction.batch_execute(CACHE_REPAIR_MIGRATION).await?;
-        transaction.batch_execute(TRADE_OUTBOX_MIGRATION).await?;
-        transaction
-            .batch_execute(OPERATION_REGISTRY_MIGRATION)
-            .await?;
-        transaction.batch_execute(HARDENING_MIGRATION).await?;
+        let migration_registry_exists: bool = transaction
+            .query_one(
+                "SELECT to_regclass('dbproxy_schema_migrations') IS NOT NULL",
+                &[],
+            )
+            .await?
+            .get(0);
+        if !migration_registry_exists {
+            transaction
+                .batch_execute(SCHEMA_MIGRATION_BOOTSTRAP)
+                .await?;
+        }
+        apply_schema_migration(&transaction, 1, "snapshot", SNAPSHOT_MIGRATION).await?;
+        validate_snapshot_partition_layout(&transaction).await?;
+        apply_schema_migration(&transaction, 2, "transactional", TRANSACTION_MIGRATION).await?;
+        apply_schema_migration(
+            &transaction,
+            3,
+            "multi-transactional",
+            MULTI_TRANSACTION_MIGRATION,
+        )
+        .await?;
+        apply_schema_migration(&transaction, 4, "cache-repair", CACHE_REPAIR_MIGRATION).await?;
+        apply_schema_migration(&transaction, 5, "trade-outbox", TRADE_OUTBOX_MIGRATION).await?;
+        apply_schema_migration(
+            &transaction,
+            6,
+            "operation-registry",
+            OPERATION_REGISTRY_MIGRATION,
+        )
+        .await?;
+        apply_schema_migration(&transaction, 7, "hardening", HARDENING_MIGRATION).await?;
         transaction.commit().await?;
         Ok(())
     }

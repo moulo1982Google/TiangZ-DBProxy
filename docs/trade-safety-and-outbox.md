@@ -89,4 +89,4 @@ Outbox 事件与交易在同一事务写入，因此不存在“交易已提交�
 
 死信不能盲目批量清除。修好 Redis/AOF 或事件消费者后，先检查 `last_error` 和目标内容，再通过 `PostgresCacheRepairQueue::requeue_dead_letter(record)` 或 `PostgresOutboxQueue::requeue_dead_letter(event_id)` 定点重放。数据库表中的死信记录本身也是故障证据，不应直接删除。
 
-历史数据归档、表分区和物理分库评估按当前决策延期，不属于本次实现。
+交易涉及的权威快照可以位于 `dbproxy_snapshots` 的不同 HASH 叶子分区，因为它们仍属于同一个 PostgreSQL 数据库事务。交易、账本和 Outbox 表本身的分区、历史归档及物理分库继续延期；当前实现不提供跨 database/cluster 原子事务。

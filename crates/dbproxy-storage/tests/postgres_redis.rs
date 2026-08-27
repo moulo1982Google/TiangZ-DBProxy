@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -13,8 +14,8 @@ use tiangz_dbproxy_core::{
 use tiangz_dbproxy_storage::{
     CacheFallbackConfig, CacheFallbackLockConfig, DEFAULT_OUTBOX_STREAM_PREFIX,
     PostgresSnapshotStore, RedisOutboxPublisher, RedisSnapshotBacklog, RedisSnapshotCache,
-    SnapshotBacklogAck, SnapshotCacheConfig, StorageError, StorageMetrics, TieredSnapshotStore,
-    TieredSnapshotStoreConfig,
+    SNAPSHOT_PARTITION_COUNT, SnapshotBacklogAck, SnapshotCacheConfig, StorageError,
+    StorageMetrics, TieredSnapshotStore, TieredSnapshotStoreConfig,
 };
 
 fn test_suffix() -> String {
@@ -23,6 +24,141 @@ fn test_suffix() -> String {
         .expect("system clock must be after Unix epoch")
         .as_nanos();
     format!("{}-{}", std::process::id(), nanos)
+}
+
+#[tokio::test]
+#[ignore = "需要本机 PostgreSQL；使用 --ignored 显式运行"]
+async fn postgres_snapshot_table_uses_32_hash_partitions() {
+    let postgres_url = std::env::var("DBPROXY_POSTGRES_URL")
+        .expect("DBPROXY_POSTGRES_URL must be set for the integration test");
+    let mut store = PostgresSnapshotStore::connect(&postgres_url)
+        .await
+        .expect("PostgreSQL and the partitioned snapshot schema must be available");
+    let (sql, connection) = tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            panic!("partition test PostgreSQL connection failed: {error}");
+        }
+    });
+
+    let parent = sql
+        .query_one(
+            "SELECT relkind::TEXT, pg_get_partkeydef(oid) FROM pg_class WHERE oid = 'dbproxy_snapshots'::regclass",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(parent.get::<_, String>(0), "p");
+    assert_eq!(parent.get::<_, String>(1), "HASH (namespace, record_key)");
+    let applied_migrations = sql
+        .query(
+            "SELECT version, name FROM dbproxy_schema_migrations ORDER BY version",
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get::<_, i32>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        applied_migrations,
+        vec![
+            (1, "snapshot".to_string()),
+            (2, "transactional".to_string()),
+            (3, "multi-transactional".to_string()),
+            (4, "cache-repair".to_string()),
+            (5, "trade-outbox".to_string()),
+            (6, "operation-registry".to_string()),
+            (7, "hardening".to_string()),
+        ]
+    );
+
+    let children = sql
+        .query(
+            r#"
+SELECT child.relname, pg_get_expr(child.relpartbound, child.oid)
+FROM pg_inherits AS inheritance
+JOIN pg_class AS child ON child.oid = inheritance.inhrelid
+WHERE inheritance.inhparent = 'dbproxy_snapshots'::regclass
+"#,
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<HashSet<_>>();
+    let expected = (0..SNAPSHOT_PARTITION_COUNT)
+        .map(|remainder| {
+            (
+                format!("dbproxy_snapshots_p{remainder:02}"),
+                format!(
+                    "FOR VALUES WITH (modulus {SNAPSHOT_PARTITION_COUNT}, remainder {remainder})"
+                ),
+            )
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(children, expected);
+
+    let namespace = format!("partition-integration-{}", test_suffix());
+    for index in 0..64 {
+        let request = SnapshotWrite {
+            request_id: format!("partition-write-{namespace}-{index}"),
+            record: RecordKey::new(&namespace, format!("record-{index}")).unwrap(),
+            schema: "integration.partitioned-snapshot".to_string(),
+            schema_version: 1,
+            payload: vec![u8::try_from(index).unwrap()],
+            expected_revision: Some(Revision::ZERO),
+            updated_at_unix_ms: u64::try_from(index).unwrap() + 1,
+        };
+        assert_eq!(
+            store.save(request).await.unwrap(),
+            SnapshotWriteOutcome::Applied {
+                revision: Revision(1)
+            }
+        );
+    }
+    let used_partitions = sql
+        .query(
+            r#"
+SELECT DISTINCT child.relname
+FROM dbproxy_snapshots AS snapshot
+JOIN pg_class AS child ON child.oid = snapshot.tableoid
+WHERE snapshot.namespace = $1
+"#,
+            &[&namespace],
+        )
+        .await
+        .unwrap();
+    assert!(
+        used_partitions.len() > 1,
+        "test snapshots must be routed into multiple physical partitions"
+    );
+    assert!(used_partitions.iter().all(|row| {
+        let name: String = row.get(0);
+        name.starts_with("dbproxy_snapshots_p")
+    }));
+
+    sql.execute(
+        "DELETE FROM dbproxy_cache_repairs WHERE namespace = $1",
+        &[&namespace],
+    )
+    .await
+    .unwrap();
+    sql.execute(
+        "DELETE FROM dbproxy_idempotency WHERE namespace = $1",
+        &[&namespace],
+    )
+    .await
+    .unwrap();
+    sql.execute(
+        "DELETE FROM dbproxy_snapshots WHERE namespace = $1",
+        &[&namespace],
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 # DBProxy 改进路线图与完成状态
 
-本文记录本轮改进的实际状态。顺序仍是先保证写入和恢复语义，再考虑容量扩展；历史归档、分区和物理分库已明确延期。
+本文记录本轮改进的实际状态。顺序仍是先保证写入和恢复语义，再逐步增加容量能力；当前已实现快照表库内分区，历史归档、其他表分区和物理分库继续延期。
 
 ## 已完成：输入与缓存护栏
 
@@ -68,16 +68,37 @@
 
 完整审视记录见[代码审视记录](dbproxy-code-review.md)。
 
+2026-08-27 的[100 玩家两小时故障演练](fault-soak-report-2026-08-27.md)已通过数据安全和自动恢复验收。演练后继续完成：
+
+- [x] 真实存储 readiness 依赖 PostgreSQL 与 Redis 健康，并增加 `/dependencies`、`dbproxy_dependency_up`、告警和 Dashboard；
+- [x] Redis backlog 的 AOF 入队、worker lease/ACK、stats 使用独立连接，消除跨职责连接锁等待；
+- [x] Rust 客户端增加兼容的 `connect_split(read_size, write_size)`，故障演练默认把 32 条连接拆为 24 读 + 8 写；
+- [x] 故障驱动跳过错过的周期，不在恢复后补跑并制造人工尖峰；
+- [x] 100 玩家 120 秒压缩回归再次通过，AOF 强杀前后 backlog 为 93/93，最终队列与死信归零。
+
+仍需在正式部署环境按目标 QPS 决定 PostgreSQL shard/连接池大小、读写池比例、worker 数量和告警阈值；没有容量证据时不引入协议多路复用或通用批处理框架。
+
+## 已完成：权威快照 HASH 分区
+
+- [x] `dbproxy_snapshots` 使用 `(namespace, record_key)` 建立 32 个原生 HASH 分区。
+- [x] DBProxy SQL 始终访问逻辑父表，不拼接物理子表名。
+- [x] 启动时验证父表类型、分区键以及全部 modulus/remainder 边界。
+- [x] 旧普通表明确拒绝启动，不静默假装分区已经生效。
+- [x] 真实 PostgreSQL 测试验证 catalog 布局和实际行路由。
+- [x] 分区数量属于 schema migration，不与 `storage.shards` 连接并发参数绑定。
+
+布局、开发库重建和未来扩容规则见[PostgreSQL 快照分区](postgresql-partitioning.md)。
+
 ## 明确延期
 
 以下项目本轮不做，也没有预埋复杂抽象：
 
 - [ ] 历史幂等回执、账本和 Outbox 的归档/保留期；
-- [ ] PostgreSQL 时间或哈希分区；
+- [ ] 交易、账本、Outbox、幂等回执等其他表的时间或哈希分区；
 - [ ] 物理分库、跨库事务或两阶段提交；
 - [ ] 多数据库方言 Adapter。
 
-以后只有在真实 PostgreSQL p95/p99、WAL、索引/VACUUM、备份窗口和恢复时间证明需要时，才进入单库分区或物理分库评估。`storage.shards` 仍只是同一数据库地址上的连接/并发分片。
+以后只有在真实 PostgreSQL p95/p99、WAL、索引/VACUUM、备份窗口和恢复时间证明需要时，才继续分区其他表或进入物理分库评估。`storage.shards` 仍只是同一数据库地址上的连接/并发分片。
 
 ## 尚需部署侧完成
 

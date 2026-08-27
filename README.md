@@ -14,7 +14,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 
 ## 当前状态
 
-`v0.6.0` 是当前工作版本。它在已有快照、关键事务、多 Endpoint 和跨记录原子事务之上，增加持久缓存修复队列、AOF 确认与重连、交易托管状态机、不可变账本和 PostgreSQL Outbox：
+`v0.6.0` 是当前工作版本。它在已有快照、关键事务、多 Endpoint 和跨记录原子事务之上，增加持久缓存修复队列、AOF 确认与重连、交易托管状态机、不可变账本、PostgreSQL Outbox 和权威快照 HASH 分区：
 
 - `RecordKey`：`namespace + key`
 - `Revision`：由 DBProxy 生成的单调版本号
@@ -27,6 +27,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 - `MultiRecordTransactionReceipt`：按`operation_id + 多个RecordKey`恢复整组提交结果；重复提交返回同一结果
 - `InMemoryTransactionalStore`：验证事务提交、CAS 冲突和原始结果重试语义
 - `PostgresSnapshotStore`：PostgreSQL 权威快照、CAS、幂等写入和关键事务收据
+- `dbproxy_snapshots`：按完整 RecordKey 路由到 32 个 PostgreSQL HASH 叶子分区，DBProxy 始终访问逻辑父表
 - `RedisSnapshotCache`：只缓存 PostgreSQL 已提交的快照
 - `TieredSnapshotStore`：先提交 PostgreSQL 和 durable repair，再尽力刷新 Redis；缓存失败不改变权威提交结果
 - `PostgresCacheRepairQueue`：与权威写入同事务提交的缓存修复目标，支持租约、指数退避、死信和定点重放
@@ -44,7 +45,7 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 - `fault_matrix.ps1`：在笔记本限额容器中显式停止/恢复 Redis/PostgreSQL，验证 AOF、积压、自动重连和缓存修复边界
 - `network_smoke.ps1`：验证 Rust SDK -> TCP -> DBProxy -> Redis/PostgreSQL 完整闭环
 
-TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transport适配；这些领域Payload与恢复逻辑不属于本仓库。交易 API 只提供通用状态/CAS/账本/Outbox 原子边界，所有权、价格、余额和风控仍由主工程的领域 Repository 决定。架构、演练和审视结果分别见[架构说明](docs/architecture.md)、[恢复手册](docs/durability-recovery-runbook.md)、[交易安全说明](docs/trade-safety-and-outbox.md)和[代码审视记录](docs/dbproxy-code-review.md)。
+TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transport适配；这些领域Payload与恢复逻辑不属于本仓库。交易 API 只提供通用状态/CAS/账本/Outbox 原子边界，所有权、价格、余额和风控仍由主工程的领域 Repository 决定。架构、演练、分区和审视结果分别见[架构说明](docs/architecture.md)、[恢复手册](docs/durability-recovery-runbook.md)、[两小时故障演练报告](docs/fault-soak-report-2026-08-27.md)、[PostgreSQL 快照分区](docs/postgresql-partitioning.md)、[交易安全说明](docs/trade-safety-and-outbox.md)和[代码审视记录](docs/dbproxy-code-review.md)。
 
 ## 启动配置
 
@@ -66,7 +67,7 @@ cargo run -p tiangz-dbproxy-server -- --config configs/local.json
 }
 ```
 
-配置`observability.listenAddr`后，DBProxy在独立HTTP端口提供`/live`、`/ready`和Prometheus格式的`/metrics`。本地Compose会启动Prometheus与Grafana并自动加载Dashboard；指标、告警和部署边界见[可观测性指南](OBSERVABILITY.md)。观测端口不要求业务认证，因此只能绑定本机或运维内网，禁止经Nginx暴露公网。
+配置`observability.listenAddr`后，DBProxy在独立HTTP端口提供`/live`、`/ready`、`/dependencies`和Prometheus格式的`/metrics`。真实存储模式只有在 PostgreSQL 与 Redis 都可达时才 Ready；`/dependencies` 会分别报告两者状态。本地Compose会启动Prometheus与Grafana并自动加载Dashboard；指标、告警和部署边界见[可观测性指南](OBSERVABILITY.md)。观测端口不要求业务认证，因此只能绑定本机或运维内网，禁止经Nginx暴露公网。
 
 仓库提供`configs/perf-memory-4.json`，固定使用4个Runtime工作线程和MemoryStub。该配置只测DBProxy自身的网络、协议、调度、分片锁和事务语义，不把PostgreSQL或Redis性能混入结果。
 
@@ -97,15 +98,26 @@ GitHub Actions 的普通分支和 Pull Request 只运行开发门禁；推送 `v
 ```powershell
 docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml up -d
 $env:DBPROXY_POSTGRES_URL = "postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz"
-$env:DBPROXY_REDIS_URL = "redis://:tiangz_dev@127.0.0.1:6379/0"
-cargo test -p tiangz-dbproxy-storage --test postgres_redis -- --ignored --nocapture
+$env:DBPROXY_REDIS_URL = "redis://:tiangz_dev@127.0.0.1:6379/15"
+cargo test -p tiangz-dbproxy-storage --test postgres_redis -- --ignored --nocapture --test-threads=1
 ```
+
+运行这组直接存储集成测试前先停止本机 DBProxy。测试会主动认领 backlog、缓存修复和 outbox 任务；若业务 worker 同时运行，会消费测试刚写入的任务并造成竞争性假失败。database 15 用于隔离测试数据，执行前仍应确认其中没有需要保留的数据。
 
 运行故障矩阵。该命令会短暂停止并恢复本机 PostgreSQL/Redis 容器，但不会删除数据卷：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/fault_matrix.ps1
 ```
+
+DBProxy 已启动后，用 100 个模拟玩家执行两小时真实 TCP 故障演练（会按时间表停止、强杀并恢复本机 PostgreSQL/Redis 容器）：
+
+```powershell
+cargo build --release --bin dbproxy_fault_soak
+powershell -ExecutionPolicy Bypass -File tools/run_fault_soak.ps1
+```
+
+正式运行前可用 `-DurationSeconds 120` 做同比压缩预演。完整阶段、断言和结果文件说明见[持久化与故障恢复手册](docs/durability-recovery-runbook.md)，2026-08-27 的 100 玩家正式结果见[两小时故障演练报告](docs/fault-soak-report-2026-08-27.md)。
 
 启动本机网络服务：
 
@@ -197,7 +209,7 @@ LoadTrade              读取交易当前版本、状态和不透明Payload
 LoadTradeTransaction   按operationId和tradeId读取已提交交易回执
 ```
 
-每条连接先校验`protocol_version + protocol_fingerprint + auth_token`，之后才允许 RPC。帧使用大端四字节长度前缀，默认上限 8 MiB。客户端连接内按顺序执行请求；`DbProxyClientPool`按`RecordKey`稳定分配到多条连接。服务端存储连接也按相同原则分片，避免所有玩家共享一个事务锁。
+每条连接先校验`protocol_version + protocol_fingerprint + auth_token`，之后才允许 RPC。帧使用大端四字节长度前缀，默认上限 8 MiB。客户端连接内按顺序执行请求；`DbProxyClientPool::connect`保持读写共享连接的兼容行为，`connect_split`可把读写分到独立连接组，避免慢写和 AOF ACK 阻塞读连接。两种模式都按`RecordKey`或 operation ID 稳定路由。服务端存储连接也按相同原则分片，避免所有玩家共享一个事务锁。
 
 详细错误码、ACK语义、Endpoint故障切换和跨记录限制见[网络协议说明](docs/network-protocol.md)。
 

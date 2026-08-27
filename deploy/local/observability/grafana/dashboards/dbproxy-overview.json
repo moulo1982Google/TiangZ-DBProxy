@@ -5,7 +5,7 @@
   "panels": [
     {
       "type": "stat",
-      "title": "Instances Ready",
+      "title": "Instances Ready (all dependencies)",
       "id": 1,
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
       "targets": [{ "expr": "sum(dbproxy_ready)", "legendFormat": "ready" }],
@@ -147,6 +147,16 @@
         { "expr": "sum by (instance, result) (rate(dbproxy_cache_repair_worker_polls_total[5m]))", "legendFormat": "{{instance}} repair {{result}}" },
         { "expr": "sum by (instance, result) (rate(dbproxy_outbox_worker_polls_total[5m]))", "legendFormat": "{{instance}} outbox {{result}}" }
       ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Required Dependency Health",
+      "id": 16,
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 52 },
+      "targets": [
+        { "expr": "dbproxy_dependency_up", "legendFormat": "{{instance}} {{dependency}}" }
+      ],
+      "fieldConfig": { "defaults": { "min": 0, "max": 1 }, "overrides": [] }
     }
   ],
   "refresh": "5s",
@@ -157,5 +167,5 @@
   "timezone": "browser",
   "title": "TiangZ DBProxy Overview",
   "uid": "tiangz-dbproxy-overview",
-  "version": 6
+  "version": 7
 }

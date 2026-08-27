@@ -1,0 +1,95 @@
+name: tiangz-dbproxy-chaos
+
+services:
+  postgres:
+    image: postgres:18.4-bookworm
+    container_name: tiangz-dbproxy-postgres
+    restart: unless-stopped
+    shm_size: 256mb
+    mem_limit: 2g
+    cpus: 1.5
+    environment:
+      POSTGRES_USER: ${DBPROXY_POSTGRES_USER:?DBPROXY_POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${DBPROXY_POSTGRES_PASSWORD:?DBPROXY_POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${DBPROXY_POSTGRES_DB:?DBPROXY_POSTGRES_DB is required}
+    command:
+      - postgres
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - min_wal_size=512MB
+      - -c
+      - wal_compression=on
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - log_min_duration_statement=500
+    ports:
+      - "127.0.0.1:${DBPROXY_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-chaos-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+    stop_grace_period: 30s
+
+  redis:
+    image: redis:8.8.1-trixie
+    container_name: tiangz-dbproxy-redis
+    restart: unless-stopped
+    mem_limit: 768m
+    cpus: 0.5
+    environment:
+      REDIS_PASSWORD: ${DBPROXY_REDIS_PASSWORD:?DBPROXY_REDIS_PASSWORD is required}
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --aof-use-rdb-preamble
+      - "yes"
+      - --auto-aof-rewrite-percentage
+      - "100"
+      - --auto-aof-rewrite-min-size
+      - 64mb
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+      - --requirepass
+      - ${DBPROXY_REDIS_PASSWORD:?DBPROXY_REDIS_PASSWORD is required}
+    ports:
+      - "127.0.0.1:${DBPROXY_REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-chaos-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    stop_grace_period: 15s
+
+volumes:
+  postgres-chaos-data:
+    name: tiangz-dbproxy-chaos-postgres-data
+  redis-chaos-data:
+    name: tiangz-dbproxy-chaos-redis-data

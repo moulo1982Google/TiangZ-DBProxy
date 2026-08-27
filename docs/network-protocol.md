@@ -70,7 +70,7 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 
 ## 连接、并发和 Endpoint
 
-一个 `DbProxyClient` 连接内只有一个在途请求。请求写出后超时会废弃连接，防止后续 RPC 读取旧响应。`DbProxyClientPool` 按 RecordKey 稳定路由到多条连接；服务端再按记录或 operation ID 路由到独立存储 shard。
+一个 `DbProxyClient` 连接内只有一个在途请求。请求写出后超时会废弃连接，防止后续 RPC 读取旧响应。`DbProxyClientPool::connect` 按 RecordKey 在一组共享读写连接中稳定路由，保持原有连接数和顺序语义；`connect_split(read_size, write_size)` 使用两组物理连接，读查询进入 read pool，写入、事务和 enqueue 进入 write pool，避免慢写造成跨用途队头阻塞。它不替代业务锁或 revision/CAS。服务端再按记录或 operation ID 路由到独立存储 shard。
 
 Rust 客户端接收有序 Endpoint 列表。连接建立失败、超时或断开才切换；Revision/Operation/Trade 等确定性远程错误不会触发切换。所有候选都必须共享同一 PostgreSQL/Redis，否则幂等和 Revision 契约不成立。
 
@@ -82,4 +82,4 @@ PostgreSQL 已断连接在下一次操作前做 2 秒有界重连；当前失败
 - 协议双版本滚动窗口；
 - 跨 PostgreSQL database/cluster 的分布式事务；
 - Outbox 下游消费组和消费者实现；
-- 历史归档、分区和物理分库。
+- 历史归档、其他表分区和物理分库。`dbproxy_snapshots` 的库内 HASH 分区对协议透明。

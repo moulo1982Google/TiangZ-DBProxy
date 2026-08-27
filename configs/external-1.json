@@ -10,7 +10,7 @@
     "shutdownGraceMs": 5000
   },
   "runtime": {
-    "workerThreads": 4
+    "workerThreads": 2
   },
   "storage": {
     "backend": "postgresRedis",

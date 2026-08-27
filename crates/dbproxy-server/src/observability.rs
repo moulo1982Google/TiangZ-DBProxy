@@ -216,6 +216,9 @@ pub struct DbProxyMetrics {
     started_at: Instant,
     live: AtomicBool,
     ready: AtomicBool,
+    dependency_readiness_required: AtomicBool,
+    postgres_dependency_up: AtomicBool,
+    redis_dependency_up: AtomicBool,
     accepted_connections: AtomicU64,
     active_connections: AtomicU64,
     connection_errors: AtomicU64,
@@ -267,6 +270,9 @@ impl Default for DbProxyMetrics {
             started_at: Instant::now(),
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
+            dependency_readiness_required: AtomicBool::new(false),
+            postgres_dependency_up: AtomicBool::new(true),
+            redis_dependency_up: AtomicBool::new(true),
             accepted_connections: AtomicU64::new(0),
             active_connections: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
@@ -318,6 +324,22 @@ impl DbProxyMetrics {
     /// 标记业务监听和存储后端已经就绪。 / Mark the business listener and storage backend ready.
     pub fn mark_ready(&self) {
         self.ready.store(true, Ordering::Release);
+    }
+
+    /// Require both durable-storage dependencies to be healthy before `/ready` returns success.
+    /// Memory backends leave this disabled because they have no external dependencies.
+    pub fn require_healthy_dependencies(&self) {
+        self.dependency_readiness_required
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn postgres_dependency_updated(&self, healthy: bool) {
+        self.postgres_dependency_up
+            .store(healthy, Ordering::Release);
+    }
+
+    pub(crate) fn redis_dependency_updated(&self, healthy: bool) {
+        self.redis_dependency_up.store(healthy, Ordering::Release);
     }
 
     /// 停机开始后立即撤销ready。 / Withdraw readiness as soon as shutdown begins.
@@ -498,7 +520,35 @@ impl DbProxyMetrics {
     }
 
     fn is_ready(&self) -> bool {
-        self.is_live() && self.ready.load(Ordering::Acquire)
+        self.is_live() && self.ready.load(Ordering::Acquire) && self.dependencies_healthy()
+    }
+
+    fn dependencies_healthy(&self) -> bool {
+        !self.dependency_readiness_required.load(Ordering::Acquire)
+            || (self.postgres_dependency_up.load(Ordering::Acquire)
+                && self.redis_dependency_up.load(Ordering::Acquire))
+    }
+
+    fn dependencies_json(&self) -> String {
+        if !self.dependency_readiness_required.load(Ordering::Acquire) {
+            return "{\"status\":\"not-configured\"}".to_string();
+        }
+        let postgres = if self.postgres_dependency_up.load(Ordering::Acquire) {
+            "up"
+        } else {
+            "down"
+        };
+        let redis = if self.redis_dependency_up.load(Ordering::Acquire) {
+            "up"
+        } else {
+            "down"
+        };
+        let status = if self.dependencies_healthy() {
+            "healthy"
+        } else {
+            "degraded"
+        };
+        format!("{{\"status\":\"{status}\",\"postgresql\":\"{postgres}\",\"redis\":\"{redis}\"}}")
     }
 
     pub(crate) fn prometheus(&self, storage_backend: &str) -> String {
@@ -512,6 +562,26 @@ impl DbProxyMetrics {
         writeln!(output, "dbproxy_live {}", u8::from(self.is_live())).unwrap();
         metric_header(&mut output, "dbproxy_ready", "DBProxy readiness", "gauge");
         writeln!(output, "dbproxy_ready {}", u8::from(self.is_ready())).unwrap();
+        if self.dependency_readiness_required.load(Ordering::Acquire) {
+            metric_header(
+                &mut output,
+                "dbproxy_dependency_up",
+                "Whether a required DBProxy storage dependency is reachable",
+                "gauge",
+            );
+            writeln!(
+                output,
+                "dbproxy_dependency_up{{dependency=\"postgresql\"}} {}",
+                u8::from(self.postgres_dependency_up.load(Ordering::Acquire))
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "dbproxy_dependency_up{{dependency=\"redis\"}} {}",
+                u8::from(self.redis_dependency_up.load(Ordering::Acquire))
+            )
+            .unwrap();
+        }
         metric_header(
             &mut output,
             "dbproxy_uptime_seconds",
@@ -1146,6 +1216,14 @@ async fn serve_http(
             "application/json",
             "{\"status\":\"not-ready\"}".to_string(),
         ),
+        "/dependencies" if metrics.dependencies_healthy() => {
+            ("200 OK", "application/json", metrics.dependencies_json())
+        }
+        "/dependencies" => (
+            "503 Service Unavailable",
+            "application/json",
+            metrics.dependencies_json(),
+        ),
         "/metrics" => (
             "200 OK",
             "text/plain; version=0.0.4",
@@ -1282,6 +1360,31 @@ mod tests {
         assert!(!output.contains("hot-key"));
     }
 
+    #[test]
+    fn required_dependency_health_controls_readiness_and_metrics() {
+        let metrics = DbProxyMetrics::default();
+        metrics.require_healthy_dependencies();
+        metrics.mark_ready();
+        assert!(metrics.is_ready());
+
+        metrics.redis_dependency_updated(false);
+        assert!(!metrics.is_ready());
+        assert_eq!(
+            metrics.dependencies_json(),
+            "{\"status\":\"degraded\",\"postgresql\":\"up\",\"redis\":\"down\"}"
+        );
+        let output = metrics.prometheus("postgresRedis");
+        assert!(output.contains("dbproxy_ready 0"));
+        assert!(output.contains("dbproxy_dependency_up{dependency=\"postgresql\"} 1"));
+        assert!(output.contains("dbproxy_dependency_up{dependency=\"redis\"} 0"));
+
+        metrics.redis_dependency_updated(true);
+        metrics.postgres_dependency_updated(false);
+        assert!(!metrics.is_ready());
+        metrics.postgres_dependency_updated(true);
+        assert!(metrics.is_ready());
+    }
+
     #[tokio::test]
     async fn http_server_exposes_ready_and_prometheus_routes() {
         let metrics = Arc::new(DbProxyMetrics::default());
@@ -1306,6 +1409,21 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("dbproxy_ready 1"));
+
+        metrics.require_healthy_dependencies();
+        metrics.redis_dependency_updated(false);
+        let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+        stream
+            .write_all(b"GET /dependencies HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(
+            response.contains("{\"status\":\"degraded\",\"postgresql\":\"up\",\"redis\":\"down\"}")
+        );
 
         shutdown.send(true).unwrap();
         server.stop().await;

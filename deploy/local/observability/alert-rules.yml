@@ -19,6 +19,15 @@ groups:
           summary: "DBProxy instance is not ready"
           description: "{{ $labels.instance }} is alive but has withdrawn readiness."
 
+      - alert: TiangZDbProxyDependencyDown
+        expr: dbproxy_dependency_up == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "DBProxy required dependency is unavailable"
+          description: "{{ $labels.instance }} cannot reach {{ $labels.dependency }}; readiness has been withdrawn."
+
       - alert: TiangZDbProxyStorageErrors
         expr: sum by (instance) (rate(dbproxy_rpc_errors_total{code="storage_unavailable"}[2m])) > 0
         for: 1m

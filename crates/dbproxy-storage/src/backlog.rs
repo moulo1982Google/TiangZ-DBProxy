@@ -128,16 +128,26 @@ pub struct RedisSnapshotBacklogStats {
 /// 基于 Redis AOF 的普通快照持久积压队列。
 #[derive(Clone)]
 pub struct RedisSnapshotBacklog {
-    connection: Arc<Mutex<ConnectionManager>>,
+    enqueue_connection: Arc<Mutex<ConnectionManager>>,
+    worker_connection: Arc<Mutex<ConnectionManager>>,
+    stats_connection: Arc<Mutex<ConnectionManager>>,
 }
 
 impl RedisSnapshotBacklog {
     /// 连接 Redis；不会自动改变 Redis 的持久化配置。
     /// Connect to Redis; persistence configuration remains a deployment responsibility.
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
-        let connection = open_redis_connection_manager(url).await?;
+        // Keep AOF acknowledgement, lease processing, and observability independent. A slow
+        // WAITAOF or a reconnect in one role must not hold up either of the other two roles.
+        let (enqueue_connection, worker_connection, stats_connection) = tokio::try_join!(
+            open_redis_connection_manager(url),
+            open_redis_connection_manager(url),
+            open_redis_connection_manager(url),
+        )?;
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            enqueue_connection: Arc::new(Mutex::new(enqueue_connection)),
+            worker_connection: Arc::new(Mutex::new(worker_connection)),
+            stats_connection: Arc::new(Mutex::new(stats_connection)),
         })
     }
 
@@ -213,7 +223,7 @@ impl RedisSnapshotBacklog {
         let script = Script::new(
             "redis.call('SET', KEYS[1], ARGV[1]); redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3]); return 1",
         );
-        let mut connection = self.connection.lock().await;
+        let mut connection = self.enqueue_connection.lock().await;
         let _: i64 = script
             .key(entry_key)
             .key(PENDING_KEY)
@@ -251,7 +261,7 @@ return (#ARGV - 1) / 3
         for (entry_key, encoded, member) in prepared {
             invocation.arg(entry_key).arg(encoded).arg(member);
         }
-        let mut connection = self.connection.lock().await;
+        let mut connection = self.enqueue_connection.lock().await;
         let accepted: i64 = invocation.invoke_async(&mut *connection).await?;
         if accepted != i64::try_from(requests.len()).unwrap_or(i64::MAX) {
             return Err(StorageError::BacklogProtocol(
@@ -265,7 +275,7 @@ return (#ARGV - 1) / 3
     /// Read backlog depth and the age of the oldest pending item without mutating the queue.
     pub async fn stats(&self) -> Result<RedisSnapshotBacklogStats, StorageError> {
         let now = Self::now_unix_ms()?;
-        let mut connection = self.connection.lock().await;
+        let mut connection = self.stats_connection.lock().await;
         let pending: i64 = redis::cmd("ZCARD")
             .arg(PENDING_KEY)
             .query_async(&mut *connection)
@@ -316,7 +326,7 @@ return (#ARGV - 1) / 3
         let now = Self::now_unix_ms()?;
         let deadline = Self::lease_deadline(now, lease_ms)?;
         let script = Script::new(CLAIM_SCRIPT);
-        let mut connection = self.connection.lock().await;
+        let mut connection = self.worker_connection.lock().await;
         let values: Vec<Vec<u8>> = script
             .key(PENDING_KEY)
             .key(PROCESSING_KEY)
@@ -368,7 +378,7 @@ return (#ARGV - 1) / 3
         let now = Self::now_unix_ms()?;
         let deadline = Self::lease_deadline(now, lease_ms)?;
         let script = Script::new(RENEW_SCRIPT);
-        let mut connection = self.connection.lock().await;
+        let mut connection = self.worker_connection.lock().await;
         let result: i64 = script
             .key(PROCESSING_KEY)
             .key(LEASES_KEY)
@@ -389,7 +399,7 @@ return (#ARGV - 1) / 3
     ) -> Result<SnapshotBacklogAck, StorageError> {
         let now = Self::now_unix_ms()?;
         let script = Script::new(ACK_SCRIPT);
-        let mut connection = self.connection.lock().await;
+        let mut connection = self.worker_connection.lock().await;
         let result: i64 = script
             .key(PROCESSING_KEY)
             .key(LEASES_KEY)
@@ -416,7 +426,7 @@ return (#ARGV - 1) / 3
     pub async fn release(&self, lease: &SnapshotBacklogLease) -> Result<bool, StorageError> {
         let now = Self::now_unix_ms()?;
         let script = Script::new(RELEASE_SCRIPT);
-        let mut connection = self.connection.lock().await;
+        let mut connection = self.worker_connection.lock().await;
         let result: i64 = script
             .key(PROCESSING_KEY)
             .key(LEASES_KEY)

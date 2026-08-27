@@ -7,6 +7,19 @@ player ID, `RecordKey`, namespace, request ID, or operation ID is used as a labe
 result bytes by the fixed RPC operation name, making payload amplification visible without exposing
 business identifiers.
 
+## Readiness and dependency health
+
+`dbproxy_live` reports process liveness. For the PostgreSQL/Redis backend, `dbproxy_ready` is one
+only while the service lifecycle is ready and both required dependencies passed the most recent
+storage-metrics sample. `dbproxy_dependency_up{dependency="postgresql"}` and
+`dbproxy_dependency_up{dependency="redis"}` expose the individual bounded states. The
+`/dependencies` endpoint returns the same state as JSON and uses HTTP 503 while degraded.
+
+Dependency state reuses the five-second durable-queue sampling loop rather than opening extra
+probe connections. A transition can therefore take up to roughly one sample interval. A failed
+PostgreSQL sample skips the second queue query in that poll, avoiding duplicate reconnect attempts.
+Memory backends do not require these dependencies and return `not-configured` from the endpoint.
+
 ## Cache and fallback counters
 
 - `dbproxy_cache_hits_total` and `dbproxy_cache_misses_total` count the initial logical cache
@@ -86,7 +99,8 @@ positive cache entry.
 - `dbproxy_backlog_processing` is the number of leased snapshots currently being written.
 - `dbproxy_backlog_oldest_pending_age_seconds` is the age of the oldest pending item. It is zero
   when the pending set is empty. These gauges are sampled every five seconds by the DBProxy
-  process; a Redis sampling error leaves the last successful value in place and is logged.
+  process; a Redis sampling error leaves the last successful value in place, marks the Redis
+  dependency down, and is logged.
 
 The local alert rules warn when pending depth exceeds 1000, the oldest item exceeds five minutes,
 fallback reads keep timing out, or background refreshes keep failing. Stale hits are intentionally

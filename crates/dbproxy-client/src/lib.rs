@@ -195,43 +195,111 @@ pub struct DbProxyClient {
     config: ClientConfig,
 }
 
-/// 多连接客户端池；同一个 RecordKey 稳定落到同一连接，不同记录可以并行请求。
-/// Multi-connection pool; one RecordKey stays on one connection while different records run in parallel.
+/// 多连接客户端池；同一个 RecordKey 在每类连接中稳定路由，不同记录可以并行请求。
+/// Multi-connection pool; one RecordKey is stable within each connection class while different
+/// records run in parallel.
 #[derive(Clone)]
 pub struct DbProxyClientPool {
-    clients: Arc<[DbProxyClient]>,
+    read_clients: Arc<[DbProxyClient]>,
+    write_clients: Arc<[DbProxyClient]>,
 }
 
 impl DbProxyClientPool {
+    /// Create one shared connection class. This preserves the original ordering and connection
+    /// count: reads and writes for the same routing key use the same TCP connection.
     pub async fn connect(config: ClientConfig, size: usize) -> Result<Self, ClientError> {
+        let clients = Self::connect_clients(config, size, "client pool size is zero").await?;
+        Ok(Self {
+            read_clients: Arc::clone(&clients),
+            write_clients: clients,
+        })
+    }
+
+    /// Create independent read and write connection classes.
+    ///
+    /// A slow write, reconnect, or durable AOF acknowledgement can no longer hold the mutex of a
+    /// read connection. Callers must still serialize game rules where required and use revision/CAS
+    /// for correctness; this method only isolates transport head-of-line blocking.
+    pub async fn connect_split(
+        config: ClientConfig,
+        read_size: usize,
+        write_size: usize,
+    ) -> Result<Self, ClientError> {
+        if read_size == 0 {
+            return Err(ClientError::InvalidConfig("read pool size is zero"));
+        }
+        if write_size == 0 {
+            return Err(ClientError::InvalidConfig("write pool size is zero"));
+        }
+        let read_clients =
+            Self::connect_clients(config.clone(), read_size, "read pool size is zero").await?;
+        let write_clients =
+            Self::connect_clients(config, write_size, "write pool size is zero").await?;
+        Ok(Self {
+            read_clients,
+            write_clients,
+        })
+    }
+
+    async fn connect_clients(
+        config: ClientConfig,
+        size: usize,
+        zero_error: &'static str,
+    ) -> Result<Arc<[DbProxyClient]>, ClientError> {
         if size == 0 {
-            return Err(ClientError::InvalidConfig("client pool size is zero"));
+            return Err(ClientError::InvalidConfig(zero_error));
         }
         let mut clients = Vec::with_capacity(size);
         for _ in 0..size {
             clients.push(DbProxyClient::connect(config.clone()).await?);
         }
-        Ok(Self {
-            clients: clients.into(),
-        })
+        Ok(clients.into())
     }
 
+    /// Total number of physical TCP connections owned by this pool.
     pub fn len(&self) -> usize {
-        self.clients.len()
+        if Arc::ptr_eq(&self.read_clients, &self.write_clients) {
+            self.read_clients.len()
+        } else {
+            self.read_clients.len() + self.write_clients.len()
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.clients.is_empty()
+        self.read_clients.is_empty() || self.write_clients.is_empty()
     }
 
-    fn client(&self, record: &RecordKey) -> &DbProxyClient {
+    pub fn read_len(&self) -> usize {
+        self.read_clients.len()
+    }
+
+    pub fn write_len(&self) -> usize {
+        self.write_clients.len()
+    }
+
+    pub fn is_split(&self) -> bool {
+        !Arc::ptr_eq(&self.read_clients, &self.write_clients)
+    }
+
+    fn client_for_record<'a>(
+        clients: &'a [DbProxyClient],
+        record: &RecordKey,
+    ) -> &'a DbProxyClient {
         let mut hasher = StableHasher::default();
         record.hash(&mut hasher);
-        &self.clients[(hasher.finish() as usize) % self.clients.len()]
+        &clients[(hasher.finish() as usize) % clients.len()]
+    }
+
+    fn read_client(&self, record: &RecordKey) -> &DbProxyClient {
+        Self::client_for_record(&self.read_clients, record)
+    }
+
+    fn write_client(&self, record: &RecordKey) -> &DbProxyClient {
+        Self::client_for_record(&self.write_clients, record)
     }
 
     pub async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, ClientError> {
-        self.client(record).load(record).await
+        self.read_client(record).load(record).await
     }
 
     pub async fn load_multi(
@@ -241,11 +309,11 @@ impl DbProxyClientPool {
         let first = records
             .first()
             .ok_or(ClientError::InvalidConfig("batch load records are empty"))?;
-        self.client(first).load_multi(records).await
+        self.read_client(first).load_multi(records).await
     }
 
     pub async fn save(&self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, ClientError> {
-        self.client(&request.record).save(request).await
+        self.write_client(&request.record).save(request).await
     }
 
     pub async fn save_multi(
@@ -255,11 +323,13 @@ impl DbProxyClientPool {
         let first = requests
             .first()
             .ok_or(ClientError::InvalidConfig("batch save writes are empty"))?;
-        self.client(&first.record).save_multi(requests).await
+        self.write_client(&first.record).save_multi(requests).await
     }
 
     pub async fn enqueue_snapshot(&self, request: SnapshotWrite) -> Result<(), ClientError> {
-        self.client(&request.record).enqueue_snapshot(request).await
+        self.write_client(&request.record)
+            .enqueue_snapshot(request)
+            .await
     }
 
     pub async fn enqueue_multi_snapshot(
@@ -269,7 +339,7 @@ impl DbProxyClientPool {
         let first = requests
             .first()
             .ok_or(ClientError::InvalidConfig("batch enqueue writes are empty"))?;
-        self.client(&first.record)
+        self.write_client(&first.record)
             .enqueue_multi_snapshot(requests)
             .await
     }
@@ -278,7 +348,7 @@ impl DbProxyClientPool {
         &self,
         request: TransactionalWrite,
     ) -> Result<TransactionalWriteOutcome, ClientError> {
-        self.client(&request.record)
+        self.write_client(&request.record)
             .apply_transaction(request)
             .await
     }
@@ -288,7 +358,7 @@ impl DbProxyClientPool {
         operation_id: &str,
         record: &RecordKey,
     ) -> Result<Option<TransactionReceipt>, ClientError> {
-        self.client(record)
+        self.read_client(record)
             .load_transaction(operation_id, record)
             .await
     }
@@ -297,7 +367,7 @@ impl DbProxyClientPool {
         &self,
         request: MultiRecordTransactionalWrite,
     ) -> Result<MultiRecordTransactionalWriteOutcome, ClientError> {
-        self.client_for_operation(&request.operation_id)
+        self.write_client_for_operation(&request.operation_id)
             .apply_multi_transaction(request)
             .await
     }
@@ -307,13 +377,13 @@ impl DbProxyClientPool {
         operation_id: &str,
         records: &[RecordKey],
     ) -> Result<Option<MultiRecordTransactionReceipt>, ClientError> {
-        self.client_for_operation(operation_id)
+        self.read_client_for_operation(operation_id)
             .load_multi_transaction(operation_id, records)
             .await
     }
 
     pub async fn load_trade(&self, trade_id: &str) -> Result<Option<TradeEnvelope>, ClientError> {
-        self.client_for_operation(trade_id)
+        self.read_client_for_operation(trade_id)
             .load_trade(trade_id)
             .await
     }
@@ -322,7 +392,7 @@ impl DbProxyClientPool {
         &self,
         request: TradeTransaction,
     ) -> Result<TradeTransactionOutcome, ClientError> {
-        self.client_for_operation(&request.operation_id)
+        self.write_client_for_operation(&request.operation_id)
             .apply_trade_transaction(request)
             .await
     }
@@ -332,15 +402,26 @@ impl DbProxyClientPool {
         operation_id: &str,
         trade_id: &str,
     ) -> Result<Option<TradeReceipt>, ClientError> {
-        self.client_for_operation(operation_id)
+        self.read_client_for_operation(operation_id)
             .load_trade_transaction(operation_id, trade_id)
             .await
     }
 
-    fn client_for_operation(&self, operation_id: &str) -> &DbProxyClient {
+    fn client_for_operation<'a>(
+        clients: &'a [DbProxyClient],
+        operation_id: &str,
+    ) -> &'a DbProxyClient {
         let mut hasher = StableHasher::default();
         operation_id.hash(&mut hasher);
-        &self.clients[(hasher.finish() as usize) % self.clients.len()]
+        &clients[(hasher.finish() as usize) % clients.len()]
+    }
+
+    fn read_client_for_operation(&self, operation_id: &str) -> &DbProxyClient {
+        Self::client_for_operation(&self.read_clients, operation_id)
+    }
+
+    fn write_client_for_operation(&self, operation_id: &str) -> &DbProxyClient {
+        Self::client_for_operation(&self.write_clients, operation_id)
     }
 }
 
@@ -1496,5 +1577,22 @@ mod tests {
         let mut tampered = receipt;
         tampered.records[0].new_revision = Revision(2);
         assert!(!trade_receipt_matches_request(&tampered, &request));
+    }
+
+    #[tokio::test]
+    async fn split_pool_rejects_zero_sized_connection_classes_before_connecting() {
+        let config = ClientConfig::new(
+            "127.0.0.1:1",
+            "secret-client-token",
+            "split-pool-validation",
+        );
+        assert!(matches!(
+            DbProxyClientPool::connect_split(config.clone(), 0, 1).await,
+            Err(ClientError::InvalidConfig("read pool size is zero"))
+        ));
+        assert!(matches!(
+            DbProxyClientPool::connect_split(config, 1, 0).await,
+            Err(ClientError::InvalidConfig("write pool size is zero"))
+        ));
     }
 }

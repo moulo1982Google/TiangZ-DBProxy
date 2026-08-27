@@ -100,6 +100,9 @@ async fn run_server(
     server_config.handshake_timeout = config.handshake_timeout;
     server_config.shutdown_grace = config.shutdown_grace;
     let metrics = Arc::new(DbProxyMetrics::default());
+    if durable_backend.is_some() {
+        metrics.require_healthy_dependencies();
+    }
     server_config.metrics = Arc::clone(&metrics);
     let server = DbProxyServer::bind(server_config, server_backend).await?;
     let actual_addr = server.local_addr()?;

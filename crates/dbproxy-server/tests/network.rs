@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use tiangz_dbproxy_client::{
     ClientConfig, ClientConnectionOutcome, ClientError, ClientObserver, ClientRequestOutcome,
-    DbProxyClient,
+    DbProxyClient, DbProxyClientPool,
 };
 use tiangz_dbproxy_core::{
     AsyncMultiRecordTransactionStore, InMemoryMultiRecordTransactionStore, InMemorySnapshotStore,
@@ -541,6 +541,39 @@ async fn multi_record_transaction_is_atomic_idempotent_and_recoverable() {
     assert_eq!(receipt.operation_id, "trade-network-1");
     assert_eq!(receipt.records.len(), 2);
     assert_eq!(receipt.result, b"trade-complete");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn split_client_pool_routes_reads_and_writes_over_independent_connections() {
+    const TOKEN: &str = "network-split-pool-token";
+    let server = TestServer::start(TOKEN).await;
+    let mut config = ClientConfig::new(&server.endpoint, TOKEN, "network-split-pool-test");
+    config.request_timeout = Duration::from_secs(1);
+    let pool = DbProxyClientPool::connect_split(config, 2, 3)
+        .await
+        .unwrap();
+
+    assert!(pool.is_split());
+    assert_eq!(pool.read_len(), 2);
+    assert_eq!(pool.write_len(), 3);
+    assert_eq!(pool.len(), 5);
+    assert!(!pool.is_empty());
+
+    let record = RecordKey::new("split-pool", "1001").unwrap();
+    let mut write = snapshot("split-pool-request", Some(Revision::ZERO));
+    write.record = record.clone();
+    assert_eq!(
+        pool.save(write).await.unwrap(),
+        SnapshotWriteOutcome::Applied {
+            revision: Revision(1)
+        }
+    );
+    assert_eq!(
+        pool.load(&record).await.unwrap().unwrap().revision,
+        Revision(1)
+    );
+
     server.stop().await;
 }
 

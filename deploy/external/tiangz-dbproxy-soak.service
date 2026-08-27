@@ -1,0 +1,21 @@
+[Unit]
+Description=TiangZ DBProxy seven-day correctness workload
+After=network-online.target tiangz-dbproxy@1.service tiangz-dbproxy@2.service
+Wants=tiangz-dbproxy@1.service tiangz-dbproxy@2.service
+
+[Service]
+Type=simple
+User=tiangz
+Group=tiangz
+WorkingDirectory=/opt/tiangz-dbproxy
+EnvironmentFile=/etc/tiangz/dbproxy.env
+ExecStart=/opt/tiangz-dbproxy/dbproxy_fault_soak --endpoint 127.0.0.1:7800 --failover-endpoint 127.0.0.1:7801 --players 100 --duration 604800 --cycle-ms 1000 --read-pool-size 24 --write-pool-size 8 --trade-interval-cycles 600 --report-interval 60 --validation-timeout 300
+Restart=no
+Nice=5
+CPUWeight=50
+MemoryHigh=256M
+MemoryMax=512M
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

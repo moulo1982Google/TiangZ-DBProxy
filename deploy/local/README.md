@@ -17,6 +17,8 @@ postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz
 redis://:tiangz_dev@127.0.0.1:6379/0
 ```
 
+当前新建数据库会把 `dbproxy_snapshots` 初始化为 32 个 HASH 分区。旧开发卷中的普通快照表不会自动改写；DBProxy 会明确拒绝该 schema。确认本地数据不再需要后，按本文后面的 `down -v` 命令删除数据卷并重新启动。分区布局和校验规则见[PostgreSQL 快照分区](../../docs/postgresql-partitioning.md)。
+
 启动：
 
 ```powershell
@@ -77,6 +79,8 @@ Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File
 客户端把 `127.0.0.1:7800` 配为首选，把 `127.0.0.1:7801` 配为备用。两份配置必须继续指向同一 PostgreSQL/Redis；停掉其中一个只验证客户端切换，不应删除共享数据卷。
 
 两个实例的指标分别位于`http://127.0.0.1:9090/metrics`和`http://127.0.0.1:9091/metrics`。只启动一个实例时，Grafana会明确显示另一个Target为Down，这是预期状态。
+
+同一端口还提供 `/live`、`/ready` 和 `/dependencies`。真实存储模式下 PostgreSQL 或 Redis 任一不可达都会在最近一次 5 秒采样后令 `/ready` 与 `/dependencies` 返回 503；后者的 JSON 会指出具体依赖。`dbproxy_dependency_up` 已进入本地告警和 Grafana 面板。
 
 停止容器但保留数据：
 

@@ -5,7 +5,7 @@ DBProxy使用独立HTTP监听暴露Prometheus指标，Prometheus负责抓取和�
 ```text
 TiangZ Process -> DBProxy TCP 7800/7801
                        |
-                       +-> /live /ready /metrics 9090/9091
+                       +-> /live /ready /dependencies /metrics 9090/9091
                                       |
                                   Prometheus
                                       |
@@ -38,6 +38,7 @@ Grafana会自动配置Prometheus数据源并加载`TiangZ DBProxy Overview`，�
 
 | 指标 | 含义 |
 | --- | --- |
+| `dbproxy_dependency_up{dependency="postgresql|redis"}` | 真实存储必要依赖的最近一次 5 秒采样结果；任一为 0 时 readiness 撤销 |
 | `dbproxy_cache_hits_total` / `dbproxy_cache_misses_total` | Initial logical Redis cache result per requested record; hits include fresh, stale, and negative results |
 | `dbproxy_cache_negative_hits_total` / `dbproxy_cache_negative_writes_total` | Negative-cache hits and missing-record markers written to Redis |
 | `dbproxy_cache_stale_hits_total` | Stale snapshots served during the stale-while-revalidate window |
@@ -58,7 +59,7 @@ Grafana会自动配置Prometheus数据源并加载`TiangZ DBProxy Overview`，�
 | `dbproxy_outbox_pending` / `dbproxy_outbox_processing` / `dbproxy_outbox_dead_lettered` | PostgreSQL transactional Outbox state |
 | `dbproxy_outbox_oldest_age_seconds` | Age of the oldest unpublished non-dead event |
 | `dbproxy_outbox_worker_polls_total` | Outbox worker outcomes using the same fixed result labels |
-| `dbproxy_live` / `dbproxy_ready` | 实例存活与接流量状态 |
+| `dbproxy_live` / `dbproxy_ready` | 实例存活与接流量状态；真实存储 Ready 还要求 PostgreSQL/Redis 都 up |
 | `dbproxy_connections_total` / `dbproxy_connections_active` | TCP连接累计值与当前值 |
 | `dbproxy_handshake_rejections_total` | 按协议、令牌或客户端名称分类的握手拒绝 |
 | `dbproxy_requests_in_flight` | 当前执行中的RPC数量 |
@@ -80,6 +81,7 @@ Grafana会自动配置Prometheus数据源并加载`TiangZ DBProxy Overview`，�
 
 - 实例30秒无法抓取；
 - 实例持续30秒未Ready；
+- PostgreSQL 或 Redis 必要依赖持续30秒不可达；
 - 存储错误持续出现；
 - P99持续5分钟超过100ms；
 - Redis普通快照Backlog持续处理失败；
@@ -100,5 +102,7 @@ Grafana会自动配置Prometheus数据源并加载`TiangZ DBProxy Overview`，�
 两个DBProxy实例使用不同观测端口，例如`127.0.0.1:9090`和`127.0.0.1:9091`。Prometheus可以部署在同机，也可以通过防火墙允许专用监控网段访问。业务TCP、观测HTTP和PostgreSQL/Redis端口必须分别管理，不能因为Grafana需要指标就把任一端口暴露公网。
 
 Dashboard新增缓存修复/Outbox状态与worker结果面板。它展示的是DBProxy服务和TiangZ客户端行为；PostgreSQL与Redis自身的连接池、慢查询、Buffer、AOF rewrite和实例资源仍应使用云厂商监控或官方Exporter，DBProxy不会冒充数据库内部指标的权威来源。
+
+`/live` 只回答进程事件循环是否存活；`/ready` 用于接流量，真实存储模式要求生命周期就绪且两个必要依赖最近一次采样均成功；`/dependencies` 在降级时返回 503，并给出 `postgresql`、`redis` 的 `up/down`。检测存在最长约一个 5 秒采样周期，容器刚停机的瞬间不保证立即摘流。MemoryBackend 没有外部依赖，`/dependencies` 返回 `not-configured`。
 
 本地Prometheus还会抓取TiangZ all-in-one的`7600`以及`cluster-dbproxy`中启用持久化的Process健康端口。未启动的开发拓扑会显示为Down，但不会触发`tiangz-dbproxy`实例告警；正式部署应通过服务发现或独立静态目标清单替换这些本机示例端口。

@@ -27,7 +27,7 @@ DBProxy-1 ---------------- DBProxy-2       无状态对等实例
 
 ## 数据地址与版本
 
-`RecordKey = namespace + key` 只是通用记录地址，不等于 PostgreSQL 表名或物理分片。所有快照当前落在 `dbproxy_snapshots`，以 `(namespace, record_key)` 为主键。
+`RecordKey = namespace + key` 只是通用记录地址，不等于 PostgreSQL 表名或物理分片。所有快照都通过逻辑父表 `dbproxy_snapshots` 访问，以 `(namespace, record_key)` 为主键；PostgreSQL 按相同两列把数据路由到 32 个 HASH 叶子分区。分区对协议和 Repository 透明，详细布局见[PostgreSQL 快照分区](postgresql-partitioning.md)。
 
 每次权威修改生成单调 `Revision`。带 `expected_revision` 的写入使用 Compare-And-Swap：不匹配时返回实际版本并回滚，调用方重新读取后由业务决定合并或拒绝。`request_id`/`operation_id` 是调用方生成的稳定幂等键；相同 ID 只能重放完全相同的请求。
 
@@ -109,7 +109,7 @@ Outbox 内容和交易在同一 PostgreSQL 事务中写入。交易先取得 `to
 
 ## 连接与并发
 
-服务端按 RecordKey/operation ID 稳定路由到固定 `TieredSnapshotStore` 分片，每个分片有独立 PostgreSQL/Redis 连接和共享存储指标。缓存修复与 Outbox 使用单独的 PostgreSQL 维护连接，不占住请求分片锁。
+服务端按 RecordKey/operation ID 稳定路由到固定 `TieredSnapshotStore` 连接分片，每个分片有独立 PostgreSQL/Redis 连接和共享存储指标。所有连接分片仍指向同一组 PostgreSQL/Redis；它们与 PostgreSQL 的 32 个快照表分区、未来物理分库都不是同一概念。缓存修复与 Outbox 使用单独的 PostgreSQL 维护连接，不占住请求分片锁。
 
 Redis 使用自动重连的 `ConnectionManager`。PostgreSQL 连接发现关闭后进行 2 秒有界重连；当前在途操作仍返回失败，下一次使用原幂等 ID 的调用才走新连接，避免底层擅自重放结果未知的写入。
 
@@ -117,7 +117,8 @@ Redis 使用自动重连的 `ConnectionManager`。PostgreSQL 连接发现关闭�
 
 迁移在 PostgreSQL advisory lock 下按顺序执行：
 
-- `001_snapshot.sql`：权威快照与快照幂等回执；
+- `000_schema_migrations.sql`：记录已经提交的 schema 版本，避免每个连接重复执行 DDL；
+- `001_snapshot.sql`：32 个 HASH 分区的权威快照父表、叶子表与快照幂等回执；
 - `002_transactional.sql`：单记录事务回执；
 - `003_multi_transactional.sql`：多记录事务头和记录回执；
 - `004_cache_repair.sql`：持久缓存修复队列；
@@ -135,4 +136,4 @@ Redis 使用自动重连的 `ConnectionManager`。PostgreSQL 连接发现关闭�
 
 仍属于部署或后续工作：TLS/mTLS、令牌轮换、租户隔离/配额、PostgreSQL/Redis 多副本高可用、Outbox 下游消费组、备份恢复和密钥系统。观测 HTTP 端口没有业务认证，只能绑定本机或运维内网。
 
-按当前决策，历史数据归档、表分区和物理分库评估暂不实施；代码和迁移中没有提前加入这些结构。
+当前只实现 `dbproxy_snapshots` 的库内 HASH 分区。历史数据归档、其他表分区和物理分库仍未实施；尤其没有把同库事务伪装成跨库事务。

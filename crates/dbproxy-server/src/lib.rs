@@ -778,31 +778,51 @@ pub async fn run_storage_metrics_poller(
         }
         metrics.storage_metrics_updated(backend.metrics().snapshot());
         match backend.backlog_stats().await {
-            Ok(stats) => metrics.backlog_depth_updated(
-                stats.pending,
-                stats.processing,
-                stats.oldest_pending_age_ms,
-            ),
-            Err(error) => tracing::warn!(%error, "failed to sample snapshot backlog metrics"),
+            Ok(stats) => {
+                metrics.redis_dependency_updated(true);
+                metrics.backlog_depth_updated(
+                    stats.pending,
+                    stats.processing,
+                    stats.oldest_pending_age_ms,
+                );
+            }
+            Err(error) => {
+                metrics.redis_dependency_updated(false);
+                tracing::warn!(%error, "failed to sample snapshot backlog metrics");
+            }
         }
-        match backend.cache_repair_stats().await {
-            Ok(stats) => metrics.cache_repair_depth_updated(
-                stats.pending,
-                stats.processing,
-                stats.dead_lettered,
-                stats.oldest_age_ms,
-            ),
-            Err(error) => tracing::warn!(%error, "failed to sample cache repair metrics"),
-        }
-        match backend.outbox_stats().await {
-            Ok(stats) => metrics.outbox_depth_updated(
-                stats.pending,
-                stats.processing,
-                stats.dead_lettered,
-                stats.oldest_age_ms,
-            ),
-            Err(error) => tracing::warn!(%error, "failed to sample outbox metrics"),
-        }
+        let postgres_healthy = match backend.cache_repair_stats().await {
+            Ok(stats) => {
+                metrics.cache_repair_depth_updated(
+                    stats.pending,
+                    stats.processing,
+                    stats.dead_lettered,
+                    stats.oldest_age_ms,
+                );
+                match backend.outbox_stats().await {
+                    Ok(stats) => {
+                        metrics.outbox_depth_updated(
+                            stats.pending,
+                            stats.processing,
+                            stats.dead_lettered,
+                            stats.oldest_age_ms,
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to sample outbox metrics");
+                        false
+                    }
+                }
+            }
+            Err(error) => {
+                // Both queues share one maintenance connection. Avoid a second reconnect attempt
+                // in the same poll when PostgreSQL is already known to be unavailable.
+                tracing::warn!(%error, "failed to sample cache repair metrics");
+                false
+            }
+        };
+        metrics.postgres_dependency_updated(postgres_healthy);
         tokio::select! {
             _ = sleep(interval) => {}
             changed = shutdown.changed() => {

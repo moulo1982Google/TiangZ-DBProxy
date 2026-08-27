@@ -1,6 +1,6 @@
 # DBProxy 代码审视记录
 
-本轮审视范围包括 Core 契约、PostgreSQL/Redis 适配器、网络协议、服务端 worker、Rust 客户端、MemoryBackend、TypeScript SDK、配置、监控和本地故障工具。目标是查找不安全、重复、过度抽象或难以运维的实现，不包含历史归档、分区和物理分库。
+本轮审视范围包括 Core 契约、PostgreSQL/Redis 适配器、网络协议、服务端 worker、Rust 客户端、MemoryBackend、TypeScript SDK、配置、监控和本地故障工具。目标是查找不安全、重复、过度抽象或难以运维的实现。后续增加的快照 HASH 分区也沿用同一原则；历史归档、其他表分区和物理分库不在本轮扩张。
 
 ## 已修复的高风险问题
 
@@ -54,6 +54,12 @@ MemoryBackend 的快照幂等指纹曾遗漏 `updated_at_unix_ms`，账本 Posti
 
 Rust 已升级协议 v2，但 TypeScript 生成脚本仍硬编码 v1，测试实际捕获了漂移。生成器现在从 Rust `PROTOCOL_VERSION` 提取权威值，并继续从 proto 计算 SHA-256 指纹。
 
+### 分区配置静默漂移
+
+只修改 `CREATE TABLE IF NOT EXISTS` 会让已有普通 `dbproxy_snapshots` 被静默保留，服务虽然启动成功，实际却没有分区。现在迁移先拒绝旧普通表，Rust 启动检查再验证父表分区键以及 32 个子表的名称和边界。分区数量没有加入实例 JSON，也没有在请求路径动态建表，避免多个实例配置不一致或运行时 DDL。
+
+真实并行集成测试还发现：仅用 advisory lock 串行“整套幂等 DDL”并不够。先完成迁移的连接可以立即开始业务写入，而排队的下一个连接随后重跑 `CREATE TABLE`/触发器 DDL，仍可能与业务行锁形成锁环。现在 `dbproxy_schema_migrations` 在同一事务记录 001 到 007；后续连接只读取版本并验证快照布局，不再重复执行已提交 DDL。
+
 ## 已收敛的冗长/过度设计
 
 ### 构造函数爆炸
@@ -92,7 +98,12 @@ Rust 已升级协议 v2，但 TypeScript 生成脚本仍硬编码 v1，测试实
 ## 已知边界，不在本轮扩张
 
 - PostgreSQL 当前每个 shard 是一条串行 Client，不是动态连接池；容量应先通过真实指标决定是否更换池实现。
+- 真实存储的 `/ready` 已要求 PostgreSQL 与 Redis 最近一次采样都健康，`/dependencies` 和 `dbproxy_dependency_up` 可定位具体依赖；状态转换存在最长约一个 5 秒采样周期，不承诺瞬时故障检测。
+- Rust 客户端仍保留共享连接的 `connect(size)` 兼容入口；故障敏感调用方应显式使用 `connect_split(read_size, write_size)`。两种模式的单条连接仍串行，没有在协议中引入多路复用。
+- Redis backlog 已把 enqueue、worker lease/ACK 和 stats 拆为三条连接；每个角色内部仍使用 mutex 保证脚本与 `WAITAOF` 的顺序。高吞吐路径继续优先使用批量 API，是否增加 enqueue 连接分片由正式延迟数据决定。
 - Redis Stream 没有在 publisher 中强制裁剪，因为盲目 `MAXLEN` 可能在消费者落后时丢事件；消费组和保留策略必须由部署明确配置。
 - 账本没有余额聚合 API，也没有替业务校验透支/物品所有权。
 - 共享令牌不是零信任方案；TLS/mTLS、轮换、租户配额属于生产安全建设。
-- 历史表保留、归档、分区和物理分库已按要求延期，不为不确定的未来容量提前增加抽象。
+- 当前仅 `dbproxy_snapshots` 使用固定 32 个库内 HASH 分区；历史表保留、归档、其他表分区和物理分库仍按要求延期。
+
+上述故障期边界、随后改进及实测数据见[100 玩家两小时故障演练报告](fault-soak-report-2026-08-27.md)。
