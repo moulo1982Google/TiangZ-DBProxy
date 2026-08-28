@@ -49,6 +49,11 @@ services:
       retries: 24
       start_period: 20s
     stop_grace_period: 30s
+    logging:
+      driver: local
+      options:
+        max-size: "32m"
+        max-file: "5"
 
   redis:
     image: redis:8.8.1-trixie
@@ -87,6 +92,11 @@ services:
       retries: 24
       start_period: 10s
     stop_grace_period: 15s
+    logging:
+      driver: local
+      options:
+        max-size: "32m"
+        max-file: "5"
 
 volumes:
   postgres-chaos-data:

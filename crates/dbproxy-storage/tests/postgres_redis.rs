@@ -319,6 +319,138 @@ async fn postgres_and_redis_preserve_snapshot_semantics() {
 }
 
 #[tokio::test]
+#[ignore = "需要本机 PostgreSQL 和 Redis；使用 --ignored 显式运行"]
+async fn batch_save_preserves_partial_results_and_batches_cache_updates() {
+    let postgres_url = std::env::var("DBPROXY_POSTGRES_URL")
+        .expect("DBPROXY_POSTGRES_URL must be set for the integration test");
+    let redis_url = std::env::var("DBPROXY_REDIS_URL")
+        .expect("DBPROXY_REDIS_URL must be set for the integration test");
+    let suffix = test_suffix();
+    let records = (0..4)
+        .map(|index| {
+            RecordKey::new(format!("batch-integration-{suffix}"), index.to_string()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let requests = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| SnapshotWrite {
+            request_id: format!("batch-request-{suffix}-{index}"),
+            record: record.clone(),
+            schema: "batch.snapshot".to_string(),
+            schema_version: 1,
+            payload: format!("payload-{index}").into_bytes(),
+            expected_revision: Some(if index == 3 {
+                Revision(9)
+            } else {
+                Revision::ZERO
+            }),
+            updated_at_unix_ms: 1,
+        })
+        .collect::<Vec<_>>();
+
+    let mut store = TieredSnapshotStore::connect(&postgres_url, &redis_url)
+        .await
+        .unwrap();
+    let outcomes = store.save_batch(requests.clone()).await.unwrap();
+    assert_eq!(outcomes.len(), requests.len());
+    for outcome in outcomes.iter().take(3) {
+        assert_eq!(
+            outcome.as_ref().unwrap(),
+            &SnapshotWriteOutcome::Applied {
+                revision: Revision(1)
+            }
+        );
+    }
+    assert!(matches!(
+        &outcomes[3],
+        Err(StorageError::Core(StoreError::RevisionConflict {
+            expected: Some(Revision(9)),
+            actual: Revision::ZERO,
+            ..
+        }))
+    ));
+
+    let cache = RedisSnapshotCache::connect(&redis_url).await.unwrap();
+    for (index, record) in records.iter().take(3).enumerate() {
+        let cached = cache.get(record).await.unwrap().unwrap();
+        assert_eq!(cached.revision, Revision(1));
+        assert_eq!(cached.payload, format!("payload-{index}").into_bytes());
+    }
+
+    // Existing rows with a matching non-zero expected revision must take the UPDATE branch.
+    // This guards against filtering the INSERT source before PostgreSQL can reach ON CONFLICT.
+    let updates = requests
+        .iter()
+        .take(3)
+        .enumerate()
+        .map(|(index, request)| SnapshotWrite {
+            request_id: format!("batch-update-{suffix}-{index}"),
+            payload: format!("updated-{index}").into_bytes(),
+            expected_revision: Some(Revision(1)),
+            updated_at_unix_ms: 2,
+            ..request.clone()
+        })
+        .collect::<Vec<_>>();
+    let update_outcomes = store.save_batch(updates).await.unwrap();
+    assert_eq!(update_outcomes.len(), 3);
+    for (index, outcome) in update_outcomes.iter().enumerate() {
+        assert_eq!(
+            outcome.as_ref().unwrap(),
+            &SnapshotWriteOutcome::Applied {
+                revision: Revision(2)
+            }
+        );
+        let cached = cache.get(&records[index]).await.unwrap().unwrap();
+        assert_eq!(cached.revision, Revision(2));
+        assert_eq!(cached.payload, format!("updated-{index}").into_bytes());
+    }
+
+    // The failed entry's provisional idempotency claim must not survive the shared transaction.
+    let mut retry = requests[3].clone();
+    retry.expected_revision = Some(Revision::ZERO);
+    assert_eq!(
+        store.save(retry).await.unwrap(),
+        SnapshotWriteOutcome::Applied {
+            revision: Revision(1)
+        }
+    );
+}
+
+#[tokio::test]
+#[ignore = "需要本机 Redis；使用 --ignored 显式运行"]
+async fn redis_backlog_claim_ack_and_release_support_batches() {
+    let redis_url = std::env::var("DBPROXY_REDIS_URL")
+        .expect("DBPROXY_REDIS_URL must be set for the integration test");
+    let backlog = RedisSnapshotBacklog::connect(&redis_url).await.unwrap();
+    let suffix = test_suffix();
+    let writes = (0..3)
+        .map(|index| SnapshotWrite {
+            request_id: format!("backlog-batch-request-{suffix}-{index}"),
+            record: RecordKey::new(format!("backlog-batch-{suffix}"), index.to_string()).unwrap(),
+            schema: "backlog.batch".to_string(),
+            schema_version: 1,
+            payload: vec![index],
+            expected_revision: None,
+            updated_at_unix_ms: 1,
+        })
+        .collect::<Vec<_>>();
+    backlog.enqueue_multi(&writes).await.unwrap();
+    let leases = backlog.claim_multi(30_000, writes.len()).await.unwrap();
+    assert_eq!(leases.len(), writes.len());
+    let released = backlog.release_multi(&leases[..1]).await.unwrap();
+    assert_eq!(released, vec![true]);
+    let acknowledged = backlog.ack_multi(&leases[1..]).await.unwrap();
+    assert_eq!(acknowledged, vec![SnapshotBacklogAck::Removed; 2]);
+    let reclaimed = backlog.claim_multi(30_000, 1).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(
+        backlog.ack_multi(&reclaimed).await.unwrap(),
+        vec![SnapshotBacklogAck::Removed]
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires local PostgreSQL and Redis; run explicitly with --ignored"]
 async fn distributed_fallback_lock_rechecks_cache_before_postgres() {
     let postgres_url = std::env::var("DBPROXY_POSTGRES_URL")

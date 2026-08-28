@@ -75,6 +75,10 @@
 - [x] Rust 客户端增加兼容的 `connect_split(read_size, write_size)`，故障演练默认把 32 条连接拆为 24 读 + 8 写；
 - [x] 故障驱动跳过错过的周期，不在恢复后补跑并制造人工尖峰；
 - [x] 100 玩家 120 秒压缩回归再次通过，AOF 强杀前后 backlog 为 93/93，最终队列与死信归零。
+- [x] `SaveMultiSnapshot` 按连接 shard 合并 PostgreSQL commit，批量执行 revision-aware Redis 回写与 cache-repair ACK；逻辑冲突仍逐条返回，数据库错误整批回滚。
+- [x] 普通快照用条件 UPDATE CTE 与受限 INSERT 同时执行 expected Revision；缺失记录只接受无条件写或 expected Revision 0，已有记录的非零匹配 revision 仍能正常推进，并由真实 PostgreSQL 回归锁定两条边界。
+- [x] backlog worker 每轮最多批量 claim/save/ACK/release 64 条，降低 PostgreSQL 恢复后的 commit 与 Redis 往返放大。
+- [x] multi transaction/trade 首次提交后直接构造已提交缓存快照；幂等重复批量读取当前版本，既移除逐条回读又不允许旧 Payload 覆盖新 Revision。
 
 仍需在正式部署环境按目标 QPS 决定 PostgreSQL shard/连接池大小、读写池比例、worker 数量和告警阈值；没有容量证据时不引入协议多路复用或通用批处理框架。
 

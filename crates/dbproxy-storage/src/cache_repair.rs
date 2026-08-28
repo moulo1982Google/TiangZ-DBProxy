@@ -61,6 +61,43 @@ impl PostgresCacheRepairQueue {
         Ok(removed == 1)
     }
 
+    /// Remove repair targets covered by a successfully written cache batch in one statement.
+    pub async fn acknowledge_cached_multi(
+        &self,
+        snapshots: &[tiangz_dbproxy_core::SnapshotEnvelope],
+    ) -> Result<u64, StorageError> {
+        if snapshots.is_empty() {
+            return Ok(0);
+        }
+        let namespaces = snapshots
+            .iter()
+            .map(|snapshot| snapshot.record.namespace.clone())
+            .collect::<Vec<_>>();
+        let keys = snapshots
+            .iter()
+            .map(|snapshot| snapshot.record.key.clone())
+            .collect::<Vec<_>>();
+        let revisions = snapshots
+            .iter()
+            .map(|snapshot| required_revision_to_i64(&snapshot.record, snapshot.revision))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut client = self.client.lock().await;
+        client.ensure_connected().await?;
+        Ok(client
+            .execute(
+                r#"
+DELETE FROM dbproxy_cache_repairs AS repair
+USING unnest($1::TEXT[], $2::TEXT[], $3::BIGINT[])
+    AS cached(namespace, record_key, revision)
+WHERE repair.namespace = cached.namespace
+  AND repair.record_key = cached.record_key
+  AND repair.target_revision <= cached.revision
+"#,
+                &[&namespaces, &keys, &revisions],
+            )
+            .await?)
+    }
+
     pub async fn claim(
         &self,
         worker_id: &str,

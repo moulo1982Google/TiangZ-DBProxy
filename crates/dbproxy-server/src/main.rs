@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config = load_config(config_path)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&config.log_filter)?)
+        .with_ansi(false)
         .init();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.runtime_worker_threads)

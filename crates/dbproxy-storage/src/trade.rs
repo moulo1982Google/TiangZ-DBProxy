@@ -2,10 +2,9 @@
 
 use async_trait::async_trait;
 use tiangz_dbproxy_core::{
-    AsyncSnapshotStore, AsyncTradeStore, LedgerPosting, OutboxEvent, RecordKey, Revision,
-    SnapshotEnvelope, StoreError, TradeEnvelope, TradeReceipt, TradeState, TradeTransaction,
-    TradeTransactionOutcome, TransactionRecordReceipt, TransactionalRecordWrite,
-    normalize_trade_transaction,
+    AsyncTradeStore, LedgerPosting, OutboxEvent, RecordKey, Revision, StoreError, TradeEnvelope,
+    TradeReceipt, TradeState, TradeTransaction, TradeTransactionOutcome, TransactionRecordReceipt,
+    TransactionalRecordWrite, normalize_trade_transaction,
 };
 use tokio_postgres::{GenericClient, Row};
 
@@ -621,21 +620,43 @@ impl AsyncTradeStore for TieredSnapshotStore {
         &mut self,
         request: TradeTransaction,
     ) -> Result<TradeTransactionOutcome, Self::Error> {
-        let records = request
-            .writes
-            .iter()
-            .map(|write| write.record.clone())
-            .collect::<Vec<_>>();
+        let committed_writes = request.writes.clone();
         let outcome = self.postgres.apply_trade(request).await?;
-        for record in records {
-            let snapshot: SnapshotEnvelope =
-                self.postgres.load(&record).await?.ok_or_else(|| {
-                    StorageError::MissingAfterWrite {
-                        record: record.clone(),
-                    }
-                })?;
-            self.synchronize_committed_cache(&snapshot).await;
-        }
+        let snapshots = if matches!(&outcome, TradeTransactionOutcome::Duplicate(_)) {
+            let records = committed_writes
+                .iter()
+                .map(|write| write.record.clone())
+                .collect::<Vec<_>>();
+            self.postgres
+                .load_multi(&records)
+                .await?
+                .into_iter()
+                .zip(records)
+                .map(|(snapshot, record)| {
+                    snapshot.ok_or(StorageError::MissingAfterWrite { record })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let revisions = outcome
+                .receipt()
+                .records
+                .iter()
+                .map(|record| (record.record.clone(), record.new_revision))
+                .collect::<std::collections::HashMap<_, _>>();
+            committed_writes
+                .iter()
+                .map(|write| {
+                    let revision = revisions.get(&write.record).copied().ok_or_else(|| {
+                        StorageError::PersistenceProtocol(format!(
+                            "trade result is missing {:?}",
+                            write.record
+                        ))
+                    })?;
+                    Ok(super::snapshot_from_transactional_write(write, revision))
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?
+        };
+        self.synchronize_committed_cache_multi(&snapshots).await;
         Ok(outcome)
     }
 }

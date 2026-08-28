@@ -39,7 +39,7 @@ DBProxy-1 ---------------- DBProxy-2       无状态对等实例
 | `EnqueueSnapshot` / `EnqueueMultiSnapshot` | 允许有限回退、可按 RecordKey 合并的状态 | Redis backlog 已通过本机 AOF 确认，PostgreSQL 尚未提交 |
 | `ApplyTransaction` / `ApplyMultiTransaction` / `ApplyTradeTransaction` | 货币、背包、奖励、交易等关键状态 | PostgreSQL 事务及持久回执已提交；缓存可异步修复 |
 
-`SaveMultiSnapshot` 是批量调用，允许部分成功；它不是跨记录事务。`Enqueue*` 禁止携带 CAS，不能用于关键经济数据。
+`SaveMultiSnapshot` 是批量调用，允许部分成功；它不是跨记录业务事务。服务端会先按连接 shard 分组，同一 shard 内的普通快照共享一次 PostgreSQL transaction/commit，以减少每条记录一次 WAL flush/commit 的开销；Revision 或幂等冲突只拒绝对应条目，SQL/连接级错误则回滚该 shard 整批，调用方继续用原 request ID 重试。需要“要么全部成功、要么全部失败”的背包/货币/交易仍必须使用 `ApplyMultiTransaction` 或 `ApplyTradeTransaction`。`Enqueue*` 禁止携带 CAS，不能用于关键经济数据。
 
 ## PostgreSQL 权威写入与缓存修复
 
@@ -58,7 +58,7 @@ Redis revision-aware fast-path refresh
 
 这消除了“数据库已经提交，但 Redis 失败导致客户端收到模糊失败”的旧语义。修复表按 `RecordKey` 合并，只保留最高 `target_revision`；worker 使用 PostgreSQL 时钟、短租约和 `FOR UPDATE SKIP LOCKED`，指数退避后进入死信。旧 lease 只能 ACK 自己领取的目标，不能删除并发产生的新版本。
 
-缓存写入由 Lua 脚本比较 Revision，旧快照不能覆盖新快照。读取失败、编码损坏或 miss 会回源 PostgreSQL；缓存预热失败不影响权威读取结果。
+缓存写入由 Lua 脚本比较 Revision，旧快照不能覆盖新快照。普通批量快照、multi transaction 和 trade 提交后的缓存刷新都使用一次批量 Lua 调用，再用一条 PostgreSQL `unnest` 删除已覆盖的修复目标；如果任一步失败，事务内预先写入的修复行仍然存在。读取失败、编码损坏或 miss 会回源 PostgreSQL；缓存预热失败不影响权威读取结果。
 
 ## 缓存击穿与生命周期
 
@@ -83,7 +83,7 @@ PostgreSQL SaveSnapshot -> Applied/Duplicate
 ack -> remove
 ```
 
-PostgreSQL 失败时主动 release；worker 崩溃时 lease 到期回收。相同 RecordKey 的新快照替换旧内容，旧 processing ACK 返回 `Superseded`，不能误删新值。详细演练见[持久化与故障恢复手册](durability-recovery-runbook.md)。
+PostgreSQL 失败时主动 release；worker 崩溃时 lease 到期回收。worker 每次最多批量领取 64 条，按 shard 合并 PostgreSQL commit，并批量 ACK/release，避免积压恢复时每条快照产生一套 Redis 往返和数据库提交。相同 RecordKey 的新快照替换旧内容，旧 processing ACK 返回 `Superseded`，不能误删新值。详细演练见[持久化与故障恢复手册](durability-recovery-runbook.md)。
 
 ## 关键事务层次
 

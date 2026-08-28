@@ -190,6 +190,11 @@ impl StorageMetrics {
         self.cache_writes.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn cache_writes(&self, count: usize) {
+        self.cache_writes
+            .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
     fn cache_write_error(&self) {
         self.cache_write_errors.fetch_add(1, Ordering::Relaxed);
     }
@@ -282,6 +287,28 @@ redis.call('SET', KEYS[3], '1', 'PX', ARGV[3])
 redis.call('PEXPIRE', KEYS[1], ARGV[4])
 redis.call('PEXPIRE', KEYS[2], ARGV[4])
 return 1
+"#;
+
+const REVISION_AWARE_CACHE_PUT_MULTI_SCRIPT: &str = r#"
+local stored = 0
+for index = 1, #ARGV, 4 do
+    local key_index = index
+    local current = redis.call('GET', KEYS[key_index + 1])
+    local incoming_revision = ARGV[index + 1]
+    if not current
+        or string.len(current) < string.len(incoming_revision)
+        or (string.len(current) == string.len(incoming_revision) and current <= incoming_revision)
+    then
+        redis.call('SET', KEYS[key_index], ARGV[index])
+        redis.call('SET', KEYS[key_index + 1], incoming_revision)
+        redis.call('DEL', KEYS[key_index + 3])
+        redis.call('SET', KEYS[key_index + 2], '1', 'PX', ARGV[index + 2])
+        redis.call('PEXPIRE', KEYS[key_index], ARGV[index + 3])
+        redis.call('PEXPIRE', KEYS[key_index + 1], ARGV[index + 3])
+        stored = stored + 1
+    end
+end
+return stored
 "#;
 
 const NEGATIVE_CACHE_PUT_SCRIPT: &str = r#"
@@ -731,6 +758,52 @@ fn snapshot_from_row(row: &Row) -> Result<SnapshotEnvelope, StorageError> {
     })
 }
 
+fn snapshot_from_write(request: &SnapshotWrite, revision: Revision) -> SnapshotEnvelope {
+    SnapshotEnvelope {
+        record: request.record.clone(),
+        schema: request.schema.clone(),
+        schema_version: request.schema_version,
+        revision,
+        payload: request.payload.clone(),
+        updated_at_unix_ms: request.updated_at_unix_ms,
+    }
+}
+
+fn snapshot_write_outcome_revision(outcome: SnapshotWriteOutcome) -> Revision {
+    match outcome {
+        SnapshotWriteOutcome::Applied { revision }
+        | SnapshotWriteOutcome::Duplicate { revision } => revision,
+    }
+}
+
+fn snapshot_from_transactional_write(
+    write: &TransactionalRecordWrite,
+    revision: Revision,
+) -> SnapshotEnvelope {
+    SnapshotEnvelope {
+        record: write.record.clone(),
+        schema: write.schema.clone(),
+        schema_version: write.schema_version,
+        revision,
+        payload: write.payload.clone(),
+        updated_at_unix_ms: write.updated_at_unix_ms,
+    }
+}
+
+fn snapshot_from_single_transactional_write(
+    write: &TransactionalWrite,
+    revision: Revision,
+) -> SnapshotEnvelope {
+    SnapshotEnvelope {
+        record: write.record.clone(),
+        schema: write.schema.clone(),
+        schema_version: write.schema_version,
+        revision,
+        payload: write.payload.clone(),
+        updated_at_unix_ms: write.updated_at_unix_ms,
+    }
+}
+
 fn idempotency_matches(
     row: &Row,
     request: &SnapshotWrite,
@@ -1134,6 +1207,226 @@ impl PostgresSnapshotStore {
             .map(|record| snapshots.remove(record))
             .collect())
     }
+
+    /// Save independent snapshots with one PostgreSQL transaction/commit while preserving a
+    /// result for every record. Expected revision and idempotency conflicts only reject their
+    /// own entry; a PostgreSQL/protocol failure aborts the complete batch so callers can retry
+    /// every request with the same request IDs.
+    pub async fn save_batch(
+        &mut self,
+        requests: &[SnapshotWrite],
+    ) -> Result<Vec<Result<SnapshotWriteOutcome, StorageError>>, StorageError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut prepared = Vec::with_capacity(requests.len());
+        let mut results = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect::<Vec<Option<Result<SnapshotWriteOutcome, StorageError>>>>();
+        for (index, request) in requests.iter().enumerate() {
+            let values = (|| -> Result<_, StorageError> {
+                validate_request(request)?;
+                Ok((
+                    schema_version_to_i64(request.schema_version),
+                    revision_to_i64(&request.record, request.expected_revision)?,
+                    timestamp_to_i64(&request.record, request.updated_at_unix_ms)?,
+                ))
+            })();
+            match values {
+                Ok(values) => prepared.push(Some(values)),
+                Err(error) => {
+                    prepared.push(None);
+                    results[index] = Some(Err(error));
+                }
+            }
+        }
+        if prepared.iter().all(Option::is_none) {
+            return Ok(results
+                .into_iter()
+                .map(|result| result.expect("invalid batch entry must have a result"))
+                .collect());
+        }
+
+        let mut client = self.client.lock().await;
+        client.ensure_connected().await?;
+        let transaction = client.transaction().await?;
+        for (index, values) in prepared.into_iter().enumerate() {
+            let Some((schema_version, expected, updated_at)) = values else {
+                continue;
+            };
+            match save_snapshot_in_transaction(
+                &transaction,
+                &requests[index],
+                schema_version,
+                expected,
+                updated_at,
+            )
+            .await
+            {
+                Ok(outcome) => results[index] = Some(Ok(outcome)),
+                Err(error @ StorageError::Core(_)) => results[index] = Some(Err(error)),
+                Err(error) => return Err(error),
+            }
+        }
+        transaction.commit().await?;
+        Ok(results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    Err(StorageError::PersistenceProtocol(
+                        "batch save result is missing".to_string(),
+                    ))
+                })
+            })
+            .collect())
+    }
+}
+
+async fn save_snapshot_in_transaction(
+    transaction: &Transaction<'_>,
+    request: &SnapshotWrite,
+    schema_version: i64,
+    expected: Option<i64>,
+    updated_at: i64,
+) -> Result<SnapshotWriteOutcome, StorageError> {
+    // Claim first so concurrent retries wait on the unique key and observe the first result.
+    let claimed = transaction
+        .query_opt(
+            "INSERT INTO dbproxy_idempotency (request_id, namespace, record_key, schema_name, schema_version, payload, expected_revision, revision, updated_at_unix_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8) ON CONFLICT (request_id) DO NOTHING RETURNING request_id",
+            &[
+                &request.request_id,
+                &request.record.namespace,
+                &request.record.key,
+                &request.schema,
+                &schema_version,
+                &request.payload,
+                &expected,
+                &updated_at,
+            ],
+        )
+        .await?;
+
+    if claimed.is_none() {
+        let receipt = transaction
+            .query_one(
+                "SELECT namespace, record_key, schema_name, schema_version, payload, expected_revision, revision, updated_at_unix_ms FROM dbproxy_idempotency WHERE request_id = $1",
+                &[&request.request_id],
+            )
+            .await?;
+        if !idempotency_matches(&receipt, request, schema_version, expected, updated_at) {
+            return Err(StoreError::IdempotencyConflict {
+                request_id: request.request_id.clone(),
+            }
+            .into());
+        }
+        let revision = revision_from_i64(&request.record, receipt.get(6))?;
+        cache_repair::enqueue_in_transaction(transaction, &request.record, revision).await?;
+        return Ok(SnapshotWriteOutcome::Duplicate { revision });
+    }
+
+    // Update first so a non-zero expected revision can reach an existing row without also
+    // permitting creation of a missing row. A source-level `SELECT ... WHERE expected = 0`
+    // cannot be used here: when the predicate is false PostgreSQL never reaches ON CONFLICT,
+    // so valid updates with expected revision 1+ would incorrectly report a conflict.
+    let mut snapshot = transaction
+        .query_opt(
+            r#"
+WITH updated AS (
+    UPDATE dbproxy_snapshots
+    SET schema_name = $3,
+        schema_version = $4,
+        revision = dbproxy_snapshots.revision + 1,
+        payload = $5,
+        updated_at_unix_ms = $6
+    WHERE namespace = $1
+      AND record_key = $2
+      AND ($7::BIGINT IS NULL OR revision = $7)
+    RETURNING revision
+), inserted AS (
+    INSERT INTO dbproxy_snapshots (
+        namespace, record_key, schema_name, schema_version,
+        revision, payload, updated_at_unix_ms
+    )
+    SELECT $1, $2, $3, $4, 1, $5, $6
+    WHERE NOT EXISTS (SELECT 1 FROM updated)
+      AND ($7::BIGINT IS NULL OR $7 = 0)
+    ON CONFLICT (namespace, record_key) DO NOTHING
+    RETURNING revision
+)
+SELECT revision FROM updated
+UNION ALL
+SELECT revision FROM inserted
+"#,
+            &[
+                &request.record.namespace,
+                &request.record.key,
+                &request.schema,
+                &schema_version,
+                &request.payload,
+                &updated_at,
+                &expected,
+            ],
+        )
+        .await?;
+
+    // A blind create can lose a race after the UPDATE snapshot but before INSERT. Blind writes
+    // allow either create or update, so finish that rare path with an unconditional UPSERT.
+    if snapshot.is_none() && expected.is_none() {
+        snapshot = transaction
+            .query_opt(
+                "INSERT INTO dbproxy_snapshots (namespace, record_key, schema_name, schema_version, revision, payload, updated_at_unix_ms) VALUES ($1, $2, $3, $4, 1, $5, $6) ON CONFLICT (namespace, record_key) DO UPDATE SET schema_name = EXCLUDED.schema_name, schema_version = EXCLUDED.schema_version, revision = dbproxy_snapshots.revision + 1, payload = EXCLUDED.payload, updated_at_unix_ms = EXCLUDED.updated_at_unix_ms RETURNING revision",
+                &[
+                    &request.record.namespace,
+                    &request.record.key,
+                    &request.schema,
+                    &schema_version,
+                    &request.payload,
+                    &updated_at,
+                ],
+            )
+            .await?;
+    }
+
+    let Some(snapshot) = snapshot else {
+        let actual = transaction
+            .query_opt(
+                "SELECT revision FROM dbproxy_snapshots WHERE namespace = $1 AND record_key = $2",
+                &[&request.record.namespace, &request.record.key],
+            )
+            .await?
+            .map(|row| revision_from_i64(&request.record, row.get(0)))
+            .transpose()?
+            .unwrap_or(Revision::ZERO);
+        // A single-record save would roll back its newly claimed idempotency row with the whole
+        // transaction. A shared batch must remove only this failed claim before continuing.
+        transaction
+            .execute(
+                "DELETE FROM dbproxy_idempotency WHERE request_id = $1 AND revision = 0",
+                &[&request.request_id],
+            )
+            .await?;
+        return Err(StoreError::RevisionConflict {
+            record: request.record.clone(),
+            expected: request.expected_revision,
+            actual,
+        }
+        .into());
+    };
+
+    let revision = revision_from_i64(&request.record, snapshot.get(0))?;
+    transaction
+        .execute(
+            "UPDATE dbproxy_idempotency SET revision = $2 WHERE request_id = $1",
+            &[
+                &request.request_id,
+                &i64::try_from(revision.0).map_err(|_| StorageError::RevisionTooLarge {
+                    record: request.record.clone(),
+                })?,
+            ],
+        )
+        .await?;
+    cache_repair::enqueue_in_transaction(transaction, &request.record, revision).await?;
+    Ok(SnapshotWriteOutcome::Applied { revision })
 }
 
 #[async_trait]
@@ -1153,101 +1446,12 @@ impl AsyncSnapshotStore for PostgresSnapshotStore {
     }
 
     async fn save(&mut self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, Self::Error> {
-        validate_request(&request)?;
-        let schema_version = schema_version_to_i64(request.schema_version);
-        let expected = revision_to_i64(&request.record, request.expected_revision)?;
-        let updated_at = timestamp_to_i64(&request.record, request.updated_at_unix_ms)?;
-
-        let mut client = self.client.lock().await;
-        client.ensure_connected().await?;
-        let transaction = client.transaction().await?;
-
-        // 先占用幂等键，再写快照；并发重复请求会等待唯一键冲突并读取第一次结果。
-        // Claim the idempotency key before the snapshot mutation; concurrent retries wait on the unique key.
-        let claimed = transaction
-            .query_opt(
-                "INSERT INTO dbproxy_idempotency (request_id, namespace, record_key, schema_name, schema_version, payload, expected_revision, revision, updated_at_unix_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8) ON CONFLICT (request_id) DO NOTHING RETURNING request_id",
-                &[
-                    &request.request_id,
-                    &request.record.namespace,
-                    &request.record.key,
-                    &request.schema,
-                    &schema_version,
-                    &request.payload,
-                    &expected,
-                    &updated_at,
-                ],
-            )
-            .await?;
-
-        if claimed.is_none() {
-            let receipt = transaction
-                .query_one(
-                    "SELECT namespace, record_key, schema_name, schema_version, payload, expected_revision, revision, updated_at_unix_ms FROM dbproxy_idempotency WHERE request_id = $1",
-                    &[&request.request_id],
-                )
-                .await?;
-            if !idempotency_matches(&receipt, &request, schema_version, expected, updated_at) {
-                return Err(StoreError::IdempotencyConflict {
-                    request_id: request.request_id,
-                }
-                .into());
-            }
-            let revision = revision_from_i64(&request.record, receipt.get(6))?;
-            cache_repair::enqueue_in_transaction(&transaction, &request.record, revision).await?;
-            transaction.commit().await?;
-            return Ok(SnapshotWriteOutcome::Duplicate { revision });
-        }
-
-        let snapshot = transaction
-            .query_opt(
-                "INSERT INTO dbproxy_snapshots (namespace, record_key, schema_name, schema_version, revision, payload, updated_at_unix_ms) VALUES ($1, $2, $3, $4, 1, $5, $6) ON CONFLICT (namespace, record_key) DO UPDATE SET schema_name = EXCLUDED.schema_name, schema_version = EXCLUDED.schema_version, revision = dbproxy_snapshots.revision + 1, payload = EXCLUDED.payload, updated_at_unix_ms = EXCLUDED.updated_at_unix_ms WHERE $7::BIGINT IS NULL OR dbproxy_snapshots.revision = $7 RETURNING revision",
-                &[
-                    &request.record.namespace,
-                    &request.record.key,
-                    &request.schema,
-                    &schema_version,
-                    &request.payload,
-                    &updated_at,
-                    &expected,
-                ],
-            )
-            .await?;
-
-        let Some(snapshot) = snapshot else {
-            let actual = match transaction
-                .query_opt(
-                    "SELECT revision FROM dbproxy_snapshots WHERE namespace = $1 AND record_key = $2",
-                    &[&request.record.namespace, &request.record.key],
-                )
-                .await?
-            {
-                Some(row) => revision_from_i64(&request.record, row.get(0))?,
-                None => Revision::ZERO,
-            };
-            return Err(StoreError::RevisionConflict {
-                record: request.record,
-                expected: request.expected_revision,
-                actual,
-            }
-            .into());
-        };
-
-        let revision = revision_from_i64(&request.record, snapshot.get(0))?;
-        transaction
-            .execute(
-                "UPDATE dbproxy_idempotency SET revision = $2 WHERE request_id = $1",
-                &[
-                    &request.request_id,
-                    &i64::try_from(revision.0).map_err(|_| StorageError::RevisionTooLarge {
-                        record: request.record.clone(),
-                    })?,
-                ],
-            )
-            .await?;
-        cache_repair::enqueue_in_transaction(&transaction, &request.record, revision).await?;
-        transaction.commit().await?;
-        Ok(SnapshotWriteOutcome::Applied { revision })
+        self.save_batch(std::slice::from_ref(&request))
+            .await?
+            .pop()
+            .ok_or_else(|| {
+                StorageError::PersistenceProtocol("single save result is missing".to_string())
+            })?
     }
 }
 
@@ -2263,6 +2467,53 @@ impl RedisSnapshotCache {
         result
     }
 
+    /// Write a revision-aware cache batch with one Redis script invocation.
+    pub async fn put_multi(&self, snapshots: &[SnapshotEnvelope]) -> Result<(), StorageError> {
+        if snapshots.is_empty() {
+            return Ok(());
+        }
+        let mut prepared = Vec::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            prepared.push((
+                bincode::serde::encode_to_vec(snapshot, bincode::config::standard())
+                    .map_err(|error| StorageError::Codec(error.to_string()))?,
+                Self::revision_token(snapshot.revision),
+                self.policy.fresh_ttl_ms(&snapshot.record),
+                self.policy.hard_ttl_ms(&snapshot.record),
+            ));
+        }
+        let result = async {
+            let script = Script::new(REVISION_AWARE_CACHE_PUT_MULTI_SCRIPT);
+            let mut invocation = script.prepare_invoke();
+            for snapshot in snapshots {
+                invocation
+                    .key(Self::cache_key(&snapshot.record))
+                    .key(Self::revision_key(&snapshot.record))
+                    .key(Self::freshness_key(&snapshot.record))
+                    .key(Self::negative_key(&snapshot.record));
+            }
+            for (bytes, revision, fresh_ttl, hard_ttl) in prepared {
+                invocation
+                    .arg(bytes)
+                    .arg(revision)
+                    .arg(fresh_ttl)
+                    .arg(hard_ttl);
+            }
+            let _: i64 = {
+                let mut connection = self.connection.lock().await;
+                invocation.invoke_async(&mut *connection).await?
+            };
+            Ok(())
+        }
+        .await;
+        if result.is_ok() {
+            self.metrics.cache_writes(snapshots.len());
+        } else {
+            self.metrics.cache_write_error();
+        }
+        result
+    }
+
     pub async fn put_negative(&self, record: &RecordKey) -> Result<(), StorageError> {
         self.put_negative_if_revision(record, None).await
     }
@@ -2400,6 +2651,49 @@ impl TieredSnapshotStore {
         self.postgres.outbox_queue()
     }
 
+    /// Persist an independent snapshot batch with one PostgreSQL commit, then synchronize all
+    /// committed cache entries with one Redis script and one repair acknowledgement statement.
+    pub async fn save_batch(
+        &mut self,
+        requests: Vec<SnapshotWrite>,
+    ) -> Result<Vec<Result<SnapshotWriteOutcome, StorageError>>, StorageError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut outcomes = self.postgres.save_batch(&requests).await?;
+        let mut snapshots = Vec::with_capacity(requests.len());
+        let mut duplicate_indexes = Vec::new();
+        for (index, (request, outcome)) in requests.iter().zip(outcomes.iter()).enumerate() {
+            match outcome {
+                Ok(outcome @ SnapshotWriteOutcome::Applied { .. }) => snapshots.push(
+                    snapshot_from_write(request, snapshot_write_outcome_revision(*outcome)),
+                ),
+                Ok(SnapshotWriteOutcome::Duplicate { .. }) => duplicate_indexes.push(index),
+                Err(_) => {}
+            }
+        }
+
+        if !duplicate_indexes.is_empty() {
+            let records = duplicate_indexes
+                .iter()
+                .map(|index| requests[*index].record.clone())
+                .collect::<Vec<_>>();
+            let loaded = self.postgres.load_multi(&records).await?;
+            for (index, snapshot) in duplicate_indexes.into_iter().zip(loaded) {
+                match snapshot {
+                    Some(snapshot) => snapshots.push(snapshot),
+                    None => {
+                        outcomes[index] = Err(StorageError::MissingAfterWrite {
+                            record: requests[index].record.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        self.synchronize_committed_cache_multi(&snapshots).await;
+        Ok(outcomes)
+    }
+
     async fn lookup_cache(
         &self,
         record: &RecordKey,
@@ -2460,6 +2754,21 @@ impl TieredSnapshotStore {
         }
     }
 
+    async fn put_cache_multi(&self, snapshots: &[SnapshotEnvelope]) -> Result<(), StorageError> {
+        match timeout(
+            self.read_coordinator.timeout(),
+            self.cache.put_multi(snapshots),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.metrics.cache_write_error();
+                Err(self.read_coordinator.cache_timeout_error("batch write"))
+            }
+        }
+    }
+
     /// Best-effort fast path after a durable commit. The PostgreSQL repair row was inserted in
     /// the same transaction, so Redis failure never turns a committed write into an ambiguous
     /// client error; a worker will retry it later.
@@ -2486,6 +2795,35 @@ impl TieredSnapshotStore {
                 key = %snapshot.record.key,
                 revision = snapshot.revision.0,
                 "cache was updated but durable repair acknowledgement failed"
+            );
+        }
+    }
+
+    /// Best-effort cache synchronization for a committed record batch. PostgreSQL repair rows
+    /// remain durable until both the revision-aware Redis script and the bulk acknowledgement
+    /// succeed, so an interrupted fast path is recovered by the normal worker.
+    async fn synchronize_committed_cache_multi(&self, snapshots: &[SnapshotEnvelope]) {
+        if snapshots.is_empty() {
+            return;
+        }
+        if let Err(error) = self.put_cache_multi(snapshots).await {
+            tracing::warn!(
+                %error,
+                record_count = snapshots.len(),
+                "snapshot cache batch update deferred to durable repair queue"
+            );
+            return;
+        }
+        if let Err(error) = self
+            .postgres
+            .cache_repair_queue()
+            .acknowledge_cached_multi(snapshots)
+            .await
+        {
+            tracing::warn!(
+                %error,
+                record_count = snapshots.len(),
+                "snapshot cache batch was updated but durable repair acknowledgement failed"
             );
         }
     }
@@ -3171,17 +3509,9 @@ impl AsyncSnapshotStore for TieredSnapshotStore {
     }
 
     async fn save(&mut self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, Self::Error> {
-        let record = request.record.clone();
-        let outcome = self.postgres.save(request).await?;
-        let snapshot =
-            self.postgres
-                .load(&record)
-                .await?
-                .ok_or_else(|| StorageError::MissingAfterWrite {
-                    record: record.clone(),
-                })?;
-        self.synchronize_committed_cache(&snapshot).await;
-        Ok(outcome)
+        self.save_batch(vec![request]).await?.pop().ok_or_else(|| {
+            StorageError::PersistenceProtocol("single tiered save result is missing".to_string())
+        })?
     }
 }
 
@@ -3201,15 +3531,22 @@ impl AsyncTransactionalStore for TieredSnapshotStore {
         &mut self,
         request: TransactionalWrite,
     ) -> Result<TransactionalWriteOutcome, Self::Error> {
-        let record = request.record.clone();
+        let committed_write = request.clone();
         let outcome = self.postgres.apply(request).await?;
-        let snapshot =
+        let (revision, duplicate) = match &outcome {
+            TransactionalWriteOutcome::Applied { new_revision, .. } => (*new_revision, false),
+            TransactionalWriteOutcome::Duplicate { new_revision, .. } => (*new_revision, true),
+        };
+        let snapshot = if duplicate {
             self.postgres
-                .load(&record)
+                .load(&committed_write.record)
                 .await?
                 .ok_or_else(|| StorageError::MissingAfterWrite {
-                    record: record.clone(),
-                })?;
+                    record: committed_write.record.clone(),
+                })?
+        } else {
+            snapshot_from_single_transactional_write(&committed_write, revision)
+        };
         self.synchronize_committed_cache(&snapshot).await;
         Ok(outcome)
     }
@@ -3233,20 +3570,45 @@ impl AsyncMultiRecordTransactionStore for TieredSnapshotStore {
         &mut self,
         request: MultiRecordTransactionalWrite,
     ) -> Result<MultiRecordTransactionalWriteOutcome, Self::Error> {
-        let records = request
-            .writes
-            .iter()
-            .map(|write| write.record.clone())
-            .collect::<Vec<_>>();
+        let committed_writes = request.writes.clone();
         let outcome = self.postgres.apply_multi(request).await?;
-        for record in records {
-            let snapshot = self.postgres.load(&record).await?.ok_or_else(|| {
-                StorageError::MissingAfterWrite {
-                    record: record.clone(),
-                }
-            })?;
-            self.synchronize_committed_cache(&snapshot).await;
-        }
+        let (records, duplicate) = match &outcome {
+            MultiRecordTransactionalWriteOutcome::Applied { records, .. } => (records, false),
+            MultiRecordTransactionalWriteOutcome::Duplicate { records, .. } => (records, true),
+        };
+        let snapshots = if duplicate {
+            let keys = committed_writes
+                .iter()
+                .map(|write| write.record.clone())
+                .collect::<Vec<_>>();
+            self.postgres
+                .load_multi(&keys)
+                .await?
+                .into_iter()
+                .zip(keys)
+                .map(|(snapshot, record)| {
+                    snapshot.ok_or(StorageError::MissingAfterWrite { record })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let revisions = records
+                .iter()
+                .map(|record| (record.record.clone(), record.new_revision))
+                .collect::<HashMap<_, _>>();
+            committed_writes
+                .iter()
+                .map(|write| {
+                    let revision = revisions.get(&write.record).copied().ok_or_else(|| {
+                        StorageError::PersistenceProtocol(format!(
+                            "multi transaction result is missing {:?}",
+                            write.record
+                        ))
+                    })?;
+                    Ok(snapshot_from_transactional_write(write, revision))
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?
+        };
+        self.synchronize_committed_cache_multi(&snapshots).await;
         Ok(outcome)
     }
 }

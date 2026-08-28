@@ -52,6 +52,41 @@ end
 return {}
 "#;
 
+const CLAIM_MULTI_SCRIPT: &str = r#"
+local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[4])
+for _, member in ipairs(expired) do
+    redis.call('ZREM', KEYS[2], member)
+    redis.call('HDEL', KEYS[3], member)
+    if redis.call('EXISTS', ARGV[3] .. member) == 1 then
+        redis.call('ZADD', KEYS[1], ARGV[1], member)
+    end
+end
+
+local claimed = {}
+local claim_limit = tonumber(ARGV[5])
+local scan_limit = tonumber(ARGV[4]) + claim_limit
+for _ = 1, scan_limit do
+    if (#claimed / 3) >= claim_limit then
+        break
+    end
+    local item = redis.call('ZPOPMIN', KEYS[1], 1)
+    if #item == 0 then
+        break
+    end
+    local member = item[1]
+    local payload = redis.call('GET', ARGV[3] .. member)
+    if payload then
+        local lease = tostring(redis.call('INCR', KEYS[4]))
+        redis.call('ZADD', KEYS[2], ARGV[2], member)
+        redis.call('HSET', KEYS[3], member, lease)
+        table.insert(claimed, member)
+        table.insert(claimed, lease)
+        table.insert(claimed, payload)
+    end
+end
+return claimed
+"#;
+
 const ACK_SCRIPT: &str = r#"
 if redis.call('HGET', KEYS[2], ARGV[2]) ~= ARGV[1] then
     return 0
@@ -74,6 +109,36 @@ redis.call('ZADD', KEYS[3], ARGV[5], ARGV[2])
 return 2
 "#;
 
+const ACK_MULTI_SCRIPT: &str = r#"
+local results = {}
+local entry_prefix = ARGV[1]
+local now = ARGV[2]
+for index = 3, #ARGV, 3 do
+    local lease = ARGV[index]
+    local member = ARGV[index + 1]
+    local encoded = ARGV[index + 2]
+    if redis.call('HGET', KEYS[2], member) ~= lease then
+        table.insert(results, 0)
+    else
+        redis.call('HDEL', KEYS[2], member)
+        redis.call('ZREM', KEYS[1], member)
+        local current = redis.call('GET', entry_prefix .. member)
+        if not current then
+            redis.call('ZREM', KEYS[3], member)
+            table.insert(results, 1)
+        elseif current == encoded then
+            redis.call('DEL', entry_prefix .. member)
+            redis.call('ZREM', KEYS[3], member)
+            table.insert(results, 1)
+        else
+            redis.call('ZADD', KEYS[3], now, member)
+            table.insert(results, 2)
+        end
+    end
+end
+return results
+"#;
+
 const RELEASE_SCRIPT: &str = r#"
 if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then
     return 0
@@ -84,6 +149,27 @@ if redis.call('EXISTS', ARGV[4] .. ARGV[1]) == 1 then
     redis.call('ZADD', KEYS[3], ARGV[3], ARGV[1])
 end
 return 1
+"#;
+
+const RELEASE_MULTI_SCRIPT: &str = r#"
+local results = {}
+local entry_prefix = ARGV[1]
+local now = ARGV[2]
+for index = 3, #ARGV, 2 do
+    local member = ARGV[index]
+    local lease = ARGV[index + 1]
+    if redis.call('HGET', KEYS[2], member) ~= lease then
+        table.insert(results, 0)
+    else
+        redis.call('HDEL', KEYS[2], member)
+        redis.call('ZREM', KEYS[1], member)
+        if redis.call('EXISTS', entry_prefix .. member) == 1 then
+            redis.call('ZADD', KEYS[3], now, member)
+        end
+        table.insert(results, 1)
+    end
+end
+return results
 "#;
 
 const RENEW_SCRIPT: &str = r#"
@@ -365,6 +451,68 @@ return (#ARGV - 1) / 3
         }))
     }
 
+    /// Claim up to `max_items` with one Redis script invocation.
+    pub async fn claim_multi(
+        &self,
+        lease_ms: u64,
+        max_items: usize,
+    ) -> Result<Vec<SnapshotBacklogLease>, StorageError> {
+        if lease_ms == 0 {
+            return Err(StorageError::InvalidBacklogLease);
+        }
+        if max_items == 0 {
+            return Err(StorageError::BacklogProtocol(
+                "batch claim size is zero".to_string(),
+            ));
+        }
+        let now = Self::now_unix_ms()?;
+        let deadline = Self::lease_deadline(now, lease_ms)?;
+        let claim_limit = i64::try_from(max_items).map_err(|_| {
+            StorageError::BacklogProtocol("batch claim size is too large".to_string())
+        })?;
+        let script = Script::new(CLAIM_MULTI_SCRIPT);
+        let mut connection = self.worker_connection.lock().await;
+        let values: Vec<Vec<u8>> = script
+            .key(PENDING_KEY)
+            .key(PROCESSING_KEY)
+            .key(LEASES_KEY)
+            .key(LEASE_SEQUENCE_KEY)
+            .arg(now)
+            .arg(deadline)
+            .arg(ENTRY_PREFIX)
+            .arg(RECLAIM_LIMIT)
+            .arg(claim_limit)
+            .invoke_async(&mut *connection)
+            .await?;
+        let (tuples, remainder) = values.as_chunks::<3>();
+        if !remainder.is_empty() {
+            return Err(StorageError::BacklogProtocol(
+                "batch claim returned an invalid tuple list".to_string(),
+            ));
+        }
+        let mut leases = Vec::with_capacity(values.len() / 3);
+        for tuple in tuples {
+            let member = String::from_utf8(tuple[0].clone())
+                .map_err(|error| StorageError::BacklogProtocol(error.to_string()))?;
+            let lease_id = String::from_utf8(tuple[1].clone())
+                .map_err(|error| StorageError::BacklogProtocol(error.to_string()))?;
+            let encoded = tuple[2].clone();
+            let request = Self::decode(&encoded)?;
+            if Self::member(&request.record) != member {
+                return Err(StorageError::BacklogProtocol(
+                    "batch claim record member does not match payload".to_string(),
+                ));
+            }
+            leases.push(SnapshotBacklogLease {
+                request,
+                member,
+                lease_id,
+                encoded,
+            });
+        }
+        Ok(leases)
+    }
+
     /// 延长 lease，避免慢数据库写入期间被另一个消费者重新领取。
     /// Renew a lease so a slow database write is not reclaimed by another consumer.
     pub async fn renew(
@@ -421,6 +569,49 @@ return (#ARGV - 1) / 3
         }
     }
 
+    /// Acknowledge a committed lease batch in one Redis round trip.
+    pub async fn ack_multi(
+        &self,
+        leases: &[SnapshotBacklogLease],
+    ) -> Result<Vec<SnapshotBacklogAck>, StorageError> {
+        if leases.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = Self::now_unix_ms()?;
+        let script = Script::new(ACK_MULTI_SCRIPT);
+        let mut invocation = script.prepare_invoke();
+        invocation
+            .key(PROCESSING_KEY)
+            .key(LEASES_KEY)
+            .key(PENDING_KEY)
+            .arg(ENTRY_PREFIX)
+            .arg(now);
+        for lease in leases {
+            invocation
+                .arg(&lease.lease_id)
+                .arg(&lease.member)
+                .arg(&lease.encoded);
+        }
+        let mut connection = self.worker_connection.lock().await;
+        let values: Vec<i64> = invocation.invoke_async(&mut *connection).await?;
+        if values.len() != leases.len() {
+            return Err(StorageError::BacklogProtocol(
+                "batch ack returned an invalid result count".to_string(),
+            ));
+        }
+        values
+            .into_iter()
+            .map(|result| match result {
+                0 => Ok(SnapshotBacklogAck::LeaseLost),
+                1 => Ok(SnapshotBacklogAck::Removed),
+                2 => Ok(SnapshotBacklogAck::Superseded),
+                _ => Err(StorageError::BacklogProtocol(
+                    "batch ack returned an invalid status".to_string(),
+                )),
+            })
+            .collect()
+    }
+
     /// 主动释放 lease，通常用于数据库写入失败后的快速重试；失败时也会等待 lease 过期自动恢复。
     /// Release a lease for immediate retry after a database failure; expiry remains the fallback.
     pub async fn release(&self, lease: &SnapshotBacklogLease) -> Result<bool, StorageError> {
@@ -438,6 +629,36 @@ return (#ARGV - 1) / 3
             .invoke_async(&mut *connection)
             .await?;
         Ok(result == 1)
+    }
+
+    /// Release a failed lease batch for immediate retry in one Redis round trip.
+    pub async fn release_multi(
+        &self,
+        leases: &[SnapshotBacklogLease],
+    ) -> Result<Vec<bool>, StorageError> {
+        if leases.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = Self::now_unix_ms()?;
+        let script = Script::new(RELEASE_MULTI_SCRIPT);
+        let mut invocation = script.prepare_invoke();
+        invocation
+            .key(PROCESSING_KEY)
+            .key(LEASES_KEY)
+            .key(PENDING_KEY)
+            .arg(ENTRY_PREFIX)
+            .arg(now);
+        for lease in leases {
+            invocation.arg(&lease.member).arg(&lease.lease_id);
+        }
+        let mut connection = self.worker_connection.lock().await;
+        let values: Vec<i64> = invocation.invoke_async(&mut *connection).await?;
+        if values.len() != leases.len() {
+            return Err(StorageError::BacklogProtocol(
+                "batch release returned an invalid result count".to_string(),
+            ));
+        }
+        Ok(values.into_iter().map(|value| value == 1).collect())
     }
 }
 

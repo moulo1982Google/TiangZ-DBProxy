@@ -10,6 +10,8 @@
 
 现在多记录和交易的最终 mutation 再次携带 expected Revision 条件，并检查 `RETURNING revision`。无论竞争者是否参与 advisory lock，只有一个 expected-revision-zero 写入能提交，另一个整笔回滚。真实 PostgreSQL 集成测试并发混合 single/multi API 验证“恰好一个成功”。
 
+批量快照集成测试随后又覆盖了普通 `SaveSnapshot` 的缺失行分支：旧 `INSERT ... ON CONFLICT DO UPDATE ... WHERE expected` 只把 CAS 谓词应用于冲突更新，`expected_revision=9` 写一个不存在的 key 仍会直接 INSERT。第一版修复把条件放到 `INSERT ... SELECT` 的源行，却因此让合法的非零 expected revision 根本到不了 `ON CONFLICT`；500 玩家启动门用真实周期快照发现了该问题。最终 SQL 使用同一语句内的条件 `UPDATE` CTE 和仅允许 expected 为空/0 的 `INSERT ... ON CONFLICT DO NOTHING`，并为无条件创建竞争保留 blind-upsert 收尾。真实 PostgreSQL 集成测试同时锁定“缺记录+非零 expected 必须冲突”和“已有 revision 1+匹配 expected 必须更新”两条边界。
+
 ### PostgreSQL 重启后连接永久失效
 
 原连接断开后没有恢复路径，故障测试只能新建 Store。现在每个 PostgreSQL 分片和维护连接保存连接地址，发现 `Client::is_closed()` 后进行 2 秒有界重连。正在执行且结果未知的调用仍失败；系统不会在底层自动重放写入，调用方用原幂等 ID 重试。
@@ -60,6 +62,14 @@ Rust 已升级协议 v2，但 TypeScript 生成脚本仍硬编码 v1，测试实
 
 真实并行集成测试还发现：仅用 advisory lock 串行“整套幂等 DDL”并不够。先完成迁移的连接可以立即开始业务写入，而排队的下一个连接随后重跑 `CREATE TABLE`/触发器 DDL，仍可能与业务行锁形成锁环。现在 `dbproxy_schema_migrations` 在同一事务记录 001 到 007；后续连接只读取版本并验证快照布局，不再重复执行已提交 DDL。
 
+### 普通快照逐条提交与恢复积压放大
+
+`SaveMultiSnapshot` 原先只是协议层批量，服务端仍逐条开启 PostgreSQL transaction、逐条更新 Redis、逐条确认缓存修复；backlog 恢复也一次只领取一条。很多玩家同时周期保存时，主要浪费在 commit/WAL flush 和网络往返，而不是 Payload 编码。
+
+现在普通快照按连接 shard 共享一次 PostgreSQL commit，保留逐条 Revision/幂等结果；成功项再通过一次 revision-aware Redis Lua 和一条修复队列 ACK 同步缓存。backlog worker 每轮最多领取、提交并 ACK/release 64 条。Revision/幂等冲突只影响对应条目，SQL/连接错误回滚所在 shard 的整批并依靠原 request ID 重试。关键交易仍走原来的原子事务 API，没有把独立周期快照批处理伪装成业务原子性。
+
+交易和 multi transaction 的 PostgreSQL 原子边界未改变，但提交成功后不再逐记录回读 PostgreSQL再逐条刷新缓存；首次应用可直接从已提交请求和返回 Revision 构造缓存快照。幂等重复仍批量读取当前权威版本，避免旧请求 Payload 覆盖已经推进的新 Revision。
+
 ## 已收敛的冗长/过度设计
 
 ### 构造函数爆炸
@@ -98,6 +108,7 @@ Rust 已升级协议 v2，但 TypeScript 生成脚本仍硬编码 v1，测试实
 ## 已知边界，不在本轮扩张
 
 - PostgreSQL 当前每个 shard 是一条串行 Client，不是动态连接池；容量应先通过真实指标决定是否更换池实现。
+- 当前没有只读副本路由。Revision/CAS、事务回执、交易、账本、Outbox 和 read-after-write 都必须读主库；以后即使增加 replica，也只能给明确允许陈旧的查询单独建 API，并依据 replay lag 自动回主，不能把现有 `LoadSnapshot` 静默改成读从库。
 - 真实存储的 `/ready` 已要求 PostgreSQL 与 Redis 最近一次采样都健康，`/dependencies` 和 `dbproxy_dependency_up` 可定位具体依赖；状态转换存在最长约一个 5 秒采样周期，不承诺瞬时故障检测。
 - Rust 客户端仍保留共享连接的 `connect(size)` 兼容入口；故障敏感调用方应显式使用 `connect_split(read_size, write_size)`。两种模式的单条连接仍串行，没有在协议中引入多路复用。
 - Redis backlog 已把 enqueue、worker lease/ACK 和 stats 拆为三条连接；每个角色内部仍使用 mutex 保证脚本与 `WAITAOF` 的顺序。高吞吐路径继续优先使用批量 API，是否增加 enqueue 连接分片由正式延迟数据决定。
@@ -105,5 +116,6 @@ Rust 已升级协议 v2，但 TypeScript 生成脚本仍硬编码 v1，测试实
 - 账本没有余额聚合 API，也没有替业务校验透支/物品所有权。
 - 共享令牌不是零信任方案；TLS/mTLS、轮换、租户配额属于生产安全建设。
 - 当前仅 `dbproxy_snapshots` 使用固定 32 个库内 HASH 分区；历史表保留、归档、其他表分区和物理分库仍按要求延期。
+- PostgreSQL 方言是当前明确边界：advisory lock、`SKIP LOCKED`、`unnest`、原生 HASH 分区、触发器和 `ON CONFLICT ... RETURNING` 均参与正确性。MySQL 8.4 不是替换连接串即可支持；若以后确认需要，应实现并独立验收一套 storage backend/migration/故障矩阵，而不是在现有 SQL 中堆方言分支。
 
 上述故障期边界、随后改进及实测数据见[100 玩家两小时故障演练报告](fault-soak-report-2026-08-27.md)。

@@ -54,6 +54,8 @@ use observability::{
     RpcOperation,
 };
 
+const BACKLOG_FLUSH_BATCH_SIZE: usize = 64;
+
 #[derive(Debug, Error)]
 pub enum BackendError {
     #[error("invalid backend configuration: {0}")]
@@ -293,6 +295,66 @@ impl StorageBackend {
         }
     }
 
+    /// Drain multiple ordinary snapshots with one Redis claim, one shard-aware save batch, and
+    /// batched ACK/release commands. Failed entries are immediately released while successful
+    /// entries retain their original idempotency IDs.
+    pub async fn process_backlog_batch(
+        &self,
+        lease_ms: u64,
+        max_items: usize,
+    ) -> Result<Vec<SnapshotBacklogAck>, BackendError> {
+        let leases = self.backlog.claim_multi(lease_ms, max_items).await?;
+        if leases.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requests = leases
+            .iter()
+            .map(|lease| lease.request.clone())
+            .collect::<Vec<_>>();
+        let outcomes = match self.save_multi(requests).await {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                if let Err(release_error) = self.backlog.release_multi(&leases).await {
+                    tracing::error!(%release_error, "failed to release snapshot backlog batch after storage failure");
+                }
+                return Err(error);
+            }
+        };
+        if outcomes.len() != leases.len() {
+            if let Err(release_error) = self.backlog.release_multi(&leases).await {
+                tracing::error!(%release_error, "failed to release malformed snapshot backlog batch");
+            }
+            return Err(BackendError::Worker(
+                "snapshot backlog batch returned an invalid result count".to_string(),
+            ));
+        }
+
+        let mut committed = Vec::new();
+        let mut failed = Vec::new();
+        let mut first_error = None;
+        for (lease, outcome) in leases.into_iter().zip(outcomes) {
+            match outcome {
+                Ok(_) => committed.push(lease),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    failed.push(lease);
+                }
+            }
+        }
+        let acknowledgements = self.backlog.ack_multi(&committed).await?;
+        if !failed.is_empty()
+            && let Err(release_error) = self.backlog.release_multi(&failed).await
+        {
+            tracing::error!(%release_error, record_count = failed.len(), "failed to release snapshot backlog batch entries");
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(acknowledgements)
+    }
+
     pub async fn process_cache_repair_once(
         &self,
         worker_id: &str,
@@ -438,14 +500,28 @@ impl DbProxyBackend for StorageBackend {
             }
             let mut shard = self.shards[shard_index].clone();
             workers.spawn(async move {
-                let mut outcomes = Vec::with_capacity(group.len());
-                for (request_index, request) in group {
-                    outcomes.push((
-                        request_index,
-                        shard.save(request).await.map_err(BackendError::from),
-                    ));
-                }
-                outcomes
+                let request_indexes = group
+                    .iter()
+                    .map(|(request_index, _)| *request_index)
+                    .collect::<Vec<_>>();
+                let requests = group
+                    .into_iter()
+                    .map(|(_, request)| request)
+                    .collect::<Vec<_>>();
+                let outcomes = shard
+                    .save_batch(requests)
+                    .await
+                    .map_err(BackendError::from)?;
+                Ok::<_, BackendError>(
+                    request_indexes
+                        .into_iter()
+                        .zip(
+                            outcomes
+                                .into_iter()
+                                .map(|outcome| outcome.map_err(BackendError::from)),
+                        )
+                        .collect::<Vec<_>>(),
+                )
             });
         }
 
@@ -454,7 +530,7 @@ impl DbProxyBackend for StorageBackend {
             .collect::<Vec<_>>();
         while let Some(result) = workers.join_next().await {
             for (request_index, outcome) in
-                result.map_err(|error| BackendError::Worker(error.to_string()))?
+                result.map_err(|error| BackendError::Worker(error.to_string()))??
             {
                 outcomes[request_index] = Some(outcome);
             }
@@ -623,14 +699,17 @@ pub async fn run_backlog_worker_observed(
             return;
         }
         let started_at = Instant::now();
-        match backend.process_backlog_once(lease_ms).await {
-            Ok(BacklogProcessOutcome::Committed(_)) => {
+        match backend
+            .process_backlog_batch(lease_ms, BACKLOG_FLUSH_BATCH_SIZE)
+            .await
+        {
+            Ok(acknowledgements) if !acknowledgements.is_empty() => {
                 if let Some(metrics) = &metrics {
                     metrics.backlog_finished(BacklogMetricResult::Committed, started_at.elapsed());
                 }
                 continue;
             }
-            Ok(BacklogProcessOutcome::Empty) => {
+            Ok(_) => {
                 if let Some(metrics) = &metrics {
                     metrics.backlog_finished(BacklogMetricResult::Empty, started_at.elapsed());
                 }
