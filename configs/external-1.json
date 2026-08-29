@@ -16,6 +16,7 @@
     "backend": "postgresRedis",
     "postgresUrlEnv": "DBPROXY_POSTGRES_URL",
     "redisUrlEnv": "DBPROXY_REDIS_URL",
+    "cacheRedisUrlEnv": "DBPROXY_CACHE_REDIS_URL",
     "shards": 4,
     "cacheFallbackConcurrency": 16,
     "cacheFallbackTimeoutMs": 2000,

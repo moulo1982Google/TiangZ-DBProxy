@@ -55,7 +55,7 @@ DBProxy使用带`configVersion: 1`的严格JSON保存普通启动参数，默认
 cargo run -p tiangz-dbproxy-server -- --config configs/local.json
 ```
 
-未知字段、零worker、零lease、空密钥变量会在建立网络连接前直接报错。每个 DBProxy 实例只配置一个监听地址；部署两个实例时使用两份 JSON，二者共享同一 PostgreSQL 和 Redis。多 Endpoint 写在业务客户端配置中，而不是 DBProxy 服务端配置中：第一个地址是首选，后续地址是故障切换候选。
+未知字段、零worker、零lease、空密钥变量会在建立网络连接前直接报错。每个 DBProxy 实例只配置一个监听地址；部署两个实例时使用两份 JSON，二者共享同一 PostgreSQL 和 Redis 服务。`redisUrlEnv`承载必须保留 AOF 的 backlog/Outbox；可选的`cacheRedisUrlEnv`把快照缓存放到独立、无持久化的 Redis。省略后者时继续复用`redisUrlEnv`，兼容单 Redis 开发环境。多 Endpoint 写在业务客户端配置中，而不是 DBProxy 服务端配置中：第一个地址是首选，后续地址是故障切换候选。
 
 存储后端必须显式选择。正式和恢复测试使用`postgresRedis`；`memory`只用于本地开发与性能隔离，进程退出后数据全部丢失，并且`EnqueueSnapshot`会直接写入内存权威快照，不模拟Redis AOF与异步刷盘：
 
@@ -67,14 +67,14 @@ cargo run -p tiangz-dbproxy-server -- --config configs/local.json
 }
 ```
 
-配置`observability.listenAddr`后，DBProxy在独立HTTP端口提供`/live`、`/ready`、`/dependencies`和Prometheus格式的`/metrics`。真实存储模式只有在 PostgreSQL 与 Redis 都可达时才 Ready；`/dependencies` 会分别报告两者状态。本地Compose会启动Prometheus与Grafana并自动加载Dashboard；指标、告警和部署边界见[可观测性指南](OBSERVABILITY.md)。观测端口不要求业务认证，因此只能绑定本机或运维内网，禁止经Nginx暴露公网。
+配置`observability.listenAddr`后，DBProxy在独立HTTP端口提供`/live`、`/ready`、`/dependencies`和Prometheus格式的`/metrics`。真实存储模式只有在 PostgreSQL 与可靠队列 Redis 都可达时才 Ready；独立快照缓存不可达时安全回源 PostgreSQL，并由缓存读写错误与回源指标告警，不把可降级缓存误判为持久依赖。本地Compose会启动Prometheus与Grafana并自动加载Dashboard；指标、告警和部署边界见[可观测性指南](OBSERVABILITY.md)。观测端口不要求业务认证，因此只能绑定本机或运维内网，禁止经Nginx暴露公网。
 
 仓库提供`configs/perf-memory-4.json`，固定使用4个Runtime工作线程和MemoryStub。该配置只测DBProxy自身的网络、协议、调度、分片锁和事务语义，不把PostgreSQL或Redis性能混入结果。
 
 ```text
 DBProxy-1: 127.0.0.1:7800 ─┐
-                           ├─ 同一 PostgreSQL + 同一 Redis
-DBProxy-2: 127.0.0.1:7801 ─┘
+                           ├─ 同一 PostgreSQL + 可靠队列 Redis
+DBProxy-2: 127.0.0.1:7801 ─┘                    + 可选易失缓存 Redis
 客户端: [7800, 7801]
 ```
 

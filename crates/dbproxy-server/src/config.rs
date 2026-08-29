@@ -82,6 +82,8 @@ pub enum StorageSection {
         postgres_url_env: String,
         #[serde(rename = "redisUrlEnv")]
         redis_url_env: String,
+        #[serde(rename = "cacheRedisUrlEnv")]
+        cache_redis_url_env: Option<String>,
         #[serde(default = "default_storage_shards")]
         shards: usize,
         #[serde(
@@ -259,6 +261,7 @@ pub enum ResolvedStorage {
     PostgresRedis {
         postgres_url: String,
         redis_url: String,
+        cache_redis_url: String,
         shards: usize,
         cache_fallback_concurrency: usize,
         cache_fallback_timeout_ms: u64,
@@ -405,6 +408,7 @@ impl DbProxyConfig {
             StorageSection::PostgresRedis {
                 postgres_url_env,
                 redis_url_env,
+                cache_redis_url_env,
                 shards,
                 cache_fallback_concurrency,
                 cache_fallback_timeout_ms,
@@ -445,9 +449,15 @@ impl DbProxyConfig {
                     cache_fallback_lock_poll_ms,
                 )?;
                 require_positive("storage.cacheTtlMs", cache_ttl_ms)?;
+                let redis_url = required_environment(&environment, &redis_url_env)?;
+                let cache_redis_url = match cache_redis_url_env {
+                    Some(name) => required_environment(&environment, &name)?,
+                    None => redis_url.clone(),
+                };
                 ResolvedStorage::PostgresRedis {
                     postgres_url: required_environment(&environment, &postgres_url_env)?,
-                    redis_url: required_environment(&environment, &redis_url_env)?,
+                    redis_url,
+                    cache_redis_url,
                     shards,
                     cache_fallback_concurrency,
                     cache_fallback_timeout_ms,
@@ -703,6 +713,8 @@ mod tests {
         assert_eq!(config.log_filter, "info");
         match &config.storage {
             ResolvedStorage::PostgresRedis {
+                redis_url,
+                cache_redis_url,
                 cache_fallback_concurrency,
                 cache_fallback_timeout_ms,
                 cache_fallback_circuit_failure_threshold,
@@ -716,6 +728,7 @@ mod tests {
                 cache_stale_while_revalidate_ms,
                 ..
             } => {
+                assert_eq!(cache_redis_url, redis_url);
                 assert_eq!(
                     *cache_fallback_concurrency,
                     DEFAULT_CACHE_FALLBACK_CONCURRENCY
@@ -757,6 +770,43 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("postgres://secret"));
         assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn resolves_an_independent_snapshot_cache_redis() {
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "storage": {
+            "backend": "postgresRedis",
+            "postgresUrlEnv": "PG",
+            "redisUrlEnv": "REDIS",
+            "cacheRedisUrlEnv": "CACHE_REDIS"
+          }
+        }"#,
+        );
+        let values = HashMap::from([
+            ("AUTH", "0123456789abcdef"),
+            ("PG", "postgres://secret"),
+            ("REDIS", "redis://durable"),
+            ("CACHE_REDIS", "redis://cache"),
+        ]);
+        let config =
+            load_config_with(&path, |name| values.get(name).map(ToString::to_string)).unwrap();
+        fs::remove_file(path).unwrap();
+
+        match config.storage {
+            ResolvedStorage::PostgresRedis {
+                redis_url,
+                cache_redis_url,
+                ..
+            } => {
+                assert_eq!(redis_url, "redis://durable");
+                assert_eq!(cache_redis_url, "redis://cache");
+            }
+            ResolvedStorage::Memory { .. } => panic!("expected postgresRedis storage"),
+        }
     }
 
     #[test]

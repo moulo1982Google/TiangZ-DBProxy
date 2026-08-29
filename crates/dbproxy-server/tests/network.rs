@@ -20,7 +20,8 @@ use tiangz_dbproxy_core::{
     TransactionStore, TransactionalRecordWrite, TransactionalWrite, TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_protocol::{
-    DEFAULT_MAX_FRAME_BYTES, PROTOCOL_FINGERPRINT, read_message, wire, write_message,
+    DEFAULT_MAX_FRAME_BYTES, LEGACY_PROTOCOL_FINGERPRINT_V2, PROTOCOL_FINGERPRINT,
+    PROTOCOL_VERSION, read_message, wire, write_message,
 };
 use tiangz_dbproxy_server::{BackendError, DbProxyBackend, DbProxyServer, ServerConfig};
 use tokio::{net::TcpStream, sync::Mutex, sync::watch, task::JoinHandle};
@@ -433,6 +434,37 @@ async fn protocol_fingerprint_mismatch_is_rejected_before_rpc() {
         wire::ErrorCode::try_from(hello.error.unwrap().code).unwrap(),
         wire::ErrorCode::ProtocolMismatch
     );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn legacy_line_ending_fingerprint_is_accepted_and_echoed() {
+    const TOKEN: &str = "network-test-token-1234";
+    let server = TestServer::start(TOKEN).await;
+    let mut stream = TcpStream::connect(&server.endpoint).await.unwrap();
+    write_message(
+        &mut stream,
+        &wire::ClientFrame {
+            body: Some(wire::client_frame::Body::Hello(wire::ClientHello {
+                protocol_version: PROTOCOL_VERSION,
+                protocol_fingerprint: LEGACY_PROTOCOL_FINGERPRINT_V2.to_string(),
+                auth_token: TOKEN.to_string(),
+                client_name: "legacy-line-ending-client".to_string(),
+            })),
+        },
+        DEFAULT_MAX_FRAME_BYTES,
+    )
+    .await
+    .unwrap();
+    let response = read_message::<_, wire::ServerFrame>(&mut stream, DEFAULT_MAX_FRAME_BYTES)
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(wire::server_frame::Body::Hello(hello)) = response.body else {
+        panic!("expected handshake response");
+    };
+    assert!(hello.accepted);
+    assert_eq!(hello.protocol_fingerprint, LEGACY_PROTOCOL_FINGERPRINT_V2);
     server.stop().await;
 }
 

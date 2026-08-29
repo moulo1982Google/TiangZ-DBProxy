@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -7,9 +9,13 @@ import {
   DbProxyClient,
 } from "../dist/index.js";
 
-test("protocol lock is generated from the authoritative proto", () => {
+test("protocol lock is generated from the canonical authoritative proto", async () => {
   assert.equal(DBPROXY_PROTOCOL_VERSION, 2);
-  assert.match(DBPROXY_PROTOCOL_FINGERPRINT, /^[0-9a-f]{64}$/);
+  const schema = await readFile(new URL("../../../crates/dbproxy-protocol/proto/dbproxy.proto", import.meta.url), "utf8");
+  const expected = createHash("sha256")
+    .update(schema.replace(/\r\n?/g, "\n"), "utf8")
+    .digest("hex");
+  assert.equal(DBPROXY_PROTOCOL_FINGERPRINT, expected);
 });
 
 test("snapshot writes cross the transport boundary as defensive copies", async () => {

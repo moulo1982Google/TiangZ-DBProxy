@@ -60,6 +60,8 @@ Redis revision-aware fast-path refresh
 
 缓存写入由 Lua 脚本比较 Revision，旧快照不能覆盖新快照。普通批量快照、multi transaction 和 trade 提交后的缓存刷新都使用一次批量 Lua 调用，再用一条 PostgreSQL `unnest` 删除已覆盖的修复目标；如果任一步失败，事务内预先写入的修复行仍然存在。读取失败、编码损坏或 miss 会回源 PostgreSQL；缓存预热失败不影响权威读取结果。
 
+严格 read-after-write 部署必须把快照缓存与 AOF backlog/Outbox 分开。可靠队列 Redis 会从 AOF 恢复；若它同时保存缓存，崩溃前尚未刷入 AOF 的新缓存可能在重启后被旧值和旧 freshness 标记替代，并在 repair worker 赶上前产生短暂旧读。`cacheRedisUrlEnv`因此指向关闭 AOF/RDB 的易失实例：重启后缓存为空，只能回源 PostgreSQL，再由读预热或持久 repair 重建。`redisUrlEnv`仍只负责必须保留的 backlog 和 Outbox。单 Redis 配置保留用于兼容和本地开发，但不能通过这一严格恢复边界。
+
 ## 缓存击穿与生命周期
 
 正缓存默认 fresh 5 分钟、稳定抖动最多 30 秒、stale-while-revalidate 30 秒；负缓存默认 5 秒。miss 回源受到以下保护：

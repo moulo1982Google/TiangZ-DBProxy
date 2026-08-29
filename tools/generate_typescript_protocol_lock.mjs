@@ -7,7 +7,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const protoPath = path.join(root, "crates", "dbproxy-protocol", "proto", "dbproxy.proto");
 const protocolSourcePath = path.join(root, "crates", "dbproxy-protocol", "src", "lib.rs");
 const outputPath = path.join(root, "sdk", "typescript", "src", "protocol-lock.ts");
-const proto = await readFile(protoPath);
+const proto = (await readFile(protoPath, "utf8")).replace(/\r\n?/g, "\n");
 const protocolSource = await readFile(protocolSourcePath, "utf8");
 const versionMatch = protocolSource.match(/pub const PROTOCOL_VERSION: u32 = (\d+);/);
 if (!versionMatch) throw new Error(`Cannot find PROTOCOL_VERSION in ${protocolSourcePath}`);

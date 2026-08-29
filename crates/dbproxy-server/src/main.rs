@@ -34,6 +34,7 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
         ResolvedStorage::PostgresRedis {
             postgres_url,
             redis_url,
+            cache_redis_url,
             shards,
             cache_fallback_concurrency,
             cache_fallback_timeout_ms,
@@ -48,9 +49,10 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
             cache_stale_while_revalidate_ms,
         } => {
             let backend = Arc::new(
-                StorageBackend::connect_with_config(
+                StorageBackend::connect_with_redis_urls(
                     &postgres_url,
                     &redis_url,
+                    &cache_redis_url,
                     StorageBackendConfig {
                         shard_count: shards,
                         tiered: tiangz_dbproxy_storage::TieredSnapshotStoreConfig {

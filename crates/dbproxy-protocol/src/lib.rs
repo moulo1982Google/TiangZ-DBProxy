@@ -18,6 +18,10 @@ use tiangz_dbproxy_core::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+#[cfg(test)]
+#[path = "../fingerprint.rs"]
+mod fingerprint;
+
 pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/tiangz.dbproxy.v1.rs"));
 }
@@ -27,6 +31,16 @@ include!(concat!(env!("OUT_DIR"), "/protocol_fingerprint.rs"));
 /// 第一版公开网络协议。修改不兼容字段时必须提升版本，而不能只改实现。
 /// First public wire version. Incompatible schema changes must increment this value.
 pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Protocol v2 fingerprint produced before line endings were canonicalized. Servers accept this
+/// exact alias during the rolling migration and echo it to legacy clients; other fingerprints
+/// remain incompatible.
+pub const LEGACY_PROTOCOL_FINGERPRINT_V2: &str =
+    "d20f64198cedce3fd673708a08a9700c230d5a7aecc3d2ede47e4701143e4f1f";
+
+pub fn is_compatible_protocol_fingerprint(candidate: &str) -> bool {
+    candidate == PROTOCOL_FINGERPRINT || candidate == LEGACY_PROTOCOL_FINGERPRINT_V2
+}
 
 /// 默认单帧上限；业务快照超过该值应拆分领域记录，而不是无限放大网络缓冲。
 /// Default frame limit; larger snapshots should be split by domain instead of growing buffers.
@@ -688,6 +702,15 @@ mod tests {
                 maximum: 64
             }
         ));
+    }
+
+    #[test]
+    fn protocol_fingerprint_compatibility_is_explicit_and_bounded() {
+        assert!(is_compatible_protocol_fingerprint(PROTOCOL_FINGERPRINT));
+        assert!(is_compatible_protocol_fingerprint(
+            LEGACY_PROTOCOL_FINGERPRINT_V2
+        ));
+        assert!(!is_compatible_protocol_fingerprint("unknown"));
     }
 
     #[test]

@@ -251,7 +251,7 @@ async fn main() -> Result<(), DynError> {
     let acknowledged_enqueues = enqueue_worker.await?;
     reporter.await?;
 
-    let validation = validate_final_state(
+    let mut validation = validate_final_state(
         &pool,
         &final_states,
         &acknowledged_enqueues,
@@ -260,6 +260,9 @@ async fn main() -> Result<(), DynError> {
     )
     .await;
     let total = counters.snapshot();
+    if validation.is_ok() {
+        validation = validate_observed_consistency(total);
+    }
     emit(
         "SOAK_FINAL",
         json!({
@@ -273,6 +276,31 @@ async fn main() -> Result<(), DynError> {
         }),
     );
     validation
+}
+
+fn validate_observed_consistency(counters: CounterSnapshot) -> Result<(), DynError> {
+    let mut violations = Vec::new();
+    if counters.missing_snapshots > 0 {
+        violations.push(format!("missingSnapshots={}", counters.missing_snapshots));
+    }
+    if counters.reads_behind_acknowledged_revision > 0 {
+        violations.push(format!(
+            "readsBehindAcknowledgedRevision={}",
+            counters.reads_behind_acknowledged_revision
+        ));
+    }
+    if counters.invariant_errors > 0 {
+        violations.push(format!("invariantErrors={}", counters.invariant_errors));
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "observed consistency violations during the run: {}",
+            violations.join(", ")
+        )
+        .into())
+    }
 }
 
 async fn seed_and_warm_players(
@@ -383,6 +411,8 @@ async fn run_player(
         let next_cycle = cycle_started + cycle;
         if next_cycle < deadline {
             tokio::time::sleep_until(next_cycle).await;
+        } else {
+            break;
         }
     }
     state
@@ -850,6 +880,21 @@ mod tests {
         assert_eq!(
             next_periodic_deadline(origin, interval, now),
             now + interval
+        );
+    }
+
+    #[test]
+    fn observed_consistency_rejects_a_stale_acknowledged_read() {
+        let counters = CounterSnapshot {
+            reads_behind_acknowledged_revision: 1,
+            ..CounterSnapshot::default()
+        };
+
+        let error = validate_observed_consistency(counters).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("readsBehindAcknowledgedRevision=1")
         );
     }
 }

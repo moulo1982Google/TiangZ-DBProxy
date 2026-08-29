@@ -33,8 +33,8 @@ use tiangz_dbproxy_core::{
 };
 use tiangz_dbproxy_protocol::{
     DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_PAYLOAD_BYTES, MAX_AUTH_TOKEN_BYTES,
-    MAX_CLIENT_NAME_BYTES, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION, ProtocolError, read_message,
-    wire, write_message,
+    MAX_CLIENT_NAME_BYTES, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION, ProtocolError,
+    is_compatible_protocol_fingerprint, read_message, wire, write_message,
 };
 use tiangz_dbproxy_storage::{
     CacheRepairStats, DEFAULT_OUTBOX_STREAM_PREFIX, OutboxStats, PostgresCacheRepairQueue,
@@ -204,6 +204,17 @@ impl StorageBackend {
         redis_url: &str,
         config: StorageBackendConfig,
     ) -> Result<Self, BackendError> {
+        Self::connect_with_redis_urls(postgres_url, redis_url, redis_url, config).await
+    }
+
+    /// Connect with separate Redis endpoints for durable queues and the disposable snapshot cache.
+    /// Keeping them equal preserves the original single-Redis deployment.
+    pub async fn connect_with_redis_urls(
+        postgres_url: &str,
+        redis_url: &str,
+        cache_redis_url: &str,
+        config: StorageBackendConfig,
+    ) -> Result<Self, BackendError> {
         if config.shard_count == 0 {
             return Err(BackendError::InvalidConfig("storage shard count is zero"));
         }
@@ -213,7 +224,7 @@ impl StorageBackend {
             shards.push(
                 TieredSnapshotStore::connect_with_config(
                     postgres_url,
-                    redis_url,
+                    cache_redis_url,
                     config.tiered,
                     Arc::clone(&metrics),
                 )
@@ -1097,7 +1108,7 @@ async fn handle_connection(
     };
 
     if hello.protocol_version != PROTOCOL_VERSION
-        || hello.protocol_fingerprint != PROTOCOL_FINGERPRINT
+        || !is_compatible_protocol_fingerprint(&hello.protocol_fingerprint)
     {
         config
             .metrics
@@ -1154,7 +1165,7 @@ async fn handle_connection(
     let accepted = wire::ServerFrame {
         body: Some(wire::server_frame::Body::Hello(wire::ServerHello {
             protocol_version: PROTOCOL_VERSION,
-            protocol_fingerprint: PROTOCOL_FINGERPRINT.to_string(),
+            protocol_fingerprint: hello.protocol_fingerprint.clone(),
             accepted: true,
             error: None,
         })),

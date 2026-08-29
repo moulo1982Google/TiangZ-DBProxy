@@ -51,7 +51,8 @@
           "properties": {
             "backend": { "const": "postgresRedis" },
             "postgresUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-            "redisUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+            "redisUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "Redis URL for the AOF-backed snapshot backlog and Outbox stream." },
+            "cacheRedisUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "Optional independent snapshot-cache Redis URL. When omitted, redisUrlEnv is reused for backward compatibility." },
             "shards": { "type": "integer", "minimum": 1, "default": 4 },
             "cacheFallbackConcurrency": { "type": "integer", "minimum": 1, "default": 16 },
             "cacheFallbackTimeoutMs": { "type": "integer", "minimum": 1, "default": 2000 },

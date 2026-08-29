@@ -18,7 +18,7 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 - 交易 Posting 最多 512 条，Outbox 事件最多 64 条；
 - 所有 ID、Schema、topic 等文本都有 UTF-8 字节上限，topic 仅允许字母、数字、`.`、`_`、`-`。
 
-第一帧必须是 `ClientHello(protocol_version, protocol_fingerprint, auth_token, client_name)`。当前握手版本是 2，fingerprint 是权威 proto 文件的 SHA-256。任一不匹配都不会进入 RPC 调度。proto 的 package 名保留 `tiangz.dbproxy.v1` 只是生成代码命名空间；兼容性由握手版本和指纹共同决定。
+第一帧必须是 `ClientHello(protocol_version, protocol_fingerprint, auth_token, client_name)`。当前握手版本是 2，fingerprint 是权威 proto 先统一为 LF 后的 SHA-256。为滚动升级已在线的旧 v2 客户端，server 还精确接受换行规范化前的已知指纹`d20f…e4f1f`并向该连接原样回显；它不接受任意别名，新客户端也不会主动降级。版本或这两个明确指纹以外的值都不会进入 RPC 调度。下一次协议版本提升时旧别名因版本不匹配自然失效。proto 的 package 名保留 `tiangz.dbproxy.v1` 只是生成代码命名空间；兼容性由握手版本和指纹共同决定。
 
 ## 十三类 RPC
 
