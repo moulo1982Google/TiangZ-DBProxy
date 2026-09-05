@@ -27,6 +27,131 @@ fn test_suffix() -> String {
 }
 
 #[tokio::test]
+#[ignore = "需要独立 PostgreSQL；使用 --ignored 显式运行"]
+async fn generic_commit_preserves_atomic_effects_and_immutable_facts() {
+    use tiangz_dbproxy_core::{AppendRecord, CommitEffects};
+    let url = std::env::var("DBPROXY_POSTGRES_URL").unwrap();
+    let mut store = PostgresSnapshotStore::connect(&url).await.unwrap();
+    let (sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    let id = format!("generic-{}", test_suffix());
+    let write = TransactionalRecordWrite {
+        record: RecordKey::new("document", &id).unwrap(),
+        schema: "document".into(),
+        schema_version: 1,
+        expected_revision: Revision::ZERO,
+        payload: b"state".to_vec(),
+        updated_at_unix_ms: 1,
+    };
+    let request = MultiRecordTransactionalWrite {
+        operation_id: id.clone(),
+        writes: vec![write],
+        result: b"ok".to_vec(),
+    };
+    let effects = CommitEffects {
+        appends: vec![AppendRecord {
+            record: RecordKey::new("audit", &id).unwrap(),
+            schema: "fact".into(),
+            schema_version: 1,
+            payload: b"fact".to_vec(),
+            occurred_at_unix_ms: 1,
+        }],
+        outbox_events: vec![OutboxEvent {
+            event_id: id.clone(),
+            topic: "document.changed".into(),
+            partition_key: id.clone(),
+            payload: b"event".to_vec(),
+            occurred_at_unix_ms: 1,
+        }],
+    };
+    let mut stale = request.clone();
+    stale.writes[0].expected_revision = Revision(10);
+    assert!(store.commit_records(stale, effects.clone()).await.is_err());
+    assert!(
+        store
+            .load(&request.writes[0].record)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        store
+            .commit_records(request.clone(), effects.clone())
+            .await
+            .unwrap(),
+        MultiRecordTransactionalWriteOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        store
+            .commit_records(request.clone(), effects.clone())
+            .await
+            .unwrap(),
+        MultiRecordTransactionalWriteOutcome::Duplicate { .. }
+    ));
+    assert!(store.apply_multi(request.clone()).await.is_err());
+    let row = sql
+        .query_one(
+            "SELECT trade_id, payload FROM dbproxy_outbox WHERE event_id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, Option<String>>(0), None);
+    assert_eq!(row.get::<_, Vec<u8>>(1), b"event");
+    assert!(sql.execute("UPDATE dbproxy_append_records SET payload=$1 WHERE namespace='audit' AND record_key=$2", &[&b"tampered".to_vec(), &id]).await.is_err());
+    assert!(
+        sql.execute(
+            "DELETE FROM dbproxy_append_records WHERE namespace='audit' AND record_key=$1",
+            &[&id]
+        )
+        .await
+        .is_err()
+    );
+    let mut next = request.clone();
+    next.operation_id.push_str("-next");
+    next.writes[0].expected_revision = Revision(1);
+    next.writes[0].payload = b"wrong".to_vec();
+    assert!(
+        store
+            .commit_records(next.clone(), effects.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .commit_records(
+                next,
+                CommitEffects {
+                    appends: vec![],
+                    outbox_events: effects.outbox_events
+                }
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load(&request.writes[0].record)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"state"
+    );
+    assert!(
+        store
+            .load_multi_receipt(&format!("{id}-next"), &[request.writes[0].record.clone()])
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 #[ignore = "需要本机 PostgreSQL；使用 --ignored 显式运行"]
 async fn postgres_snapshot_table_uses_32_hash_partitions() {
     let postgres_url = std::env::var("DBPROXY_POSTGRES_URL")
@@ -72,6 +197,8 @@ async fn postgres_snapshot_table_uses_32_hash_partitions() {
             (5, "trade-outbox".to_string()),
             (6, "operation-registry".to_string()),
             (7, "hardening".to_string()),
+            (8, "generic-commit".to_string()),
+            (9, "outbox-relay".to_string()),
         ]
     );
 

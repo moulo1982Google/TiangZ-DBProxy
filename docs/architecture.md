@@ -1,5 +1,15 @@
 # DBProxy 架构说明
 
+## 通用提交集成（2026-09-05）
+
+`CommitRecords` 组合非空快照写集合、可选追加事实、可选 Outbox 和业务回执；复用多记录 CAS 提交，不解释 payload。`dbproxy_append_records` 使用独立 namespace/key 唯一键，禁止 UPDATE/DELETE/TRUNCATE；本轮没有新增扫描/索引查询 API，审计查询由后续只读工具或消费端投影承担。
+
+效果规范化后以 bincode standard 编码保存于 `dbproxy_multi_transaction_effects`，重复操作必须比较完整效果。该编码属于持久幂等契约，后续改变结构/编码必须设计兼容读取。普通无效果事务无需新增效果行；带效果的操作用普通多记录 API 重试会被新服务拒绝。
+
+迁移 008 将 Outbox 的 operation_id 外键转为通用操作注册表，trade_id 允许 NULL。旧交易行保留，通用事件的发布字段 trade_id 为空字符串。全部服务和 worker 升级后才启用通用写入；旧二进制不识别新效果和 NULL trade_id，启用后不得直接回滚二进制。
+
+`TradeState`、零和 Posting 和专用 Trade API 是过渡期兼容能力，尚未从内核移除。新领域采用通用提交，状态机与资产规则在游戏服务中实现。其余章节中的“交易原语”描述旧兼容入口，不能作为继续扩展领域规则的依据。详见[通用持久化调整](generic-persistence-plan.md)。
+
 ## 定位与边界
 
 DBProxy 是 TiangZ 的独立持久化边界。业务服务提交已经序列化的完整快照和事务计划；DBProxy 负责 Revision/CAS、幂等、同库原子提交、缓存、持久队列和恢复，不负责场景、道具价格、玩家资格、背包容量等玩法规则。
@@ -126,7 +136,9 @@ Redis 使用自动重连的 `ConnectionManager`。PostgreSQL 连接发现关闭�
 - `004_cache_repair.sql`：持久缓存修复队列；
 - `005_trade_outbox.sql`：交易、不可变账本和 Outbox；
 - `006_operation_registry.sql`：跨事务类型的 operation ID 注册表；
-- `007_hardening.sql`：旧库兼容字段和交易状态约束。
+- `007_hardening.sql`：旧库兼容字段和交易状态约束；
+- `008_generic_commit.sql`：通用提交效果、不可变追加记录以及与交易无关的 Outbox；
+- `009_outbox_relay.sql`：持久路由/Publisher 身份、入队序号、租约令牌与管理审计。新配置与兼容限制见 [Outbox Relay](outbox-relay.md)。
 
 ## 网络和 SDK
 

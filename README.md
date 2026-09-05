@@ -1,5 +1,7 @@
 # TiangZ DBProxy
 
+本地集成分支新增 `CommitRecords`：多记录 CAS、不可变追加事实和 Outbox 同一事务提交，不要求交易状态或账本规则。旧接口保持兼容，旧 Trade API 暂留兼容入口。实施状态与发布前验证见[通用持久化计划](docs/generic-persistence-plan.md)；当前远程七天演练不使用这些修改。
+
 TiangZ DBProxy 是独立的 Rust 持久化服务项目。
 
 它负责通用的：
@@ -48,6 +50,8 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transport适配；这些领域Payload与恢复逻辑不属于本仓库。交易 API 只提供通用状态/CAS/账本/Outbox 原子边界，所有权、价格、余额和风控仍由主工程的领域 Repository 决定。架构、演练、分区和审视结果分别见[架构说明](docs/architecture.md)、[恢复手册](docs/durability-recovery-runbook.md)、[两小时故障演练报告](docs/fault-soak-report-2026-08-27.md)、[PostgreSQL 快照分区](docs/postgresql-partitioning.md)、[交易安全说明](docs/trade-safety-and-outbox.md)和[代码审视记录](docs/dbproxy-code-review.md)。
 
 ## 启动配置
+
+通用 Outbox Relay 的 Redis 路由、禁用的未来 MQ 声明、离线检查和审计管理命令见[Outbox Relay](docs/outbox-relay.md)与[配置示例](configs/outbox-relay.example.json)。旧配置及旧 Stream 地址保持兼容；新来源不能在所有 worker 升级前启用。
 
 DBProxy使用带`configVersion: 1`的严格JSON保存普通启动参数，默认读取`configs/local.json`，并由`configs/dbproxy.schema.json`提供编辑器提示。`runtime.workerThreads`可以固定Tokio Runtime工作线程数，省略时沿用Tokio按逻辑CPU选择的行为；它与只负责Redis积压消费的`backlog.workers`不是同一个参数。连接串和认证令牌不能写进JSON；配置文件只记录环境变量名，由部署环境注入实际密钥：
 

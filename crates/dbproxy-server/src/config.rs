@@ -39,6 +39,8 @@ pub struct DbProxyConfig {
     #[serde(default)]
     pub outbox: RetryQueueSection,
     #[serde(default)]
+    pub outbox_relay: crate::relay_config::OutboxRelaySection,
+    #[serde(default)]
     pub logging: LoggingSection,
     #[serde(default)]
     pub observability: ObservabilitySection,
@@ -242,6 +244,7 @@ pub struct ResolvedDbProxyConfig {
     pub backlog_failure_delay: Duration,
     pub cache_repair: ResolvedRetryQueue,
     pub outbox: ResolvedRetryQueue,
+    pub outbox_relay: crate::relay_config::ResolvedOutboxRelay,
     pub log_filter: String,
     pub observability_listen_addr: Option<SocketAddr>,
 }
@@ -316,7 +319,7 @@ impl fmt::Debug for ResolvedDbProxyConfig {
 }
 
 #[derive(Debug)]
-pub struct ConfigError(String);
+pub struct ConfigError(pub(crate) String);
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -353,6 +356,25 @@ pub fn config_path_from_args(
 /// Load strict JSON and resolve secret references. Unknown fields, empty variables, and unsafe zeroes fail before networking.
 pub fn load_config(path: impl AsRef<Path>) -> Result<ResolvedDbProxyConfig, ConfigError> {
     load_config_with(path, |name| env::var(name).ok())
+}
+
+/// 离线预检不读取环境密钥或联网；实际密钥可用性仍由正式启动检查。
+/// Offline preflight uses placeholders without reading secrets or networking.
+pub fn check_config(path: impl AsRef<Path>) -> Result<(), ConfigError> {
+    let path = path.as_ref();
+    let text =
+        fs::read_to_string(path).map_err(|_| ConfigError("cannot read configuration".into()))?;
+    let config: DbProxyConfig =
+        serde_json::from_str(&text).map_err(|e| ConfigError(format!("invalid config: {e}")))?;
+    let filter = config.logging.filter_env.clone();
+    config.resolve(path, |name| {
+        if name == filter {
+            None
+        } else {
+            Some("redis://config-check.invalid/0".into())
+        }
+    })?;
+    Ok(())
 }
 
 fn load_config_with(
@@ -402,6 +424,7 @@ impl DbProxyConfig {
         require_positive("backlog.failureDelayMs", self.backlog.failure_delay_ms)?;
         let cache_repair = resolve_retry_queue("cacheRepair", self.cache_repair)?;
         let outbox = resolve_retry_queue("outbox", self.outbox)?;
+        let outbox_relay = self.outbox_relay.resolve(outbox.lease_ms, &environment)?;
 
         let auth_token = required_environment(&environment, &self.server.auth_token_env)?;
         let storage = match self.storage {
@@ -478,6 +501,13 @@ impl DbProxyConfig {
             }
         };
         validate_environment_name(&self.logging.filter_env)?;
+        if matches!(storage, ResolvedStorage::Memory { .. })
+            && (!outbox_relay.routes.is_empty() || !outbox_relay.publishers.is_empty())
+        {
+            return Err(ConfigError(
+                "memory backend cannot activate outbox publishers or sources".into(),
+            ));
+        }
         let log_filter = environment(&self.logging.filter_env)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(self.logging.default_filter);
@@ -503,13 +533,14 @@ impl DbProxyConfig {
             backlog_failure_delay: Duration::from_millis(self.backlog.failure_delay_ms),
             cache_repair,
             outbox,
+            outbox_relay,
             log_filter,
             observability_listen_addr: self.observability.listen_addr,
         })
     }
 }
 
-fn required_environment(
+pub(crate) fn required_environment(
     environment: &impl Fn(&str) -> Option<String>,
     name: &str,
 ) -> Result<String, ConfigError> {
@@ -523,7 +554,7 @@ fn required_environment(
         })
 }
 
-fn validate_environment_name(name: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_environment_name(name: &str) -> Result<(), ConfigError> {
     let mut characters = name.chars();
     let valid_first = characters
         .next()

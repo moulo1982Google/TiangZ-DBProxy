@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashSet};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::{Revision, StoreError, TransactionRecordReceipt, TransactionalRecordWrite};
+use super::{
+    OutboxEvent, Revision, StoreError, TransactionRecordReceipt, TransactionalRecordWrite,
+};
 
 /// DBProxy认可的最小托管状态机；Settled和Cancelled是终态。
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -50,16 +52,6 @@ pub struct LedgerPosting {
     pub asset: String,
     pub amount: i64,
     pub metadata: Vec<u8>,
-}
-
-/// 与交易一起提交、由后台worker至少一次投递的Outbox事件。
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct OutboxEvent {
-    pub event_id: String,
-    pub topic: String,
-    pub partition_key: String,
-    pub payload: Vec<u8>,
-    pub occurred_at_unix_ms: u64,
 }
 
 /// 一次原子交易：状态、玩家/领域快照、账本和Outbox要么一起提交，要么全部回滚。
@@ -219,6 +211,11 @@ pub fn normalize_trade_transaction(
         .sort_by(|left, right| left.event_id.cmp(&right.event_id));
     let mut event_ids = HashSet::with_capacity(request.outbox_events.len());
     for event in &request.outbox_events {
+        if event.topic.starts_with(crate::RELAY_TOPIC_PREFIX) {
+            return Err(StoreError::InvalidOutboxEvent(
+                "relay envelopes require CommitRecords",
+            ));
+        }
         if event.event_id.trim().is_empty() {
             return Err(StoreError::InvalidOutboxEvent("event id is empty"));
         }

@@ -196,6 +196,24 @@ message LoadMultiTransactionResponse {
   MultiTransactionReceipt receipt = 1;
 }
 
+// Opaque immutable facts; identities are independent from snapshot identities.
+message AppendRecord {
+  RecordKey record = 1;
+  string schema = 2;
+  uint32 schema_version = 3;
+  bytes payload = 4;
+  uint64 occurred_at_unix_ms = 5;
+}
+
+// Separate RPC so older servers cannot silently discard transaction effects.
+message CommitRecordsRequest {
+  string operation_id = 1;
+  repeated TransactionalRecordWrite writes = 2;
+  bytes result = 3;
+  repeated AppendRecord appends = 4;
+  repeated OutboxEvent outbox_events = 5;
+}
+
 message TradeEnvelope {
   string trade_id = 1;
   uint64 version = 2;
@@ -287,6 +305,7 @@ message RequestEnvelope {
     ApplyTradeTransactionRequest apply_trade_transaction = 20;
     LoadTradeRequest load_trade = 21;
     LoadTradeTransactionRequest load_trade_transaction = 22;
+    CommitRecordsRequest commit_records = 23;
   }
 }
 
@@ -307,6 +326,7 @@ message ResponseEnvelope {
     ApplyTradeTransactionResponse apply_trade_transaction = 20;
     LoadTradeResponse load_trade = 21;
     LoadTradeTransactionResponse load_trade_transaction = 22;
+    ApplyMultiTransactionResponse commit_records = 23;
   }
 }
 
@@ -322,6 +342,8 @@ message ServerHello {
   string protocol_fingerprint = 2;
   bool accepted = 3;
   RpcError error = 4;
+  // Recognizes the versioned generic Outbox envelope and immutable relay routing contract.
+  bool supports_outbox_relay = 5;
 }
 
 message ClientFrame {

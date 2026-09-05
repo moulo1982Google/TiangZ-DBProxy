@@ -96,6 +96,39 @@
       "$ref": "#/$defs/retryQueue",
       "description": "PostgreSQL事务Outbox worker；事件至少一次发布到Redis Streams。"
     },
+    "outboxRelay": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "publishTimeoutMs": { "type": "integer", "minimum": 3000, "maximum": 60000, "default": 5000, "description": "必须比 outbox.leaseMs 至少少 1000ms。" },
+        "defaultPublisher": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+        "publishers": {
+          "type": "array", "maxItems": 32,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["id", "backend", "connectionEnv"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$", "description": "legacy 为保留 ID；更换目标集群必须更换 ID。" },
+              "backend": { "enum": ["redisStream", "kafka", "rabbitMq"] },
+              "connectionEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+              "enabled": { "type": "boolean", "default": true }
+            },
+            "allOf": [{ "if": { "properties": { "backend": { "enum": ["kafka", "rabbitMq"] } } }, "then": { "required": ["enabled"], "properties": { "enabled": { "const": false } } } }]
+          }
+        },
+        "sources": {
+          "type": "array", "maxItems": 64,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["producer", "version", "destination"],
+            "properties": {
+              "producer": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+              "enabled": { "type": "boolean", "default": true, "description": "未来 MQ 的来源可以先声明为 false，不注册路由、不启用投递。" },
+              "version": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+              "publisher": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+              "destination": { "type": "string", "minLength": 1, "maxLength": 256, "description": "完整 Stream 地址；dbproxy:outbox: 前缀保留给旧消息。" }
+            }
+          }
+        }
+      }
+    },
     "logging": {
       "type": "object",
       "additionalProperties": false,

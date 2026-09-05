@@ -1,15 +1,16 @@
 //! PostgreSQL outbox queue and Redis Streams publisher.
 
+#[cfg(test)]
+#[path = "outbox_publisher_tests.rs"]
+mod publisher_tests;
+
 use std::sync::Arc;
 
-use redis::aio::ConnectionManager;
+use redis::aio::MultiplexedConnection;
 use tiangz_dbproxy_core::OutboxEvent;
 use tokio::sync::Mutex;
 
-use crate::{
-    DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS, SharedPostgresClient, StorageError,
-    open_redis_connection_manager,
-};
+use crate::{DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS, SharedPostgresClient, StorageError};
 
 const MAX_ERROR_CHARS: usize = 1_024;
 
@@ -19,6 +20,10 @@ pub struct OutboxLease {
     pub operation_id: String,
     pub trade_id: String,
     pub attempt_count: u64,
+    pub producer: String,
+    pub publisher_id: String,
+    pub destination: String,
+    pub lease_token: i64,
     lease_owner: String,
 }
 
@@ -32,7 +37,7 @@ pub struct OutboxStats {
 
 #[derive(Clone)]
 pub struct PostgresOutboxQueue {
-    client: SharedPostgresClient,
+    pub(crate) client: SharedPostgresClient,
 }
 
 impl PostgresOutboxQueue {
@@ -44,6 +49,17 @@ impl PostgresOutboxQueue {
         &self,
         worker_id: &str,
         lease_ms: u64,
+    ) -> Result<Option<OutboxLease>, StorageError> {
+        self.claim_for_publisher(worker_id, lease_ms, None).await
+    }
+
+    /// 可选限制 Publisher，供独立验收或专用 worker 使用，不跨来源修改队列。
+    /// Optional publisher scoping for isolated acceptance or dedicated workers.
+    pub async fn claim_for_publisher(
+        &self,
+        worker_id: &str,
+        lease_ms: u64,
+        publisher: Option<&str>,
     ) -> Result<Option<OutboxLease>, StorageError> {
         validate_worker(worker_id, lease_ms)?;
         let lease_ms = i64::try_from(lease_ms)
@@ -59,29 +75,33 @@ WITH candidate AS (
     WHERE current_event.published_at IS NULL
       AND current_event.dead_lettered_at IS NULL
       AND current_event.available_at <= clock_timestamp()
+      AND ($3::TEXT IS NULL OR current_event.publisher_id = $3)
       AND (current_event.lease_until IS NULL OR current_event.lease_until <= clock_timestamp())
       AND NOT EXISTS (
           SELECT 1
           FROM dbproxy_outbox AS prior_event
-          WHERE prior_event.topic = current_event.topic
+          WHERE prior_event.publisher_id = current_event.publisher_id
+            AND prior_event.destination = current_event.destination
             AND prior_event.partition_key = current_event.partition_key
             AND prior_event.published_at IS NULL
-            AND (prior_event.created_at, prior_event.event_id)
-                < (current_event.created_at, current_event.event_id)
+            AND prior_event.enqueue_order < current_event.enqueue_order
       )
-    ORDER BY current_event.created_at, current_event.event_id
+    ORDER BY current_event.enqueue_order
     FOR UPDATE OF current_event SKIP LOCKED
     LIMIT 1
 )
 UPDATE dbproxy_outbox AS event
 SET lease_owner = $1,
+    lease_token = event.lease_token + 1,
+    expired_leases = event.expired_leases + CASE WHEN event.lease_until IS NOT NULL THEN 1 ELSE 0 END,
     lease_until = clock_timestamp() + ($2::BIGINT * interval '1 millisecond')
 FROM candidate
 WHERE event.event_id = candidate.event_id
 RETURNING event.event_id, event.operation_id, event.trade_id, event.topic,
-          event.partition_key, event.payload, event.occurred_at_unix_ms, event.attempt_count
+          event.partition_key, event.payload, event.occurred_at_unix_ms, event.attempt_count,
+          event.producer, event.publisher_id, event.destination, event.lease_token
 "#,
-                &[&worker_id, &lease_ms],
+                &[&worker_id, &lease_ms, &publisher],
             )
             .await?;
         let Some(row) = row else {
@@ -101,8 +121,13 @@ RETURNING event.event_id, event.operation_id, event.trade_id, event.topic,
                 occurred_at_unix_ms: occurred_at,
             },
             operation_id: row.get(1),
-            trade_id: row.get(2),
+            // Empty for generic commits; legacy trade deliveries retain their original ID.
+            trade_id: row.get::<_, Option<String>>(2).unwrap_or_default(),
             attempt_count,
+            producer: row.get(8),
+            publisher_id: row.get(9),
+            destination: row.get(10),
+            lease_token: row.get(11),
             lease_owner: worker_id.to_string(),
         }))
     }
@@ -116,8 +141,13 @@ RETURNING event.event_id, event.operation_id, event.trade_id, event.topic,
 UPDATE dbproxy_outbox
 SET published_at = clock_timestamp(), lease_owner = NULL, lease_until = NULL, last_error = NULL
 WHERE event_id = $1 AND lease_owner = $2 AND published_at IS NULL
+  AND lease_token = $3 AND lease_until > clock_timestamp()
 "#,
-                &[&lease.event.event_id, &lease.lease_owner],
+                &[
+                    &lease.event.event_id,
+                    &lease.lease_owner,
+                    &lease.lease_token,
+                ],
             )
             .await?;
         Ok(updated == 1)
@@ -158,6 +188,7 @@ SET attempt_count = attempt_count + 1,
         ELSE NULL
     END
 WHERE event_id = $1 AND lease_owner = $2 AND published_at IS NULL
+  AND lease_token = $6 AND lease_until > clock_timestamp()
 "#,
                 &[
                     &lease.event.event_id,
@@ -165,6 +196,7 @@ WHERE event_id = $1 AND lease_owner = $2 AND published_at IS NULL
                     &error,
                     &delay,
                     &maximum,
+                    &lease.lease_token,
                 ],
             )
             .await?;
@@ -173,29 +205,12 @@ WHERE event_id = $1 AND lease_owner = $2 AND published_at IS NULL
 
     /// Requeue one inspected dead letter after an operator has fixed the root cause.
     pub async fn requeue_dead_letter(&self, event_id: &str) -> Result<bool, StorageError> {
-        if event_id.trim().is_empty() {
-            return Err(StorageError::QueueProtocol(
-                "outbox event id is empty".to_string(),
-            ));
-        }
-        let mut client = self.client.lock().await;
-        client.ensure_connected().await?;
-        let updated = client
-            .execute(
-                r#"
-UPDATE dbproxy_outbox
-SET attempt_count = 0,
-    available_at = clock_timestamp(),
-    lease_owner = NULL,
-    lease_until = NULL,
-    last_error = NULL,
-    dead_lettered_at = NULL
-WHERE event_id = $1 AND published_at IS NULL AND dead_lettered_at IS NOT NULL
-"#,
-                &[&event_id],
-            )
-            .await?;
-        Ok(updated == 1)
+        self.retry_dead_letter(
+            event_id,
+            "legacy-api",
+            "Explicit retry through the compatibility API",
+        )
+        .await
     }
 
     pub async fn stats(&self) -> Result<OutboxStats, StorageError> {
@@ -225,7 +240,8 @@ FROM dbproxy_outbox
 
 #[derive(Clone)]
 pub struct RedisOutboxPublisher {
-    connection: Arc<Mutex<ConnectionManager>>,
+    connection: Arc<Mutex<Option<MultiplexedConnection>>>,
+    client: redis::Client,
     stream_prefix: Arc<str>,
 }
 
@@ -236,47 +252,98 @@ impl RedisOutboxPublisher {
                 "outbox stream prefix is empty".to_string(),
             ));
         }
-        let connection = open_redis_connection_manager(url).await?;
+        let client = redis::Client::open(url)?;
+        let connection = client.get_multiplexed_async_connection().await?;
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            connection: Arc::new(Mutex::new(Some(connection))),
+            client,
             stream_prefix: Arc::from(stream_prefix),
         })
     }
 
     /// Publish at least once. Consumers must deduplicate by event_id.
     pub async fn publish(&self, lease: &OutboxLease) -> Result<String, StorageError> {
-        let stream = format!("{}{}", self.stream_prefix, lease.event.topic);
-        let mut connection = self.connection.lock().await;
-        let stream_id: String = redis::cmd("XADD")
+        let stream = if tiangz_dbproxy_core::EventEnvelope::from_outbox(&lease.event)?.is_some() {
+            lease.destination.clone()
+        } else {
+            format!("{}{}", self.stream_prefix, lease.event.topic)
+        };
+        self.publish_to(&lease.event, &stream, &lease.operation_id, &lease.trade_id)
+            .await
+    }
+
+    async fn publish_to(
+        &self,
+        event: &OutboxEvent,
+        stream: &str,
+        operation_id: &str,
+        trade_id: &str,
+    ) -> Result<String, StorageError> {
+        let mut slot = self.connection.lock().await;
+        if slot.is_none() {
+            *slot = Some(self.client.get_multiplexed_async_connection().await?);
+        }
+        // Take ownership before awaiting: cancellation discards the connection instead of
+        // acknowledging XADD on a possibly reconnected, unrelated WAITAOF connection.
+        let mut connection = slot.take().expect("initialized connection");
+        let mut command = redis::cmd("XADD");
+        command
             .arg(stream)
             .arg("*")
             .arg("event_id")
-            .arg(&lease.event.event_id)
+            .arg(&event.event_id)
             .arg("operation_id")
-            .arg(&lease.operation_id)
+            .arg(operation_id)
             .arg("trade_id")
-            .arg(&lease.trade_id)
+            .arg(trade_id)
             .arg("partition_key")
-            .arg(&lease.event.partition_key)
+            .arg(&event.partition_key)
             .arg("occurred_at_unix_ms")
-            .arg(lease.event.occurred_at_unix_ms)
+            .arg(event.occurred_at_unix_ms)
             .arg("payload")
-            .arg(&lease.event.payload)
-            .query_async(&mut *connection)
-            .await?;
+            .arg(&event.payload);
+        if tiangz_dbproxy_core::EventEnvelope::from_outbox(event)?.is_some() {
+            command.arg("event").arg(&event.payload);
+        }
+        let stream_id: String = command.query_async(&mut connection).await?;
         let timeout_ms = i64::try_from(DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS).unwrap_or(i64::MAX);
         let (local, _replicas): (i64, i64) = redis::cmd("WAITAOF")
             .arg(1)
             .arg(0)
             .arg(timeout_ms)
-            .query_async(&mut *connection)
+            .query_async(&mut connection)
             .await?;
         if local < 1 {
             return Err(StorageError::RedisAofNotDurable {
                 timeout_ms: DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS,
             });
         }
+        *slot = Some(connection);
         Ok(stream_id)
+    }
+}
+
+/// 首个内置 Publisher；旧类型名保留兼容，Relay 不依赖 Redis 的具体方法。
+/// First built-in publisher; the old concrete name remains source-compatible.
+pub type RedisStreamPublisher = RedisOutboxPublisher;
+
+#[async_trait::async_trait]
+impl crate::Publisher for RedisStreamPublisher {
+    async fn publish(
+        &self,
+        message: crate::PublishMessage<'_>,
+    ) -> Result<crate::PublishReceipt, crate::PublishError> {
+        tiangz_dbproxy_core::EventEnvelope::from_outbox(message.event)
+            .map_err(|_| crate::PublishError::Permanent("invalid envelope"))?;
+        self.publish_to(
+            message.event,
+            message.destination,
+            message.operation_id,
+            message.trade_id,
+        )
+        .await
+        .map(|message_id| crate::PublishReceipt { message_id })
+        .map_err(|_| crate::PublishError::Transient("Redis send or AOF confirmation failed"))
     }
 }
 

@@ -382,6 +382,16 @@ impl DbProxyClientPool {
             .await
     }
 
+    pub async fn commit_records(
+        &self,
+        request: MultiRecordTransactionalWrite,
+        effects: tiangz_dbproxy_core::CommitEffects,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, ClientError> {
+        self.write_client_for_operation(&request.operation_id)
+            .commit_records(request, effects)
+            .await
+    }
+
     pub async fn load_trade(&self, trade_id: &str) -> Result<Option<TradeEnvelope>, ClientError> {
         self.read_client_for_operation(trade_id)
             .load_trade(trade_id)
@@ -523,6 +533,7 @@ impl DbProxyClient {
         }
         if hello.protocol_version != PROTOCOL_VERSION
             || hello.protocol_fingerprint != PROTOCOL_FINGERPRINT
+            || !hello.supports_outbox_relay
         {
             return Err(ClientError::UnexpectedResponse(
                 "server accepted a different protocol",
@@ -915,25 +926,59 @@ impl DbProxyClient {
         &self,
         request: MultiRecordTransactionalWrite,
     ) -> Result<MultiRecordTransactionalWriteOutcome, ClientError> {
+        self.apply_records(request, None).await
+    }
+
+    pub async fn commit_records(
+        &self,
+        request: MultiRecordTransactionalWrite,
+        effects: tiangz_dbproxy_core::CommitEffects,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, ClientError> {
+        self.apply_records(request, Some(effects)).await
+    }
+
+    async fn apply_records(
+        &self,
+        request: MultiRecordTransactionalWrite,
+        effects: Option<tiangz_dbproxy_core::CommitEffects>,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, ClientError> {
         if request.writes.is_empty() || request.writes.len() > MAX_TRANSACTION_RECORDS {
             return Err(ClientError::InvalidConfig(
                 "multi-record transaction size is outside the protocol limit",
             ));
         }
-        let response = self
-            .call(wire::request_envelope::Body::ApplyMultiTransaction(
+        let is_commit = effects.is_some();
+        let body = if let Some(effects) = effects {
+            if effects.appends.len() > MAX_TRANSACTION_RECORDS
+                || effects.outbox_events.len() > tiangz_dbproxy_protocol::MAX_OUTBOX_EVENTS
+            {
+                return Err(ClientError::InvalidConfig("commit effects exceed limits"));
+            }
+            wire::request_envelope::Body::CommitRecords(wire::CommitRecordsRequest {
+                operation_id: request.operation_id,
+                writes: request.writes.iter().map(Into::into).collect(),
+                result: request.result,
+                appends: effects.appends.iter().map(Into::into).collect(),
+                outbox_events: effects.outbox_events.iter().map(Into::into).collect(),
+            })
+        } else {
+            wire::request_envelope::Body::ApplyMultiTransaction(
                 wire::ApplyMultiTransactionRequest {
                     operation_id: request.operation_id,
                     writes: request.writes.iter().map(Into::into).collect(),
                     result: request.result,
                 },
-            ))
-            .await?;
-        let Some(wire::response_envelope::Body::ApplyMultiTransaction(result)) = response.body
-        else {
-            return Err(ClientError::UnexpectedResponse(
-                "multi-transaction returned another response type",
-            ));
+            )
+        };
+        let response = self.call(body).await?;
+        let result = match response.body {
+            Some(wire::response_envelope::Body::ApplyMultiTransaction(r)) if !is_commit => r,
+            Some(wire::response_envelope::Body::CommitRecords(r)) if is_commit => r,
+            _ => {
+                return Err(ClientError::UnexpectedResponse(
+                    "record commit returned another response type",
+                ));
+            }
         };
         let records = result
             .records
@@ -1448,6 +1493,7 @@ fn request_operation(body: &wire::request_envelope::Body) -> &'static str {
         wire::request_envelope::Body::ApplyTradeTransaction(_) => "apply_trade_transaction",
         wire::request_envelope::Body::LoadTrade(_) => "load_trade",
         wire::request_envelope::Body::LoadTradeTransaction(_) => "load_trade_transaction",
+        wire::request_envelope::Body::CommitRecords(_) => "commit_records",
     }
 }
 

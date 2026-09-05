@@ -40,7 +40,9 @@ pub use backlog::{
     RedisSnapshotBacklog, RedisSnapshotBacklogStats, SnapshotBacklogAck, SnapshotBacklogLease,
 };
 pub use cache_repair::{CacheRepairLease, CacheRepairStats, PostgresCacheRepairQueue};
-pub use outbox::{OutboxLease, OutboxStats, PostgresOutboxQueue, RedisOutboxPublisher};
+pub use outbox::{
+    OutboxLease, OutboxStats, PostgresOutboxQueue, RedisOutboxPublisher, RedisStreamPublisher,
+};
 
 const SCHEMA_MIGRATION_BOOTSTRAP: &str = include_str!("../migrations/000_schema_migrations.sql");
 const SNAPSHOT_MIGRATION: &str = include_str!("../migrations/001_snapshot.sql");
@@ -50,6 +52,15 @@ const CACHE_REPAIR_MIGRATION: &str = include_str!("../migrations/004_cache_repai
 const TRADE_OUTBOX_MIGRATION: &str = include_str!("../migrations/005_trade_outbox.sql");
 const OPERATION_REGISTRY_MIGRATION: &str = include_str!("../migrations/006_operation_registry.sql");
 const HARDENING_MIGRATION: &str = include_str!("../migrations/007_hardening.sql");
+mod commit;
+mod outbox_admin;
+mod relay;
+pub use outbox_admin::{OutboxInspection, OutboxSourceStats};
+pub use relay::{
+    OutboxRoute, PublishError, PublishMessage, PublishReceipt, Publisher,
+    redis_endpoint_fingerprint,
+};
+use tiangz_dbproxy_core::CommitEffects;
 const MIGRATION_LOCK_ID: i64 = 8_390_417_203;
 pub const SNAPSHOT_PARTITION_COUNT: usize = 32;
 pub const DEFAULT_CACHE_FALLBACK_CONCURRENCY: usize = 16;
@@ -1110,11 +1121,17 @@ impl PostgresSnapshotStore {
     /// 连接数据库并执行幂等表与快照表迁移。
     /// Connect and apply the snapshot/idempotency schema.
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
-        let store = Self {
-            client: Arc::new(Mutex::new(ReconnectingPostgresClient::connect(url).await?)),
-        };
+        let store = Self::connect_existing(url).await?;
         store.migrate().await?;
         Ok(store)
+    }
+
+    /// 管理查询连接不执行迁移、不启动队列 worker。
+    /// Administrative connections do not migrate schemas or start workers.
+    pub async fn connect_existing(url: &str) -> Result<Self, StorageError> {
+        Ok(Self {
+            client: Arc::new(Mutex::new(ReconnectingPostgresClient::connect(url).await?)),
+        })
     }
 
     /// 在全局迁移锁下仅执行尚未登记的 schema migration。
@@ -1160,6 +1177,20 @@ impl PostgresSnapshotStore {
         )
         .await?;
         apply_schema_migration(&transaction, 7, "hardening", HARDENING_MIGRATION).await?;
+        apply_schema_migration(
+            &transaction,
+            8,
+            "generic-commit",
+            include_str!("../migrations/008_generic_commit.sql"),
+        )
+        .await?;
+        apply_schema_migration(
+            &transaction,
+            9,
+            "outbox-relay",
+            include_str!("../migrations/009_outbox_relay.sql"),
+        )
+        .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -1720,6 +1751,19 @@ impl AsyncMultiRecordTransactionStore for PostgresSnapshotStore {
         &mut self,
         request: MultiRecordTransactionalWrite,
     ) -> Result<MultiRecordTransactionalWriteOutcome, Self::Error> {
+        self.commit_records(request, CommitEffects::default()).await
+    }
+}
+
+impl PostgresSnapshotStore {
+    /// 原子保存记录与通用效果；兼容普通多记录事务和原始回执查询。
+    /// Atomically commit records and opaque effects, preserving existing receipts.
+    pub async fn commit_records(
+        &mut self,
+        request: MultiRecordTransactionalWrite,
+        effects: CommitEffects,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, StorageError> {
+        let effects = effects.normalize()?;
         validate_multi_transaction_request(&request)?;
         let mut request = request;
         request.writes.sort_by(|left, right| {
@@ -1747,6 +1791,7 @@ impl AsyncMultiRecordTransactionStore for PostgresSnapshotStore {
             .await?;
 
         if claimed.is_none() {
+            commit::verify_retry(&transaction, &operation_id, &effects).await?;
             let header = transaction
                 .query_one(
                     "SELECT result, record_count FROM dbproxy_multi_transactions WHERE operation_id = $1",
@@ -1794,6 +1839,7 @@ impl AsyncMultiRecordTransactionStore for PostgresSnapshotStore {
             });
         }
 
+        commit::lock_partitions(&transaction, &effects).await?;
         let mut revisions = Vec::with_capacity(request.writes.len());
         for write in &request.writes {
             // 用同一个数据库事务锁住每个逻辑记录，且始终按排序后的顺序加锁，避免跨玩家交易死锁。
@@ -1858,6 +1904,7 @@ impl AsyncMultiRecordTransactionStore for PostgresSnapshotStore {
                 .await?;
             cache_repair::enqueue_in_transaction(&transaction, &write.record, *revision).await?;
         }
+        commit::persist(&transaction, &operation_id, &effects).await?;
         transaction.commit().await?;
         let records = request
             .writes
@@ -3570,8 +3617,20 @@ impl AsyncMultiRecordTransactionStore for TieredSnapshotStore {
         &mut self,
         request: MultiRecordTransactionalWrite,
     ) -> Result<MultiRecordTransactionalWriteOutcome, Self::Error> {
+        self.commit_records(request, CommitEffects::default()).await
+    }
+}
+
+impl TieredSnapshotStore {
+    /// 提交后缓存失败由持久修复队列收敛，不重做领域决策。
+    /// Durable repair handles cache failure after an authoritative commit.
+    pub async fn commit_records(
+        &mut self,
+        request: MultiRecordTransactionalWrite,
+        effects: CommitEffects,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, StorageError> {
         let committed_writes = request.writes.clone();
-        let outcome = self.postgres.apply_multi(request).await?;
+        let outcome = self.postgres.commit_records(request, effects).await?;
         let (records, duplicate) = match &outcome {
             MultiRecordTransactionalWriteOutcome::Applied { records, .. } => (records, false),
             MultiRecordTransactionalWriteOutcome::Duplicate { records, .. } => (records, true),

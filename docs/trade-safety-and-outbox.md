@@ -1,5 +1,7 @@
 # 交易安全、托管状态机与 Outbox
 
+> 本文描述暂留兼容的 Trade API。新领域使用 CommitRecords 将版本化记录、追加事实和事件组合提交，状态迁移与记账规则由领域实现。当前 TiangZ 在线玩家交易已接入审计/事件，但完整持久托管状态机尚未迁移。Outbox 自迁移 008 起也可以来自通用事务，不再强制要求 trade_id；旧 worker 必须先升级。见[通用持久化计划](generic-persistence-plan.md)。
+
 本实现把一次交易中必须同生共死的持久化结果放进同一个 PostgreSQL 事务：交易状态、相关快照 Revision、不可变账本、幂等回执、缓存修复任务和 Outbox 事件。Redis 不参与交易提交判定。
 
 ## 责任边界
@@ -61,6 +63,8 @@ escrow:trade-1001   +100
 结算时再追加新的 Posting，把托管账户转给卖方；取消时追加反向 Posting。已经存在的 Posting 永远不修改或删除。`posting_id` 是全局幂等键，冲突会使整笔交易回滚。当前账本提供不可变审计事实，不代替业务侧的余额/物品规则，也没有实现按账本实时聚合余额的查询 API。
 
 ## PostgreSQL Outbox worker
+
+本地新版 worker 已改为通用 Relay + Publisher，并增加路由固定、租约令牌、有界发送与审计管理；旧交易地址/内容保持兼容。下面描述的旧投递约定仍有效，新增来源和升级要求见 [Outbox Relay](outbox-relay.md)。
 
 Outbox 事件与交易在同一事务写入，因此不存在“交易已提交但事件意图丢失”的窗口。worker 使用 `FOR UPDATE SKIP LOCKED` 领取短租约，失败后按指数退避重试，达到 `maxAttempts` 后进入死信。默认参数位于顶层 `outbox` 配置：1 个 worker、30 秒租约、1 秒到 60 秒退避、最多 20 次。
 

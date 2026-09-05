@@ -8,12 +8,14 @@
 pub mod config;
 mod memory_backend;
 mod observability;
+pub mod relay_config;
+pub mod relay_metrics;
 
 pub use memory_backend::MemoryBackend;
 pub use observability::{DbProxyMetrics, ObservabilityServer};
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     hash::{Hash, Hasher},
     io,
@@ -24,6 +26,7 @@ use std::{
 
 use async_trait::async_trait;
 use thiserror::Error;
+use tiangz_dbproxy_core::CommitEffects;
 use tiangz_dbproxy_core::{
     AsyncMultiRecordTransactionStore, AsyncSnapshotStore, AsyncTradeStore, AsyncTransactionalStore,
     MultiRecordTransactionalWrite, MultiRecordTransactionalWriteOutcome, RecordKey, Revision,
@@ -72,6 +75,16 @@ pub enum BackendError {
 /// Minimal backend used by the network layer; implementations must remain business-agnostic.
 #[async_trait]
 pub trait DbProxyBackend: Send + Sync + 'static {
+    async fn commit_records(
+        &self,
+        request: MultiRecordTransactionalWrite,
+        effects: CommitEffects,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, BackendError> {
+        let _ = (request, effects);
+        Err(BackendError::InvalidConfig(
+            "generic commits are not supported by this backend",
+        ))
+    }
     async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, BackendError>;
     async fn load_multi(
         &self,
@@ -168,7 +181,9 @@ pub struct StorageBackend {
     backlog: RedisSnapshotBacklog,
     cache_repairs: PostgresCacheRepairQueue,
     outbox: PostgresOutboxQueue,
-    outbox_publisher: RedisOutboxPublisher,
+    outbox_publishers: HashMap<String, Arc<dyn tiangz_dbproxy_storage::Publisher>>,
+    outbox_publish_timeout: Duration,
+    pub outbox_relay_metrics: Arc<relay_metrics::RelayMetrics>,
     metrics: Arc<StorageMetrics>,
 }
 
@@ -215,6 +230,25 @@ impl StorageBackend {
         cache_redis_url: &str,
         config: StorageBackendConfig,
     ) -> Result<Self, BackendError> {
+        Self::connect_with_outbox(
+            postgres_url,
+            redis_url,
+            cache_redis_url,
+            config,
+            &relay_config::ResolvedOutboxRelay::default(),
+        )
+        .await
+    }
+
+    /// 路由必须先注册再接流量；旧配置保留 legacy Publisher。
+    /// Registers immutable routes before serving traffic, preserving the legacy publisher.
+    pub async fn connect_with_outbox(
+        postgres_url: &str,
+        redis_url: &str,
+        cache_redis_url: &str,
+        config: StorageBackendConfig,
+        relay: &relay_config::ResolvedOutboxRelay,
+    ) -> Result<Self, BackendError> {
         if config.shard_count == 0 {
             return Err(BackendError::InvalidConfig("storage shard count is zero"));
         }
@@ -236,16 +270,46 @@ impl StorageBackend {
         let maintenance = PostgresSnapshotStore::connect(postgres_url).await?;
         let cache_repairs = maintenance.cache_repair_queue();
         let outbox = maintenance.outbox_queue();
+        outbox
+            .ensure_unregistered_routes(&relay.disabled_routes)
+            .await?;
+        let mut outbox_publishers: HashMap<String, Arc<dyn tiangz_dbproxy_storage::Publisher>> =
+            HashMap::new();
+        for (id, url) in std::iter::once(("legacy", redis_url)).chain(
+            relay
+                .publishers
+                .iter()
+                .map(|p| (p.id.as_str(), p.url.as_str())),
+        ) {
+            outbox
+                .register_publisher(
+                    id,
+                    &tiangz_dbproxy_storage::redis_endpoint_fingerprint(url)?,
+                )
+                .await?;
+            outbox_publishers.insert(
+                id.to_string(),
+                Arc::new(RedisOutboxPublisher::connect(url, DEFAULT_OUTBOX_STREAM_PREFIX).await?),
+            );
+        }
+        for route in &relay.routes {
+            outbox.register_route(route).await?;
+        }
+        for id in outbox.required_publishers().await? {
+            if !outbox_publishers.contains_key(&id) {
+                return Err(BackendError::InvalidConfig(
+                    "a registered route or pending event requires a missing publisher",
+                ));
+            }
+        }
         Ok(Self {
             shards,
             backlog: RedisSnapshotBacklog::connect(redis_url).await?,
             cache_repairs,
             outbox,
-            outbox_publisher: RedisOutboxPublisher::connect(
-                redis_url,
-                DEFAULT_OUTBOX_STREAM_PREFIX,
-            )
-            .await?,
+            outbox_publishers,
+            outbox_publish_timeout: Duration::from_millis(relay.publish_timeout_ms),
+            outbox_relay_metrics: Arc::new(relay_metrics::RelayMetrics::new(&relay.routes)),
             metrics,
         })
     }
@@ -412,25 +476,77 @@ impl StorageBackend {
         let Some(lease) = self.outbox.claim(worker_id, policy.lease_ms).await? else {
             return Ok(DurableQueueProcessOutcome::Empty);
         };
-        match self.outbox_publisher.publish(&lease).await {
+        let publisher = self
+            .outbox_publishers
+            .get(&lease.publisher_id)
+            .ok_or(BackendError::InvalidConfig("outbox publisher is missing"))?;
+        let message = tiangz_dbproxy_storage::PublishMessage {
+            event: &lease.event,
+            destination: &lease.destination,
+            operation_id: &lease.operation_id,
+            trade_id: &lease.trade_id,
+        };
+        let started = Instant::now();
+        let published = timeout(self.outbox_publish_timeout, publisher.publish(message)).await;
+        let status = match &published {
+            Ok(Ok(_)) => "success",
+            Ok(Err(_)) => "error",
+            Err(_) => "timeout",
+        };
+        self.outbox_relay_metrics.record(
+            &lease.producer,
+            &lease.publisher_id,
+            status,
+            started.elapsed().as_secs_f64(),
+        );
+        let publication =
+            published.unwrap_or(Err(tiangz_dbproxy_storage::PublishError::Transient(
+                "publication deadline exceeded; result may be unknown",
+            )));
+        match publication {
             Ok(_) => {
                 if self.outbox.acknowledge(&lease).await? {
                     Ok(DurableQueueProcessOutcome::Committed)
                 } else {
+                    self.outbox_relay_metrics.record(
+                        &lease.producer,
+                        &lease.publisher_id,
+                        "lease_lost",
+                        0.0,
+                    );
                     Ok(DurableQueueProcessOutcome::LeaseLost)
                 }
             }
             Err(error) => {
+                let max_attempts =
+                    if matches!(error, tiangz_dbproxy_storage::PublishError::Permanent(_)) {
+                        1
+                    } else {
+                        policy.max_attempts
+                    };
                 let dead_lettered =
-                    lease.attempt_count.saturating_add(1) >= u64::from(policy.max_attempts);
-                let retry_delay = policy.retry_delay_ms(lease.attempt_count);
+                    lease.attempt_count.saturating_add(1) >= u64::from(max_attempts);
+                let retry_delay =
+                    policy.outbox_retry_delay_ms(&lease.event.event_id, lease.attempt_count);
                 if !self
                     .outbox
-                    .fail(&lease, &error.to_string(), retry_delay, policy.max_attempts)
+                    .fail(&lease, &error.to_string(), retry_delay, max_attempts)
                     .await?
                 {
+                    self.outbox_relay_metrics.record(
+                        &lease.producer,
+                        &lease.publisher_id,
+                        "lease_lost",
+                        0.0,
+                    );
                     return Ok(DurableQueueProcessOutcome::LeaseLost);
                 }
+                self.outbox_relay_metrics.record(
+                    &lease.producer,
+                    &lease.publisher_id,
+                    if dead_lettered { "dead" } else { "retry" },
+                    0.0,
+                );
                 if dead_lettered {
                     Ok(DurableQueueProcessOutcome::DeadLettered)
                 } else {
@@ -594,6 +710,15 @@ impl DbProxyBackend for StorageBackend {
         Ok(store.apply_multi(request).await?)
     }
 
+    async fn commit_records(
+        &self,
+        request: MultiRecordTransactionalWrite,
+        effects: CommitEffects,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, BackendError> {
+        let mut store = self.shard_for_operation(&request.operation_id);
+        Ok(store.commit_records(request, effects).await?)
+    }
+
     async fn load_multi_transaction(
         &self,
         operation_id: &str,
@@ -647,6 +772,16 @@ pub struct RetryWorkerPolicy {
 }
 
 impl RetryWorkerPolicy {
+    /// 对同一事件/次数稳定的半幅抖动，避免整批事件同步重试。
+    /// Stable per-event jitter prevents synchronized retry waves.
+    fn outbox_retry_delay_ms(self, event_id: &str, attempt: u64) -> u64 {
+        use sha2::{Digest, Sha256};
+        let cap = self.retry_delay_ms(attempt);
+        let floor = cap.div_ceil(2);
+        let digest = Sha256::digest(format!("{event_id}/{attempt}").as_bytes());
+        let entropy = u64::from_le_bytes(digest[..8].try_into().expect("eight digest bytes"));
+        floor + entropy % (cap - floor + 1)
+    }
     fn validate(self) -> Result<Self, BackendError> {
         if self.lease_ms == 0
             || self.base_retry_delay_ms == 0
@@ -913,6 +1048,12 @@ pub async fn run_storage_metrics_poller(
             }
         };
         metrics.postgres_dependency_updated(postgres_healthy);
+        if postgres_healthy {
+            match backend.outbox.source_stats().await {
+                Ok(stats) => backend.outbox_relay_metrics.depths(stats),
+                Err(error) => tracing::warn!(%error,"failed to sample outbox source metrics"),
+            }
+        }
         tokio::select! {
             _ = sleep(interval) => {}
             changed = shutdown.changed() => {
@@ -1164,6 +1305,7 @@ async fn handle_connection(
 
     let accepted = wire::ServerFrame {
         body: Some(wire::server_frame::Body::Hello(wire::ServerHello {
+            supports_outbox_relay: true,
             protocol_version: PROTOCOL_VERSION,
             protocol_fingerprint: hello.protocol_fingerprint.clone(),
             accepted: true,
@@ -1210,6 +1352,7 @@ async fn write_hello_rejection(
         stream,
         &wire::ServerFrame {
             body: Some(wire::server_frame::Body::Hello(wire::ServerHello {
+                supports_outbox_relay: false,
                 protocol_version: PROTOCOL_VERSION,
                 protocol_fingerprint: PROTOCOL_FINGERPRINT.to_string(),
                 accepted: false,
@@ -1511,6 +1654,63 @@ async fn dispatch_body(
                 wire::LoadTransactionResponse {
                     receipt: receipt.map(transaction_receipt),
                 },
+            ))
+        }
+        wire::request_envelope::Body::CommitRecords(request) => {
+            validate_text_field(
+                "commit.operation_id",
+                &request.operation_id,
+                tiangz_dbproxy_protocol::MAX_IDEMPOTENCY_KEY_BYTES,
+            )?;
+            if request.writes.is_empty()
+                || request.writes.len() > tiangz_dbproxy_protocol::MAX_TRANSACTION_RECORDS
+                || request.appends.len() > tiangz_dbproxy_protocol::MAX_TRANSACTION_RECORDS
+                || request.outbox_events.len() > tiangz_dbproxy_protocol::MAX_OUTBOX_EVENTS
+            {
+                return Err(RpcFailure::invalid("commit collection size exceeds limits"));
+            }
+            let writes = request
+                .writes
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(RpcFailure::from_protocol)?;
+            validate_transaction_payloads(&writes, max_payload_bytes)?;
+            validate_payload_size("commit.result", request.result.len(), max_payload_bytes)?;
+            let appends = request
+                .appends
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<tiangz_dbproxy_core::AppendRecord>, _>>()
+                .map_err(RpcFailure::from_protocol)?;
+            let events = request
+                .outbox_events
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<tiangz_dbproxy_core::OutboxEvent>, _>>()
+                .map_err(RpcFailure::from_protocol)?;
+            for append in &appends {
+                validate_payload_size("commit.append", append.payload.len(), max_payload_bytes)?;
+            }
+            for event in &events {
+                validate_payload_size("commit.event", event.payload.len(), max_payload_bytes)?;
+            }
+            let outcome = backend
+                .commit_records(
+                    MultiRecordTransactionalWrite {
+                        operation_id: request.operation_id,
+                        writes,
+                        result: request.result,
+                    },
+                    CommitEffects {
+                        appends,
+                        outbox_events: events,
+                    },
+                )
+                .await
+                .map_err(RpcFailure::from_backend)?;
+            Ok(wire::response_envelope::Body::CommitRecords(
+                multi_transaction_outcome(outcome),
             ))
         }
         wire::request_envelope::Body::ApplyMultiTransaction(request) => {
@@ -1922,11 +2122,13 @@ impl RpcFailure {
                 public_message: error.to_string(),
                 actual_revision: None,
             },
-            StoreError::OperationIdConflict { .. } => Self {
-                code: wire::ErrorCode::OperationConflict,
-                public_message: error.to_string(),
-                actual_revision: None,
-            },
+            StoreError::OperationIdConflict { .. } | StoreError::AppendRecordConflict { .. } => {
+                Self {
+                    code: wire::ErrorCode::OperationConflict,
+                    public_message: error.to_string(),
+                    actual_revision: None,
+                }
+            }
             StoreError::RevisionConflict { actual, .. } => Self {
                 code: wire::ErrorCode::RevisionConflict,
                 public_message: error.to_string(),
@@ -2098,6 +2300,18 @@ mod tests {
         assert_eq!(policy.retry_delay_ms(1), 2_000);
         assert_eq!(policy.retry_delay_ms(6), 60_000);
         assert_eq!(policy.retry_delay_ms(u64::MAX), 60_000);
+        for attempt in [0, 1, 6, u64::MAX] {
+            let delays = (0..100)
+                .map(|id| policy.outbox_retry_delay_ms(&format!("event-{id}"), attempt))
+                .collect::<HashSet<_>>();
+            assert!(delays.len() > 1);
+            for delay in delays {
+                assert!(
+                    (policy.retry_delay_ms(attempt).div_ceil(2)..=policy.retry_delay_ms(attempt))
+                        .contains(&delay)
+                );
+            }
+        }
 
         let invalid = RetryWorkerPolicy {
             max_retry_delay_ms: 999,

@@ -39,11 +39,12 @@ pub(crate) enum RpcOperation {
     ApplyTradeTransaction,
     LoadTrade,
     LoadTradeTransaction,
+    CommitRecords,
     Invalid,
 }
 
 impl RpcOperation {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::LoadSnapshot,
         Self::LoadMultiSnapshot,
         Self::SaveSnapshot,
@@ -57,6 +58,7 @@ impl RpcOperation {
         Self::ApplyTradeTransaction,
         Self::LoadTrade,
         Self::LoadTradeTransaction,
+        Self::CommitRecords,
         Self::Invalid,
     ];
 
@@ -79,12 +81,14 @@ impl RpcOperation {
             Self::ApplyTradeTransaction => "apply_trade_transaction",
             Self::LoadTrade => "load_trade",
             Self::LoadTradeTransaction => "load_trade_transaction",
+            Self::CommitRecords => "commit_records",
             Self::Invalid => "invalid",
         }
     }
 
     pub(crate) fn from_body(body: Option<&wire::request_envelope::Body>) -> Self {
         match body {
+            Some(wire::request_envelope::Body::CommitRecords(_)) => Self::CommitRecords,
             Some(wire::request_envelope::Body::LoadSnapshot(_)) => Self::LoadSnapshot,
             Some(wire::request_envelope::Body::LoadMultiSnapshot(_)) => Self::LoadMultiSnapshot,
             Some(wire::request_envelope::Body::SaveSnapshot(_)) => Self::SaveSnapshot,
@@ -114,6 +118,9 @@ impl RpcOperation {
 
     pub(crate) fn record_count(body: Option<&wire::request_envelope::Body>) -> u64 {
         match body {
+            Some(wire::request_envelope::Body::CommitRecords(r)) => {
+                (r.writes.len() + r.appends.len()) as u64
+            }
             Some(wire::request_envelope::Body::LoadMultiSnapshot(request)) => {
                 request.records.len() as u64
             }
@@ -163,6 +170,13 @@ impl RpcOperation {
             Some(wire::request_envelope::Body::ApplyTransaction(request)) => {
                 bytes(request.payload.len().saturating_add(request.result.len()))
             }
+            Some(wire::request_envelope::Body::CommitRecords(r)) => r
+                .writes
+                .iter()
+                .map(|w| bytes(w.payload.len()))
+                .chain(r.appends.iter().map(|a| bytes(a.payload.len())))
+                .chain(r.outbox_events.iter().map(|e| bytes(e.payload.len())))
+                .fold(bytes(r.result.len()), u64::saturating_add),
             Some(wire::request_envelope::Body::ApplyMultiTransaction(request)) => request
                 .writes
                 .iter()
@@ -262,6 +276,7 @@ pub struct DbProxyMetrics {
     outbox_processing: AtomicU64,
     outbox_dead_lettered: AtomicU64,
     outbox_oldest_age_ms: AtomicU64,
+    pub outbox_relay: std::sync::Mutex<Option<Arc<crate::relay_metrics::RelayMetrics>>>,
 }
 
 impl Default for DbProxyMetrics {
@@ -316,6 +331,7 @@ impl Default for DbProxyMetrics {
             outbox_processing: AtomicU64::new(0),
             outbox_dead_lettered: AtomicU64::new(0),
             outbox_oldest_age_ms: AtomicU64::new(0),
+            outbox_relay: std::sync::Mutex::new(None),
         }
     }
 }
@@ -966,6 +982,14 @@ impl DbProxyMetrics {
                 oldest_age_ms: &self.outbox_oldest_age_ms,
             },
         );
+        if let Some(relay) = self
+            .outbox_relay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            output.push_str(&relay.render());
+        }
         output
     }
 }

@@ -1,5 +1,19 @@
 # DBProxy可观测性
 
+## 通用 Outbox Relay 增量（本地开发，尚未部署）
+
+保留原有全局 Outbox 指标；新增 `dbproxy_outbox_relay_*` 按 `producer,publisher,backend` 汇总发送成功/失败/超时、耗时累计、重试/死信/租约丢失、积压与最老年龄。标签来自启动配置，未知历史来源归入 `other`，不使用事件 ID、玩家 ID 或完整 Stream 地址。
+
+例如按 Publisher 查看发送成功率（无发送时分母为零，不应作为故障报警）：
+
+```promql
+sum by (publisher) (rate(dbproxy_outbox_relay_publish_total{result="success"}[5m]))
+/
+sum by (publisher) (rate(dbproxy_outbox_relay_publish_total[5m]))
+```
+
+同时观察 `dbproxy_outbox_relay_dead`、`dbproxy_outbox_relay_oldest_age_seconds` 和 `dbproxy_outbox_relay_expired_leases`；后者是未发布记录的过期次数 gauge，不能使用 `rate()` 冒充累计计数。投递成功不是消费者完成，应由消费者另行报告 lag、inbox 去重和业务失败。管理操作、Redis 持久确认条件和验收限制见 [Outbox Relay](docs/outbox-relay.md)。当前远程仪表盘和演练版本不在本轮部署范围内。
+
 DBProxy使用独立HTTP监听暴露Prometheus指标，Prometheus负责抓取和告警，Grafana只负责查询与展示：
 
 ```text

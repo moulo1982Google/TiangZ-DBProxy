@@ -16,6 +16,17 @@ use tokio::{sync::watch, task::JoinSet};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let args = env::args().collect::<Vec<_>>();
+    if args.get(1).is_some_and(|a| a == "--check-config") {
+        if args.len() != 3 {
+            return Err("usage: --check-config PATH".into());
+        }
+        tiangz_dbproxy_server::config::check_config(&args[2])?;
+        println!(
+            "Configuration structure and capabilities verified; no environment secrets read, no connections opened. Secret availability is checked at startup."
+        );
+        return Ok(());
+    }
     let config_path = config_path_from_args(env::args())?;
     let config = load_config(config_path)?;
     tracing_subscriber::fmt()
@@ -49,7 +60,7 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
             cache_stale_while_revalidate_ms,
         } => {
             let backend = Arc::new(
-                StorageBackend::connect_with_redis_urls(
+                StorageBackend::connect_with_outbox(
                     &postgres_url,
                     &redis_url,
                     &cache_redis_url,
@@ -79,6 +90,7 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
                             },
                         },
                     },
+                    &config.outbox_relay,
                 )
                 .await?,
             );
@@ -105,6 +117,12 @@ async fn run_server(
     let metrics = Arc::new(DbProxyMetrics::default());
     if durable_backend.is_some() {
         metrics.require_healthy_dependencies();
+    }
+    if let Some(backend) = &durable_backend {
+        *metrics
+            .outbox_relay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&backend.outbox_relay_metrics));
     }
     server_config.metrics = Arc::clone(&metrics);
     let server = DbProxyServer::bind(server_config, server_backend).await?;
