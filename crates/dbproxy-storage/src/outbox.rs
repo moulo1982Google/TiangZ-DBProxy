@@ -4,13 +4,16 @@
 #[path = "outbox_publisher_tests.rs"]
 mod publisher_tests;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use redis::aio::MultiplexedConnection;
 use tiangz_dbproxy_core::OutboxEvent;
 use tokio::sync::Mutex;
 
-use crate::{DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS, SharedPostgresClient, StorageError};
+use crate::{
+    DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS, DEFAULT_REDIS_RESPONSE_TIMEOUT_MS, SharedPostgresClient,
+    StorageError,
+};
 
 const MAX_ERROR_CHARS: usize = 1_024;
 
@@ -253,7 +256,9 @@ impl RedisOutboxPublisher {
             ));
         }
         let client = redis::Client::open(url)?;
-        let connection = client.get_multiplexed_async_connection().await?;
+        let connection = client
+            .get_multiplexed_async_connection_with_config(&publisher_connection_config())
+            .await?;
         Ok(Self {
             connection: Arc::new(Mutex::new(Some(connection))),
             client,
@@ -281,7 +286,11 @@ impl RedisOutboxPublisher {
     ) -> Result<String, StorageError> {
         let mut slot = self.connection.lock().await;
         if slot.is_none() {
-            *slot = Some(self.client.get_multiplexed_async_connection().await?);
+            *slot = Some(
+                self.client
+                    .get_multiplexed_async_connection_with_config(&publisher_connection_config())
+                    .await?,
+            );
         }
         // Take ownership before awaiting: cancellation discards the connection instead of
         // acknowledging XADD on a possibly reconnected, unrelated WAITAOF connection.
@@ -321,6 +330,18 @@ impl RedisOutboxPublisher {
         *slot = Some(connection);
         Ok(stream_id)
     }
+}
+
+// 客户端超时必须大于WAITAOF的服务端等待上限；首次连接和故障后重连使用同一配置。
+// The client deadline must exceed WAITAOF's server wait, including after reconnect.
+fn publisher_connection_config() -> redis::AsyncConnectionConfig {
+    redis::AsyncConnectionConfig::new()
+        .set_connection_timeout(Some(Duration::from_millis(
+            DEFAULT_REDIS_RESPONSE_TIMEOUT_MS,
+        )))
+        .set_response_timeout(Some(Duration::from_millis(
+            DEFAULT_REDIS_RESPONSE_TIMEOUT_MS,
+        )))
 }
 
 /// 首个内置 Publisher；旧类型名保留兼容，Relay 不依赖 Redis 的具体方法。

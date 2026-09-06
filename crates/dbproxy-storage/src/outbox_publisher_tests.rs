@@ -51,14 +51,19 @@ async fn fixture(stall: bool) -> (String, tokio::task::JoinHandle<()>, Arc<Atomi
                             let _ = input.read(&mut probe).await;
                             break;
                         }
-                        b"WAITAOF" => output
-                            .write_all(if index == 0 {
-                                b"*2\r\n:0\r\n:0\r\n"
-                            } else {
-                                b"*2\r\n:1\r\n:0\r\n"
-                            })
-                            .await
-                            .unwrap(),
+                        b"WAITAOF" => {
+                            if index > 0 {
+                                tokio::time::sleep(Duration::from_millis(750)).await;
+                            }
+                            output
+                                .write_all(if index == 0 {
+                                    b"*2\r\n:0\r\n:0\r\n"
+                                } else {
+                                    b"*2\r\n:1\r\n:0\r\n"
+                                })
+                                .await
+                                .unwrap();
+                        }
                         _ => output.write_all(b"+OK\r\n").await.unwrap(),
                     }
                 }

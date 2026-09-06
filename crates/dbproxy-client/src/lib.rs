@@ -644,6 +644,11 @@ impl DbProxyClient {
     async fn reconnect_next(&self) -> Result<(), ClientError> {
         let candidates = self.config.endpoint_candidates()?;
         let mut connection = self.connection.lock().await;
+        // 并发失败者可能排在成功重连者后面，不要再替换已修复的连接。
+        // A concurrent caller may already have repaired this shared connection.
+        if connection.usable {
+            return Ok(());
+        }
         let current_index = connection.endpoint_index;
         let mut last_error = None;
         for offset in 1..=candidates.len() {
@@ -1539,6 +1544,9 @@ impl Hasher for StableHasher {
         }
     }
 }
+
+#[cfg(test)]
+mod reconnect_tests;
 
 #[cfg(test)]
 mod tests {

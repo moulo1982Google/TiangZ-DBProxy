@@ -295,6 +295,25 @@ mod tests {
         assert!(resolve(value).is_err());
     }
     #[test]
+    fn sources_and_route_versions_can_share_one_destination() {
+        let mut value = section();
+        value["sources"].as_array_mut().unwrap().extend([
+            json!({"producer":"achievement","version":1,"destination":"game.events"}),
+            json!({"producer":"game","version":2,"destination":"game.events"}),
+            json!({"producer":"futureGame","version":1,"destination":"game.events","enabled":false}),
+        ]);
+        let config = resolve(value).unwrap();
+        assert_eq!(config.routes.len(), 3);
+        assert!(
+            config
+                .routes
+                .iter()
+                .all(|route| route.publisher == "events" && route.destination == "game.events")
+        );
+        assert_eq!(config.disabled_routes, ["dbproxy.relay.v1.futureGame.1"]);
+    }
+
+    #[test]
     fn rejects_unknown_fields_and_checks_repository_example_offline() {
         let mut value = section();
         value["sources"][0]["table"] = json!("game_outbox");

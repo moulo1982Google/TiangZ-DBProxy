@@ -1152,6 +1152,26 @@ async fn trade_state_ledger_and_outbox_commit_atomically() {
         .expect("DBPROXY_POSTGRES_URL must be set for the integration test");
     let redis_url = std::env::var("DBPROXY_REDIS_URL")
         .expect("DBPROXY_REDIS_URL must be set for the integration test");
+    // Legacy claims intentionally scan all publishers. Give this test its own schema
+    // instead of marking unrelated pending events published to make its assertions pass.
+    assert!(postgres_url.starts_with("postgres://") || postgres_url.starts_with("postgresql://"));
+    assert!(
+        !postgres_url.contains("options="),
+        "test requires an unscoped PostgreSQL URI"
+    );
+    let schema = format!("trade_test_{}", test_suffix().replace('-', "_"));
+    let (admin, connection) = tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let admin_task = tokio::spawn(async move { connection.await.unwrap() });
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    drop(admin);
+    admin_task.await.unwrap();
+    let separator = if postgres_url.contains('?') { '&' } else { '?' };
+    let postgres_url = format!("{postgres_url}{separator}options=-csearch_path%3D{schema}");
     let mut store = TieredSnapshotStore::connect(&postgres_url, &redis_url)
         .await
         .expect("PostgreSQL and Redis must be available");
@@ -1159,12 +1179,6 @@ async fn trade_state_ledger_and_outbox_commit_atomically() {
         .await
         .unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
-    sql.execute(
-        "UPDATE dbproxy_outbox SET published_at = COALESCE(published_at, clock_timestamp()), attempt_count = 0, lease_owner = NULL, lease_until = NULL, last_error = NULL, dead_lettered_at = NULL WHERE event_id LIKE '000-event-%' OR event_id LIKE '001-event-%'",
-        &[],
-    )
-    .await
-    .unwrap();
     let suffix = test_suffix();
     let trade_id = format!("trade-{suffix}");
     let operation_id = format!("escrow-{suffix}");

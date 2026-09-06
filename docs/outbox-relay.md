@@ -100,6 +100,8 @@ Relay 核心负责领取/失败/死信；`Publisher` 只负责发送与确认。
 
 同一 Publisher、destination、partition_key 按入队序号领取；写入端按同一目标取得事务级锁。前序死信继续阻塞后序，不能静默越过。至少一次和失效在途请求仍可能带来迟到的重复消息；需要严格业务序列的消费者仍应检查领域 revision/sequence，不宣称任意故障下的全局严格顺序。
 
+允许多个 producer 或路由版本共用同一 Publisher/destination（扇入）。新版事件先解析持久路由，再按实际目标与 partition_key 加锁，不按原始 topic 各自加锁；同组前序死信也会阻塞其他来源的后续事件。不同 Publisher ID 是不同排序组，即使它们实际连接同一 Redis Stream，也不保证跨 ID 的组内顺序。
+
 消费者必须把 inbox 去重记录与业务变更放进自己的本地事务，提交后再 ACK。生产者 Outbox 不能替消费者完成这件事。多个不同消费组分别收到消息，同组实例分担处理。
 
 ## 管理与可观测性

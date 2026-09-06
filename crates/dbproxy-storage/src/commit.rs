@@ -60,8 +60,9 @@ pub(crate) async fn lock_partitions(
     }
     routes.sort();
     routes.dedup();
-    for (topic, partition) in routes {
-        let key = advisory_lock_key("outbox-partition", &[&topic, &partition]);
+    // Relay uses the resolved destination scope; legacy uses its one-to-one topic scope.
+    for (lock_scope, partition) in routes {
+        let key = advisory_lock_key("outbox-partition", &[&lock_scope, &partition]);
         tx.query_one(
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
             &[&key],

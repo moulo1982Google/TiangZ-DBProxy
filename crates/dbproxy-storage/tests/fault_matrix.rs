@@ -11,6 +11,80 @@ use tiangz_dbproxy_storage::{
 
 const POSTGRES_CONTAINER: &str = "tiangz-dbproxy-postgres";
 const REDIS_CONTAINER: &str = "tiangz-dbproxy-redis";
+const CACHE_CONTAINER: &str = "tiangz-dbproxy-cache";
+
+#[tokio::test]
+#[ignore = "会强杀本机缓存 Redis；设置 DBPROXY_RUN_DOCKER_FAULTS=1 后显式运行"]
+async fn ephemeral_cache_restart_cannot_restore_an_acknowledged_old_revision() {
+    if !require_opt_in() {
+        return;
+    }
+    let (postgres_url, _) = env_urls();
+    let cache_url = std::env::var("DBPROXY_CACHE_REDIS_URL").unwrap();
+    let mut store = TieredSnapshotStore::connect(&postgres_url, &cache_url)
+        .await
+        .unwrap();
+    let key = RecordKey::new("fault-cache-restart", test_suffix()).unwrap();
+    store
+        .apply(transaction(
+            &test_suffix(),
+            key.clone(),
+            Revision::ZERO,
+            b"old",
+            b"ok",
+        ))
+        .await
+        .unwrap();
+    // Deliberately create an old disk image. Even an accidental SAVE must not survive
+    // the cache container restart: /data must be tmpfs, not a Redis image volume.
+    let mut connection = redis::Client::open(cache_url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SAVE")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let mut guard = RestartGuard {
+        container: CACHE_CONTAINER,
+        active: true,
+    };
+    docker(&["kill", CACHE_CONTAINER]);
+    let outcome = store
+        .apply(transaction(
+            &test_suffix(),
+            key.clone(),
+            Revision(1),
+            b"new",
+            b"ok",
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        TransactionalWriteOutcome::Applied {
+            new_revision: Revision(2),
+            ..
+        }
+    ));
+    guard.restart();
+    // No repair worker or duplicate write runs before this read; neither can hide old data.
+    let reader = TieredSnapshotStore::connect(&postgres_url, &cache_url)
+        .await
+        .unwrap();
+    for snapshot in [
+        reader.load(&key).await.unwrap().unwrap(),
+        reader.load_multi(&[key]).await.unwrap().remove(0).unwrap(),
+    ] {
+        assert_eq!(
+            snapshot.revision,
+            Revision(2),
+            "cache restored an older acknowledged revision"
+        );
+        assert_eq!(snapshot.payload, b"new");
+    }
+}
 
 fn test_suffix() -> String {
     let nanos = SystemTime::now()
