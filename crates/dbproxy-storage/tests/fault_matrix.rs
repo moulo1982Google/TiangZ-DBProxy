@@ -112,7 +112,14 @@ fn docker(args: &[&str]) {
 }
 
 fn wait_healthy(container: &str) {
-    for _ in 0..40 {
+    // 本地 Compose 健康检查每 5 秒一次、允许 12 次失败；10 秒轮询会在
+    // AOF 已恢复但 Docker 尚未发布下一次探测结果时误判。这里只等待容器就绪，
+    // 不改变 DBProxy 请求超时或任何持久化/数据断言。
+    // Local Compose allows 12 health probes at 5-second intervals. Wait for that
+    // readiness contract plus a probe margin, independently of application RPC deadlines.
+    let deadline = std::time::Instant::now() + Duration::from_secs(70);
+    let mut last_status = String::new();
+    while std::time::Instant::now() < deadline {
         let output = Command::new("docker")
             .args(["inspect", "--format", "{{.State.Health.Status}}", container])
             .output()
@@ -121,9 +128,12 @@ fn wait_healthy(container: &str) {
         if status == "healthy" {
             return;
         }
+        last_status = status;
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("container {container} did not become healthy");
+    panic!(
+        "container {container} did not become healthy within the Compose readiness window; last status: {last_status}"
+    );
 }
 
 struct RestartGuard {
