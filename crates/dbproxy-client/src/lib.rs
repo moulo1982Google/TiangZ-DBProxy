@@ -46,6 +46,22 @@ pub enum ClientRequestOutcome {
     ProtocolError,
 }
 
+/// 单次已结束请求的互斥锁等待与持锁处理时间；不包含重连或外层重试。
+/// Timing for one completed attempt, excluding reconnects and outer retries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientRequestTiming {
+    pub queue_wait: Duration,
+    /// 包含客户端编解码、网络及服务端处理，不是数据库执行时间；失效连接可能未发送。
+    /// Includes codec, network and server work, not SQL alone; an unusable connection may not send.
+    pub exchange: Duration,
+}
+
+impl ClientRequestTiming {
+    pub fn total(self) -> Duration {
+        self.queue_wait.saturating_add(self.exchange)
+    }
+}
+
 /// 可选的低开销客户端观测器。实现只能记录有界指标，不得把RecordKey或幂等ID作为标签。
 /// Optional low-overhead client observer. Implementations must not label metrics with RecordKey or idempotency IDs.
 pub trait ClientObserver: Send + Sync + 'static {
@@ -65,6 +81,18 @@ pub trait ClientObserver: Send + Sync + 'static {
         elapsed: Duration,
         outcome: ClientRequestOutcome,
     );
+
+    /// 分阶段回调默认转发旧回调一次，已有观察者无需修改；回调不得阻塞。
+    /// Defaults to exactly one legacy callback for compatibility; observers must not block.
+    fn request_attempt_timed(
+        &self,
+        endpoint_index: usize,
+        operation: &'static str,
+        timing: ClientRequestTiming,
+        outcome: ClientRequestOutcome,
+    ) {
+        self.request_attempt(endpoint_index, operation, timing.total(), outcome);
+    }
 }
 
 /// 客户端连接参数；令牌只用于内部服务认证，不能写入日志或提交到生产配置。
@@ -560,6 +588,7 @@ impl DbProxyClient {
         let operation = request_operation(&body);
         let started_at = Instant::now();
         let mut connection = self.connection.lock().await;
+        let queue_wait = started_at.elapsed();
         let endpoint_index = connection.endpoint_index;
         let result = async {
             if !connection.usable {
@@ -617,10 +646,13 @@ impl DbProxyClient {
         }
         .await;
         if let Some(observer) = &self.config.observer {
-            observer.request_attempt(
+            observer.request_attempt_timed(
                 endpoint_index,
                 operation,
-                started_at.elapsed(),
+                ClientRequestTiming {
+                    queue_wait,
+                    exchange: started_at.elapsed().saturating_sub(queue_wait),
+                },
                 request_outcome(&result),
             );
         }
@@ -1547,6 +1579,9 @@ impl Hasher for StableHasher {
 
 #[cfg(test)]
 mod reconnect_tests;
+
+#[cfg(test)]
+mod timing_tests;
 
 #[cfg(test)]
 mod tests {

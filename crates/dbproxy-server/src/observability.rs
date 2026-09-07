@@ -10,7 +10,9 @@ use std::{
 };
 
 use tiangz_dbproxy_protocol::wire;
-use tiangz_dbproxy_storage::StorageMetricsSnapshot;
+use tiangz_dbproxy_storage::{
+    STORAGE_LATENCY_BOUNDS_MS, StorageMetricsSnapshot, StorageStageSnapshot,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -20,8 +22,10 @@ use tokio::{
 };
 
 const MAX_HTTP_REQUEST_BYTES: usize = 8 * 1024;
-const DURATION_BUCKETS_SECONDS: [f64; 10] = [
-    0.0005, 0.001, 0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 1.0,
+// 故障恢复可能超过一秒；保留原桶并扩展尾部，避免秒级样本全部进入 +Inf。
+// Keep existing buckets and distinguish multi-second recovery latency before +Inf.
+const DURATION_BUCKETS_SECONDS: [f64; 14] = [
+    0.0005, 0.001, 0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 1.0, 2.0, 5.0, 15.0, 30.0,
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -277,6 +281,7 @@ pub struct DbProxyMetrics {
     outbox_dead_lettered: AtomicU64,
     outbox_oldest_age_ms: AtomicU64,
     pub outbox_relay: std::sync::Mutex<Option<Arc<crate::relay_metrics::RelayMetrics>>>,
+    storage_latencies: std::sync::Mutex<Vec<StorageStageSnapshot>>,
 }
 
 impl Default for DbProxyMetrics {
@@ -332,6 +337,7 @@ impl Default for DbProxyMetrics {
             outbox_dead_lettered: AtomicU64::new(0),
             outbox_oldest_age_ms: AtomicU64::new(0),
             outbox_relay: std::sync::Mutex::new(None),
+            storage_latencies: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -476,6 +482,59 @@ impl DbProxyMetrics {
         );
     }
 
+    pub(crate) fn storage_latencies_updated(&self, snapshot: Vec<StorageStageSnapshot>) {
+        *self
+            .storage_latencies
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = snapshot;
+    }
+
+    fn append_storage_latencies(&self, output: &mut String) {
+        writeln!(output, "# HELP dbproxy_storage_stage_seconds Elapsed storage scopes including errors and cancellation, not successful SQL execution").unwrap();
+        writeln!(output, "# TYPE dbproxy_storage_stage_seconds histogram").unwrap();
+        writeln!(
+            output,
+            "# HELP dbproxy_storage_stage_in_flight Active storage scopes at the last storage poll"
+        )
+        .unwrap();
+        writeln!(output, "# TYPE dbproxy_storage_stage_in_flight gauge").unwrap();
+        let snapshot = self
+            .storage_latencies
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for sample in snapshot.iter() {
+            let stage = sample.stage;
+            let mut cumulative = 0_u64;
+            for (bound, count) in STORAGE_LATENCY_BOUNDS_MS.iter().zip(sample.buckets) {
+                cumulative += count;
+                writeln!(output, "dbproxy_storage_stage_seconds_bucket{{stage=\"{stage}\",le=\"{}\"}} {cumulative}", *bound as f64 / 1_000.0).unwrap();
+            }
+            let count = sample.buckets.iter().sum::<u64>();
+            writeln!(
+                output,
+                "dbproxy_storage_stage_seconds_bucket{{stage=\"{stage}\",le=\"+Inf\"}} {count}"
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "dbproxy_storage_stage_seconds_count{{stage=\"{stage}\"}} {count}"
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "dbproxy_storage_stage_seconds_sum{{stage=\"{stage}\"}} {:.6}",
+                sample.sum_micros as f64 / 1_000_000.0
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "dbproxy_storage_stage_in_flight{{stage=\"{stage}\"}} {}",
+                sample.in_flight
+            )
+            .unwrap();
+        }
+    }
+
     pub(crate) fn backlog_depth_updated(
         &self,
         pending: u64,
@@ -569,6 +628,7 @@ impl DbProxyMetrics {
 
     pub(crate) fn prometheus(&self, storage_backend: &str) -> String {
         let mut output = String::with_capacity(16 * 1024);
+        self.append_storage_latencies(&mut output);
         metric_header(
             &mut output,
             "dbproxy_live",
@@ -1382,6 +1442,75 @@ mod tests {
         assert!(output.contains("dbproxy_outbox_dead_lettered 1"));
         assert!(output.contains("dbproxy_outbox_oldest_age_seconds 4.500"));
         assert!(!output.contains("hot-key"));
+    }
+
+    #[test]
+    fn rpc_tail_buckets_distinguish_slow_failures_and_keep_overflow() {
+        let metrics = DbProxyMetrics::default();
+        for seconds in [1, 2, 3, 5, 15, 30, 31] {
+            metrics.request_started();
+            metrics.request_finished(
+                RpcOperation::SaveSnapshot,
+                1,
+                0,
+                Duration::from_secs(seconds),
+                Some(wire::ErrorCode::StorageUnavailable),
+            );
+        }
+        let output = metrics.prometheus("memory");
+        for (bound, count) in [
+            ("1", 1),
+            ("2", 2),
+            ("5", 4),
+            ("15", 5),
+            ("30", 6),
+            ("+Inf", 7),
+        ] {
+            assert!(output.contains(&format!("dbproxy_rpc_duration_seconds_bucket{{operation=\"save_snapshot\",le=\"{bound}\"}} {count}")));
+        }
+        assert!(
+            output.contains("dbproxy_rpc_duration_seconds_count{operation=\"save_snapshot\"} 7")
+        );
+        assert!(output.contains(
+            "dbproxy_rpc_errors_total{operation=\"save_snapshot\",code=\"storage_unavailable\"} 7"
+        ));
+    }
+
+    #[test]
+    fn storage_latency_poll_replaces_cumulative_samples_and_exports_overflow() {
+        let metrics = DbProxyMetrics::default();
+        let mut sample = StorageStageSnapshot {
+            stage: "postgres_operation",
+            buckets: [0; STORAGE_LATENCY_BOUNDS_MS.len() + 1],
+            sum_micros: 31_002_000,
+            in_flight: 2,
+        };
+        sample.buckets[0] = 2;
+        sample.buckets[STORAGE_LATENCY_BOUNDS_MS.len()] = 1;
+        metrics.storage_latencies_updated(vec![sample.clone()]);
+        metrics.storage_latencies_updated(vec![sample]);
+        let output = metrics.prometheus("memory");
+        assert!(output.contains(
+            "dbproxy_storage_stage_seconds_bucket{stage=\"postgres_operation\",le=\"0.001\"} 2"
+        ));
+        assert!(output.contains(
+            "dbproxy_storage_stage_seconds_bucket{stage=\"postgres_operation\",le=\"+Inf\"} 3"
+        ));
+        assert!(
+            output.contains("dbproxy_storage_stage_seconds_count{stage=\"postgres_operation\"} 3")
+        );
+        assert!(
+            output.contains(
+                "dbproxy_storage_stage_seconds_sum{stage=\"postgres_operation\"} 31.002000"
+            )
+        );
+        assert!(output.contains("dbproxy_storage_stage_in_flight{stage=\"postgres_operation\"} 2"));
+        metrics.storage_latencies_updated(Vec::new());
+        assert!(
+            !metrics
+                .prometheus("memory")
+                .contains("stage=\"postgres_operation\"")
+        );
     }
 
     #[test]

@@ -33,8 +33,13 @@ use tokio_postgres::{Client, NoTls, Row, Transaction};
 
 mod backlog;
 mod cache_repair;
+mod latency;
+#[cfg(test)]
+mod latency_path_tests;
 mod outbox;
 mod trade;
+pub use latency::{STORAGE_LATENCY_BOUNDS_MS, StorageStageSnapshot};
+use latency::{Stage, StorageLatency};
 
 pub use backlog::{
     RedisSnapshotBacklog, RedisSnapshotBacklogStats, SnapshotBacklogAck, SnapshotBacklogLease,
@@ -106,6 +111,7 @@ pub(crate) fn advisory_lock_key(scope: &str, components: &[&str]) -> String {
 /// safe to expose through Prometheus without creating an unbounded time-series cardinality.
 #[derive(Default)]
 pub struct StorageMetrics {
+    latency: StorageLatency,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     cache_read_errors: AtomicU64,
@@ -154,6 +160,12 @@ pub struct StorageMetricsSnapshot {
 }
 
 impl StorageMetrics {
+    /// 低频采集固定阶段；不包含记录键、操作 ID、凭据或 SQL 文本。
+    /// Scrapes fixed stages without record keys, operation IDs, credentials or SQL text.
+    pub fn latency_snapshot(&self) -> Vec<StorageStageSnapshot> {
+        self.latency.snapshot()
+    }
+
     pub fn snapshot(&self) -> StorageMetricsSnapshot {
         StorageMetricsSnapshot {
             cache_hits: self.cache_hits.load(Ordering::Relaxed),
@@ -1115,6 +1127,7 @@ pub(crate) type SharedPostgresClient = Arc<Mutex<ReconnectingPostgresClient>>;
 #[derive(Clone)]
 pub struct PostgresSnapshotStore {
     client: SharedPostgresClient,
+    metrics: Arc<StorageMetrics>,
 }
 
 impl PostgresSnapshotStore {
@@ -1131,13 +1144,19 @@ impl PostgresSnapshotStore {
     pub async fn connect_existing(url: &str) -> Result<Self, StorageError> {
         Ok(Self {
             client: Arc::new(Mutex::new(ReconnectingPostgresClient::connect(url).await?)),
+            metrics: Arc::new(StorageMetrics::default()),
         })
     }
 
     /// 在全局迁移锁下仅执行尚未登记的 schema migration。
     /// Apply each schema migration once while holding the global migration lock.
     pub async fn migrate(&self) -> Result<(), StorageError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .metrics
+            .latency
+            .measure(Stage::PostgresQueue, self.client.lock())
+            .await;
+        let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         // 多个DBProxy进程可能同时启动；事务级 advisory lock 防止DDL在 PostgreSQL 系统目录上竞争。
@@ -1220,7 +1239,12 @@ impl PostgresSnapshotStore {
             .iter()
             .map(|record| record.key.clone())
             .collect::<Vec<_>>();
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .metrics
+            .latency
+            .measure(Stage::PostgresQueue, self.client.lock())
+            .await;
+        let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
         client.ensure_connected().await?;
         let rows = client
             .query(
@@ -1278,7 +1302,12 @@ impl PostgresSnapshotStore {
                 .collect());
         }
 
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .metrics
+            .latency
+            .measure(Stage::PostgresQueue, self.client.lock())
+            .await;
+        let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         for (index, values) in prepared.into_iter().enumerate() {
@@ -1465,7 +1494,12 @@ impl AsyncSnapshotStore for PostgresSnapshotStore {
     type Error = StorageError;
 
     async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, Self::Error> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .metrics
+            .latency
+            .measure(Stage::PostgresQueue, self.client.lock())
+            .await;
+        let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
         client.ensure_connected().await?;
         let row = client
             .query_opt(
@@ -1496,7 +1530,12 @@ impl AsyncTransactionalStore for PostgresSnapshotStore {
         record: &RecordKey,
     ) -> Result<Option<TransactionReceipt>, Self::Error> {
         validate_receipt_lookup(operation_id, record)?;
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .metrics
+            .latency
+            .measure(Stage::PostgresQueue, self.client.lock())
+            .await;
+        let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
         client.ensure_connected().await?;
         let receipt = client
             .query_opt(
@@ -1533,7 +1572,12 @@ impl AsyncTransactionalStore for PostgresSnapshotStore {
             required_revision_to_i64(&request.record, request.expected_revision)?;
         let updated_at_unix_ms = timestamp_to_i64(&request.record, request.updated_at_unix_ms)?;
 
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .metrics
+            .latency
+            .measure(Stage::PostgresQueue, self.client.lock())
+            .await;
+        let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         claim_operation(&transaction, &request.operation_id, "single").await?;
@@ -1698,7 +1742,12 @@ impl AsyncMultiRecordTransactionStore for PostgresSnapshotStore {
             return Err(StoreError::EmptyTransactionRecords.into());
         }
         let expected_records = sorted_unique_records(records)?;
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .metrics
+            .latency
+            .measure(Stage::PostgresQueue, self.client.lock())
+            .await;
+        let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
         client.ensure_connected().await?;
         let header = client
             .query_opt(
@@ -1773,7 +1822,12 @@ impl PostgresSnapshotStore {
                 .then_with(|| left.record.key.cmp(&right.record.key))
         });
 
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .metrics
+            .latency
+            .measure(Stage::PostgresQueue, self.client.lock())
+            .await;
+        let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         let operation_id = request.operation_id.clone();
@@ -2126,6 +2180,7 @@ impl CacheFallbackCircuit {
 /// The key map stores weak references: completed keys do not retain an ever-growing lock map.
 /// A shared semaphore also bounds fallback reads across unrelated keys when Redis is unavailable.
 struct CacheReadCoordinator {
+    metrics: Arc<StorageMetrics>,
     key_locks: Mutex<HashMap<RecordKey, Weak<Mutex<()>>>>,
     fallback_slots: Arc<Semaphore>,
     refresh_slots: Arc<Semaphore>,
@@ -2145,6 +2200,7 @@ impl CacheReadCoordinator {
         let lock_config = lock_config.validate()?;
         Ok(Self {
             key_locks: Mutex::new(HashMap::new()),
+            metrics: Arc::new(StorageMetrics::default()),
             fallback_slots: Arc::new(Semaphore::new(config.max_concurrent)),
             refresh_slots: Arc::new(Semaphore::new(config.max_concurrent)),
             fallback_timeout: config.timeout,
@@ -2155,6 +2211,7 @@ impl CacheReadCoordinator {
     }
 
     async fn acquire_fallback(&self) -> Result<OwnedSemaphorePermit, StorageError> {
+        let _timer = self.metrics.latency.start(Stage::FallbackCapacity);
         timeout(
             self.fallback_timeout,
             Arc::clone(&self.fallback_slots).acquire_owned(),
@@ -2202,6 +2259,7 @@ impl CacheReadCoordinator {
     }
 
     async fn acquire_key(&self, record: &RecordKey) -> OwnedMutexGuard<()> {
+        let _timer = self.metrics.latency.start(Stage::FallbackKey);
         let lock = {
             let mut key_locks = self.key_locks.lock().await;
             key_locks.retain(|_, lock| lock.strong_count() > 0);
@@ -2652,19 +2710,26 @@ impl TieredSnapshotStore {
         config: TieredSnapshotStoreConfig,
         metrics: Arc<StorageMetrics>,
     ) -> Result<Self, StorageError> {
+        let mut postgres = PostgresSnapshotStore::connect(postgres_url).await?;
+        // 启动迁移不混入请求路径计时；所有请求分片共享同一组指标。
+        // Exclude startup migration and aggregate every request shard into shared telemetry.
+        postgres.metrics = Arc::clone(&metrics);
+        let cache = RedisSnapshotCache::connect_with_metrics_and_policy(
+            redis_url,
+            Arc::clone(&metrics),
+            config.cache,
+        )
+        .await?;
+        let mut coordinator = CacheReadCoordinator::new_with_circuit_and_lock(
+            config.fallback,
+            config.circuit,
+            config.lock,
+        )?;
+        coordinator.metrics = Arc::clone(&metrics);
         Ok(Self {
-            postgres: PostgresSnapshotStore::connect(postgres_url).await?,
-            cache: RedisSnapshotCache::connect_with_metrics_and_policy(
-                redis_url,
-                Arc::clone(&metrics),
-                config.cache,
-            )
-            .await?,
-            read_coordinator: Arc::new(CacheReadCoordinator::new_with_circuit_and_lock(
-                config.fallback,
-                config.circuit,
-                config.lock,
-            )?),
+            postgres,
+            cache,
+            read_coordinator: Arc::new(coordinator),
             metrics,
             refreshing: Arc::new(StdMutex::new(HashSet::new())),
         })
@@ -2746,6 +2811,7 @@ impl TieredSnapshotStore {
         record: &RecordKey,
         observed: bool,
     ) -> Result<CacheLookup, StorageError> {
+        let _timer = self.metrics.latency.start(Stage::CacheLookup);
         let result = if observed {
             timeout(self.read_coordinator.timeout(), self.cache.lookup(record)).await
         } else {
@@ -2769,6 +2835,7 @@ impl TieredSnapshotStore {
         records: &[RecordKey],
         observed: bool,
     ) -> Result<Vec<CacheLookup>, StorageError> {
+        let _timer = self.metrics.latency.start(Stage::CacheLookup);
         let result = if observed {
             timeout(
                 self.read_coordinator.timeout(),
@@ -2792,6 +2859,7 @@ impl TieredSnapshotStore {
     }
 
     async fn put_cache(&self, snapshot: &SnapshotEnvelope) -> Result<(), StorageError> {
+        let _timer = self.metrics.latency.start(Stage::CacheWrite);
         match timeout(self.read_coordinator.timeout(), self.cache.put(snapshot)).await {
             Ok(result) => result,
             Err(_) => {
@@ -2802,6 +2870,7 @@ impl TieredSnapshotStore {
     }
 
     async fn put_cache_multi(&self, snapshots: &[SnapshotEnvelope]) -> Result<(), StorageError> {
+        let _timer = self.metrics.latency.start(Stage::CacheWrite);
         match timeout(
             self.read_coordinator.timeout(),
             self.cache.put_multi(snapshots),
@@ -2820,6 +2889,7 @@ impl TieredSnapshotStore {
     /// the same transaction, so Redis failure never turns a committed write into an ambiguous
     /// client error; a worker will retry it later.
     async fn synchronize_committed_cache(&self, snapshot: &SnapshotEnvelope) {
+        let _timer = self.metrics.latency.start(Stage::CommittedCacheSync);
         if let Err(error) = self.put_cache(snapshot).await {
             tracing::warn!(
                 %error,
@@ -2831,9 +2901,14 @@ impl TieredSnapshotStore {
             return;
         }
         if let Err(error) = self
-            .postgres
-            .cache_repair_queue()
-            .acknowledge_cached(&snapshot.record, snapshot.revision)
+            .metrics
+            .latency
+            .measure(
+                Stage::RepairAck,
+                self.postgres
+                    .cache_repair_queue()
+                    .acknowledge_cached(&snapshot.record, snapshot.revision),
+            )
             .await
         {
             tracing::warn!(
@@ -2853,6 +2928,7 @@ impl TieredSnapshotStore {
         if snapshots.is_empty() {
             return;
         }
+        let _timer = self.metrics.latency.start(Stage::CommittedCacheSync);
         if let Err(error) = self.put_cache_multi(snapshots).await {
             tracing::warn!(
                 %error,
@@ -2862,9 +2938,14 @@ impl TieredSnapshotStore {
             return;
         }
         if let Err(error) = self
-            .postgres
-            .cache_repair_queue()
-            .acknowledge_cached_multi(snapshots)
+            .metrics
+            .latency
+            .measure(
+                Stage::RepairAck,
+                self.postgres
+                    .cache_repair_queue()
+                    .acknowledge_cached_multi(snapshots),
+            )
             .await
         {
             tracing::warn!(
@@ -2880,6 +2961,7 @@ impl TieredSnapshotStore {
         record: &RecordKey,
         expected_revision: Option<Revision>,
     ) -> Result<(), StorageError> {
+        let _timer = self.metrics.latency.start(Stage::CacheWrite);
         match timeout(
             self.read_coordinator.timeout(),
             self.cache
@@ -2896,6 +2978,7 @@ impl TieredSnapshotStore {
     }
 
     async fn delete_cache(&self, record: &RecordKey) -> Result<(), StorageError> {
+        let _timer = self.metrics.latency.start(Stage::CacheWrite);
         match timeout(self.read_coordinator.timeout(), self.cache.delete(record)).await {
             Ok(result) => result,
             Err(_) => {
@@ -2918,6 +3001,7 @@ impl TieredSnapshotStore {
         record: &RecordKey,
         max_wait: Duration,
     ) -> CacheFallbackLockOutcome {
+        let _timer = self.metrics.latency.start(Stage::FallbackLease);
         let config = self.read_coordinator.fallback_lock_config();
         let lock = CacheFallbackLock {
             key: RedisSnapshotCache::fallback_lock_key(record),
@@ -2999,6 +3083,7 @@ impl TieredSnapshotStore {
     }
 
     async fn release_fallback_lock(&self, lock: CacheFallbackLock) {
+        let _timer = self.metrics.latency.start(Stage::FallbackRelease);
         match timeout(
             self.read_coordinator.timeout(),
             self.cache.release_fallback_lock(&lock),
@@ -3726,6 +3811,13 @@ mod tests {
             .expect("the second loader should proceed after the first releases the key");
         first.await.unwrap();
         second.await.unwrap();
+        let snapshot = coordinator.metrics.latency_snapshot();
+        let key = snapshot
+            .iter()
+            .find(|sample| sample.stage == "fallback_key_wait")
+            .unwrap();
+        assert_eq!(key.buckets.iter().sum::<u64>(), 2);
+        assert_eq!(key.in_flight, 0);
     }
 
     #[tokio::test]
@@ -3745,6 +3837,24 @@ mod tests {
             coordinator.acquire_fallback().await,
             Err(StorageError::CacheFallbackTimeout { timeout_ms: 20 })
         ));
+        let snapshot = coordinator.metrics.latency_snapshot();
+        let capacity = snapshot
+            .iter()
+            .find(|sample| sample.stage == "fallback_capacity_wait")
+            .unwrap();
+        assert_eq!(capacity.buckets.iter().sum::<u64>(), 2);
+        assert_eq!(capacity.in_flight, 0);
+        assert!(capacity.sum_micros >= 20_000);
+        assert_eq!(
+            snapshot
+                .iter()
+                .find(|sample| sample.stage == "postgres_operation")
+                .unwrap()
+                .buckets
+                .iter()
+                .sum::<u64>(),
+            0
+        );
     }
 
     #[test]

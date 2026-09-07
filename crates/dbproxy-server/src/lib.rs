@@ -1002,6 +1002,7 @@ pub async fn run_storage_metrics_poller(
             return;
         }
         metrics.storage_metrics_updated(backend.metrics().snapshot());
+        metrics.storage_latencies_updated(backend.metrics().latency_snapshot());
         match backend.backlog_stats().await {
             Ok(stats) => {
                 metrics.redis_dependency_updated(true);

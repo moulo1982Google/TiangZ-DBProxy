@@ -1,5 +1,21 @@
 # DBProxy 测试补强与工作区审查（2026-09-06）
 
+## 09-07 尾延迟诊断补强
+
+第二步增加固定 10 阶段的存储耗时与 in_flight：缓存读写、回源配额/同键/分布式租约及释放、PostgreSQL 连接等待/操作、已提交缓存同步和修复 ACK。SQL、超时、锁顺序和提交语义不变；Store 的作用域退出（包括失败和取消）保留耗时，计数不能当作成功提交数。PG operation 包含重连与网络，不是纯 SQL 时间；committed_cache_sync 包含缓存写入与 ACK，父子阶段不能相加。
+
+计数共享于请求分片，启动迁移和专用队列维护连接不混入。沿用存储 poller 冷路径导出，固定 180 条新序列，不添加请求日志/数据标签/后端查询。PG/RESP 私有模拟端点通过真实 Store 方法验证 PG 排队取消、查询取消、缓存失败跳过 ACK、缓存成功后 ACK 卡住；另检查配额超时、同键等待、原子聚合和 Prometheus 导出。它们不访问 Docker 数据或远程服务，也不能替代真实故障验收。完整边界见 TiangZ `docs/testing/latency-attribution.md` 的第二步。
+
+第二步指标为 `dbproxy_storage_stage_seconds`（累计 histogram，单位秒）与 `dbproxy_storage_stage_in_flight`（上次存储 poll 时的活动阶段数）。固定 stage：`cache_lookup`、`cache_write`、`fallback_capacity_wait`、`fallback_key_wait`、`fallback_distributed_lease`、`fallback_lease_release`、`postgres_connection_wait`、`postgres_operation`、`committed_cache_sync`、`cache_repair_ack`。取消样本只反映取消前耗时，不能推断服务器 SQL 已结束。重复采集替换累计快照，不重复加总；进程重启会重置计数，应使用 rate/increase 分析时间窗口。
+
+第二步最终验证：workspace 默认 **124 通过、0 失败、27 ignored**（storage 库 21、server 库 26）；三个真实 Store 调用路径的模拟用例另重复 10 轮全部通过。workspace 全目标严格 Clippy、fmt/diff 通过。未跑真实数据库故障和发布/长稳验收；未提交、未部署。以下 SDK 9 / server 25 与 TiangZ quick 23/23 是第一步结果，不能替代第二步数据库故障验收。
+
+SDK 现通过兼容的默认 `request_attempt_timed` 回调，区分共享连接锁等待和持锁处理；旧 `request_attempt` 仍恰好回调一次。两段总和保持原 attempt 耗时，不改协议、超时、重试或数据库语义。已结束的失败也记录，外部取消未完成的 future 没有完成样本；exchange 包含网络及服务端工作，不是 SQL 时间。
+
+新增 loopback 测试通过实际持锁、手动 poll 和服务端信号控制，分别验证排队/服务端等待的归属，另测请求超时后的未发送失败及旧观察者兼容。RPC 直方图保留原桶，新增 2/5/15/30 秒桶及精确边界/溢出回归，避免故障恢复全部挤入 +Inf。TiangZ 使用固定端点/阶段直方图接收结果，说明见其 `docs/testing/latency-attribution.md`。本轮不触碰真实数据库或远程服务；这些测试不证明旧夜间延迟已修复。
+
+实际验证：workspace 默认测试通过（真实数据库/故障 27 项仍 ignored）；SDK 9 项、服务端库 25 项通过；新增 SDK 3 项计时测试重复 10 轮均通过；client/server 全目标严格 Clippy 及 fmt/diff 检查通过。TiangZ 接入后的 quick 门禁 23/23（含 TypeScript 100 项和 Rust 全目标）通过。本轮未跑故障长稳或无补丁发布门禁，未提交、未部署。
+
 先只读等待 15 分钟（北京时间 07:32:35–07:47:35），再审查用户正在编辑的路由约束；首次测试补强保留用户的 6 个补丁文件。用户随后确认误判并建议撤回，现已定向撤回唯一约束，保留测试，增加扇入回归。未部署远程七天演练、未启动 Docker、未改 TiangZ/WoW335。
 
 ## 已补充的独立用例
