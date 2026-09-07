@@ -66,7 +66,9 @@ cargo test -p tiangz-dbproxy-server --test postgres_redis_network --locked -j1 -
 
 上述真实套件必须逐个执行，并在套件之间使用独立的专用库/Redis 状态，或按既有控制器的允许列表重建已确认可销毁的契约库、清空演练 Redis。复用上轮已注册 Relay 路由的数据库，会使无对应发布器的网络套件正确地拒绝启动。本轮曾因此复跑失败，日志保留；这不是关闭路由校验的理由。新 PG 回归通过 `postgres_redis.rs` 引入，已纳入既有控制器的套件清单；CI 同步了专用库迁移的显式环境开关。
 
-## 本机最终验证记录
+## 实现提交前的本机验证记录
+
+以下为实现提交前的检查；提交后的完整构建与启动失败见[验收记录](pg-queue-acceptance-2026-09-07.md)。
 
 最终默认参数为排队 2,000 ms、重连失败冷却 500 ms。默认 workspace 测试 136 项通过、31 项 ignored；另按套件隔离状态显式运行全部 31 项真实测试：存储 16、Outbox 并发 6、Relay 1、基础设施故障矩阵 7、网络闭环 1，全部通过。全目标严格 Clippy 与格式检查通过。新增真实回归已经合入既有存储套件，未把 ignored 计作通过。
 
@@ -76,4 +78,4 @@ cargo test -p tiangz-dbproxy-server --test postgres_redis_network --locked -j1 -
 
 原始日志保存在工作区 `.build-tmp/pg-queue-20260907/`：`workspace-final.log`、`clippy-final.log`、`fmt-final.log` 及五份 `isolated-*-3.log` 为最终检查；`healthy-baseline-2.log` 为最终参数的另一轮健康验证。保留 `healthy-baseline-1.log` 的 500 ms 候选失败、`healthy-diagnostic-30s-budget.log` 的临时诊断，以及 `real-contracts-2.log` 的套件状态污染失败，不将这些记录归入最终通过结果。数据库故障测试结束后，三个演练容器均恢复健康。
 
-完整 100 游戏玩家 + 100 持久化探针的 30 分钟故障演练尚未执行；当前精确回归不替代游戏尾延迟、最终全链路对账或七天长稳验收。
+提交后已启动完整 100 游戏玩家 + 100 持久化探针的 30 分钟验收计划，但在启动健康检查失败，未进入计时负载和故障注入；详见[提交后验收失败记录](pg-queue-acceptance-2026-09-07.md)。当前精确回归不替代游戏尾延迟、最终全链路对账或七天长稳验收。
