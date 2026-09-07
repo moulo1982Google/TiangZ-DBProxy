@@ -2,6 +2,8 @@
 
 2026-09-07：服务端提交后缓存修复清理改由现有维护 worker 有界合并处理，业务提交及持久修复契约不变，见[提交后清理](cache-repair-cleanup.md)。
 
+同库批量快照现由首记录选择一条连接、一次 PG 提交，保留逐条 CAS/幂等结果；连接分片不再把一批写入拆成多个提交，见[批次提交](snapshot-batch-commit.md)。
+
 ## 通用提交集成（2026-09-05）
 
 `CommitRecords` 组合非空快照写集合、可选追加事实、可选 Outbox 和业务回执；复用多记录 CAS 提交，不解释 payload。`dbproxy_append_records` 使用独立 namespace/key 唯一键，禁止 UPDATE/DELETE/TRUNCATE；本轮没有新增扫描/索引查询 API，审计查询由后续只读工具或消费端投影承担。

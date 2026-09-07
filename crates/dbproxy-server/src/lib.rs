@@ -376,7 +376,7 @@ impl StorageBackend {
         }
     }
 
-    /// Drain multiple ordinary snapshots with one Redis claim, one shard-aware save batch, and
+    /// Drain multiple ordinary snapshots with one Redis claim, one PostgreSQL save batch, and
     /// batched ACK/release commands. Failed entries are immediately released while successful
     /// entries retain their original idempotency IDs.
     pub async fn process_backlog_batch(
@@ -623,63 +623,35 @@ impl DbProxyBackend for StorageBackend {
         &self,
         requests: Vec<SnapshotWrite>,
     ) -> Result<Vec<Result<SnapshotWriteOutcome, BackendError>>, BackendError> {
-        let request_count = requests.len();
-        let mut groups = (0..self.shards.len())
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>();
-        for (request_index, request) in requests.into_iter().enumerate() {
-            groups[self.shard_index(&request.record)].push((request_index, request));
+        let Some(first) = requests.first() else {
+            return Ok(Vec::new());
+        };
+        // 分片是同库连接，整批只需一次提交；逐条 CAS/幂等结果仍由 save_batch 保留。
+        // These shards are connections to one database: commit the batch once while preserving
+        // independent CAS/idempotency outcomes. One RPC must not occupy every request connection.
+        let mut shard = self.shard(&first.record);
+        let mut indexed: Vec<_> = requests.into_iter().enumerate().collect();
+        // 跨连接的重叠批次按记录排序取锁，响应恢复调用者顺序。
+        // Lock overlapping batches in record order across connections; restore caller order below.
+        indexed.sort_by(|(_, a), (_, b)| {
+            a.record
+                .namespace
+                .cmp(&b.record.namespace)
+                .then_with(|| a.record.key.cmp(&b.record.key))
+        });
+        let (indexes, requests): (Vec<_>, Vec<_>) = indexed.into_iter().unzip();
+        let outcomes = shard.save_batch(requests).await?;
+        if outcomes.len() != indexes.len() {
+            return Err(BackendError::Worker(
+                "batch save result count mismatch".to_string(),
+            ));
         }
-
-        let mut workers = JoinSet::new();
-        for (shard_index, group) in groups.into_iter().enumerate() {
-            if group.is_empty() {
-                continue;
-            }
-            let mut shard = self.shards[shard_index].clone();
-            workers.spawn(async move {
-                let request_indexes = group
-                    .iter()
-                    .map(|(request_index, _)| *request_index)
-                    .collect::<Vec<_>>();
-                let requests = group
-                    .into_iter()
-                    .map(|(_, request)| request)
-                    .collect::<Vec<_>>();
-                let outcomes = shard
-                    .save_batch(requests)
-                    .await
-                    .map_err(BackendError::from)?;
-                Ok::<_, BackendError>(
-                    request_indexes
-                        .into_iter()
-                        .zip(
-                            outcomes
-                                .into_iter()
-                                .map(|outcome| outcome.map_err(BackendError::from)),
-                        )
-                        .collect::<Vec<_>>(),
-                )
-            });
-        }
-
-        let mut outcomes = std::iter::repeat_with(|| None)
-            .take(request_count)
-            .collect::<Vec<_>>();
-        while let Some(result) = workers.join_next().await {
-            for (request_index, outcome) in
-                result.map_err(|error| BackendError::Worker(error.to_string()))??
-            {
-                outcomes[request_index] = Some(outcome);
-            }
-        }
-        outcomes
+        let mut indexed: Vec<_> = indexes.into_iter().zip(outcomes).collect();
+        indexed.sort_by_key(|(index, _)| *index);
+        Ok(indexed
             .into_iter()
-            .map(|outcome| {
-                outcome
-                    .ok_or_else(|| BackendError::Worker("batch save result is missing".to_string()))
-            })
-            .collect()
+            .map(|(_, outcome)| outcome.map_err(BackendError::from))
+            .collect())
     }
 
     async fn enqueue_snapshot(&self, request: SnapshotWrite) -> Result<(), BackendError> {
