@@ -32,6 +32,8 @@ use tokio::{
 use tokio_postgres::{Client, NoTls, Row, Transaction};
 
 mod backlog;
+mod cache_ack;
+pub use cache_ack::CacheRepairAcknowledgements;
 mod cache_repair;
 mod latency;
 mod postgres_request;
@@ -2754,6 +2756,7 @@ pub struct TieredSnapshotStore {
     read_coordinator: Arc<CacheReadCoordinator>,
     metrics: Arc<StorageMetrics>,
     refreshing: Arc<StdMutex<HashSet<RecordKey>>>,
+    cache_acknowledgements: Option<CacheRepairAcknowledgements>,
 }
 
 impl TieredSnapshotStore {
@@ -2804,7 +2807,15 @@ impl TieredSnapshotStore {
             read_coordinator: Arc::new(coordinator),
             metrics,
             refreshing: Arc::new(StdMutex::new(HashSet::new())),
+            cache_acknowledgements: None,
         })
+    }
+
+    /// 把缓存成功后的清理交给共享维护 worker；调用方必须驱动 flush 或持久修复。
+    /// Hand successful-cache cleanup to a shared maintenance worker. The owner must drive
+    /// flush or durable repair; standalone stores retain synchronous cleanup by default.
+    pub fn defer_cache_acknowledgements(&mut self, acknowledgements: CacheRepairAcknowledgements) {
+        self.cache_acknowledgements = Some(acknowledgements);
     }
 
     fn record_fallback_error(&self, error: &StorageError) {
@@ -2981,6 +2992,10 @@ impl TieredSnapshotStore {
             );
             return;
         }
+        if let Some(acknowledgements) = &self.cache_acknowledgements {
+            acknowledgements.record(&snapshot.record, snapshot.revision);
+            return;
+        }
         if let Err(error) = self
             .metrics
             .latency
@@ -3016,6 +3031,12 @@ impl TieredSnapshotStore {
                 record_count = snapshots.len(),
                 "snapshot cache batch update deferred to durable repair queue"
             );
+            return;
+        }
+        if let Some(acknowledgements) = &self.cache_acknowledgements {
+            for snapshot in snapshots {
+                acknowledgements.record(&snapshot.record, snapshot.revision);
+            }
             return;
         }
         if let Err(error) = self

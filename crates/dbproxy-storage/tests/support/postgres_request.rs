@@ -14,8 +14,9 @@ use tiangz_dbproxy_core::{
     Revision, SnapshotWrite, SnapshotWriteOutcome, TransactionalRecordWrite,
 };
 use tiangz_dbproxy_storage::{
-    PostgresRequestConfig, PostgresSnapshotStore, STORAGE_LATENCY_BOUNDS_MS, StorageError,
-    StorageMetrics, TieredSnapshotStore, TieredSnapshotStoreConfig,
+    CacheRepairAcknowledgements, PostgresRequestConfig, PostgresSnapshotStore, RedisSnapshotCache,
+    STORAGE_LATENCY_BOUNDS_MS, StorageError, StorageMetrics, TieredSnapshotStore,
+    TieredSnapshotStoreConfig,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -72,6 +73,55 @@ fn write(id: &str) -> SnapshotWrite {
         payload: b"durable".to_vec(),
         updated_at_unix_ms: 1,
     }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL/Redis; deferred cleanup recovery and revision safety"]
+async fn deferred_cache_cleanup_preserves_newer_targets_and_survives_lost_hints() {
+    timeout(Duration::from_secs(30), async {
+        let url = test_url();
+        let cache_url = std::env::var("DBPROXY_CACHE_REDIS_URL").unwrap();
+        let mut store = TieredSnapshotStore::connect(&url, &cache_url).await.unwrap();
+        let hints = CacheRepairAcknowledgements::default();
+        store.defer_cache_acknowledgements(hints.clone());
+        let mut postgres = PostgresSnapshotStore::connect(&url).await.unwrap();
+        let queue = postgres.cache_repair_queue();
+        let cache = RedisSnapshotCache::connect(&cache_url).await.unwrap();
+        let request = write(&unique());
+        let key = request.record.clone();
+        store.save(request.clone()).await.unwrap();
+        assert_eq!(cache.get(&key).await.unwrap().unwrap().revision, Revision(1));
+        let (observer, _peer) = sql(&url).await;
+        let target = || async {
+            observer.query_opt("SELECT target_revision FROM dbproxy_cache_repairs WHERE namespace=$1 AND record_key=$2", &[&key.namespace, &key.key]).await.unwrap().map(|r| r.get::<_, i64>(0))
+        };
+        assert_eq!(target().await, Some(1), "response leaves a durable recovery target");
+
+        // 新提交尚未刷新缓存时，延迟到达的旧 ACK 绝不能删除新目标。
+        // A delayed older ACK must not remove a newer commit whose cache is not refreshed.
+        let mut newer = request.clone();
+        newer.request_id.push_str("-newer");
+        newer.expected_revision = Some(Revision(1));
+        newer.payload = b"newer".to_vec();
+        postgres.save(newer).await.unwrap();
+        assert_eq!(hints.flush(&queue, &StorageMetrics::default()).await.unwrap(), 0);
+        assert_eq!(target().await, Some(2));
+        assert_eq!(store.repair_cache(&key).await.unwrap(), Some(Revision(2)));
+        assert_eq!(cache.get(&key).await.unwrap().unwrap().revision, Revision(2));
+        queue.acknowledge_cached(&key, Revision(2)).await.unwrap();
+        assert_eq!(target().await, None);
+
+        // 进程丢失未刷新的内存提示后，持久修复仍可完成；原请求重试不重复写。
+        // Losing in-memory hints still permits durable repair; original-id retry is duplicate.
+        let lost = write(&unique());
+        store.save(lost.clone()).await.unwrap();
+        drop(store);
+        drop(hints);
+        assert!(matches!(postgres.save(lost.clone()).await.unwrap(), SnapshotWriteOutcome::Duplicate { revision: Revision(1) }));
+        let replacement = TieredSnapshotStore::connect(&url, &cache_url).await.unwrap();
+        assert_eq!(replacement.repair_cache(&lost.record).await.unwrap(), Some(Revision(1)));
+        assert!(queue.acknowledge_cached(&lost.record, Revision(1)).await.unwrap());
+    }).await.expect("deferred cleanup recovery deadline");
 }
 
 #[tokio::test]

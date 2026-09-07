@@ -40,10 +40,10 @@ use tiangz_dbproxy_protocol::{
     is_compatible_protocol_fingerprint, read_message, wire, write_message,
 };
 use tiangz_dbproxy_storage::{
-    CacheRepairStats, DEFAULT_OUTBOX_STREAM_PREFIX, OutboxStats, PostgresCacheRepairQueue,
-    PostgresOutboxQueue, PostgresSnapshotStore, RedisOutboxPublisher, RedisSnapshotBacklog,
-    RedisSnapshotBacklogStats, SnapshotBacklogAck, StorageError, StorageMetrics,
-    TieredSnapshotStore, TieredSnapshotStoreConfig,
+    CacheRepairAcknowledgements, CacheRepairStats, DEFAULT_OUTBOX_STREAM_PREFIX, OutboxStats,
+    PostgresCacheRepairQueue, PostgresOutboxQueue, PostgresSnapshotStore, RedisOutboxPublisher,
+    RedisSnapshotBacklog, RedisSnapshotBacklogStats, SnapshotBacklogAck, StorageError,
+    StorageMetrics, TieredSnapshotStore, TieredSnapshotStoreConfig,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -180,6 +180,7 @@ pub struct StorageBackend {
     shards: Vec<TieredSnapshotStore>,
     backlog: RedisSnapshotBacklog,
     cache_repairs: PostgresCacheRepairQueue,
+    cache_acknowledgements: CacheRepairAcknowledgements,
     outbox: PostgresOutboxQueue,
     outbox_publishers: HashMap<String, Arc<dyn tiangz_dbproxy_storage::Publisher>>,
     outbox_publish_timeout: Duration,
@@ -253,6 +254,7 @@ impl StorageBackend {
             return Err(BackendError::InvalidConfig("storage shard count is zero"));
         }
         let metrics = Arc::new(StorageMetrics::default());
+        let cache_acknowledgements = CacheRepairAcknowledgements::default();
         let mut shards = Vec::with_capacity(config.shard_count);
         for _ in 0..config.shard_count {
             shards.push(
@@ -302,10 +304,14 @@ impl StorageBackend {
                 ));
             }
         }
+        for shard in &mut shards {
+            shard.defer_cache_acknowledgements(cache_acknowledgements.clone());
+        }
         Ok(Self {
             shards,
             backlog: RedisSnapshotBacklog::connect(redis_url).await?,
             cache_repairs,
+            cache_acknowledgements,
             outbox,
             outbox_publishers,
             outbox_publish_timeout: Duration::from_millis(relay.publish_timeout_ms),
@@ -436,6 +442,11 @@ impl StorageBackend {
         policy: RetryWorkerPolicy,
     ) -> Result<DurableQueueProcessOutcome, BackendError> {
         let policy = policy.validate()?;
+        // 每轮先批量清理成功提示，再处理一条持久修复，避免提示持续到达饿死恢复。
+        // Flush one bounded hint batch, then service a durable repair even under continuous writes.
+        self.cache_acknowledgements
+            .flush(&self.cache_repairs, &self.metrics)
+            .await?;
         let Some(lease) = self.cache_repairs.claim(worker_id, policy.lease_ms).await? else {
             return Ok(DurableQueueProcessOutcome::Empty);
         };

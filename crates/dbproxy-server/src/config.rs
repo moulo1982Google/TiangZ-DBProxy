@@ -752,11 +752,18 @@ mod tests {
     };
 
     fn write_config(content: &str) -> PathBuf {
+        // Windows 时钟可能让并行测试取得相同时间戳，不能单独用时间作为文件身份。
+        // Parallel tests can observe identical Windows timestamps; add process-local identity.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = env::temp_dir().join(format!("tiangz-dbproxy-config-{suffix}.json"));
+        let path = env::temp_dir().join(format!(
+            "tiangz-dbproxy-config-{}-{suffix}-{sequence}.json",
+            std::process::id()
+        ));
         fs::write(&path, content).unwrap();
         path
     }

@@ -121,6 +121,7 @@ async fn tiered(fail_cache: bool) -> (TieredSnapshotStore, oneshot::Receiver<()>
             read_coordinator: Arc::new(coordinator),
             metrics,
             refreshing: Arc::new(StdMutex::new(HashSet::new())),
+            cache_acknowledgements: None,
         },
         arrived,
         pg_peer,
@@ -623,6 +624,50 @@ async fn cache_failure_records_sync_but_does_not_attempt_repair_ack() {
     })
     .await
     .expect("cache failure timing fixture deadline");
+}
+
+#[tokio::test]
+async fn committed_cache_should_not_wait_for_repair_cleanup() {
+    let (mut store, _arrived, _pg, _redis) = tiered(false).await;
+    store.defer_cache_acknowledgements(CacheRepairAcknowledgements::default());
+    let held = store.postgres.client.lock().await;
+    let value = snapshot();
+    timeout(
+        Duration::from_millis(200),
+        store.synchronize_committed_cache(&value),
+    )
+    .await
+    .expect("a committed and cached write must not wait for repair cleanup");
+    timeout(
+        Duration::from_millis(200),
+        store.synchronize_committed_cache_multi(&[value]),
+    )
+    .await
+    .expect("batch cleanup must also be deferred");
+    assert_eq!(count(&store.metrics, "cache_write"), 2);
+    assert_eq!(count(&store.metrics, "cache_repair_ack"), 0);
+    drop(held);
+}
+
+#[tokio::test]
+async fn failed_cache_write_does_not_offer_deferred_cleanup() {
+    let (mut store, _arrived, _pg, _redis) = tiered(true).await;
+    let hints = CacheRepairAcknowledgements::default();
+    store.defer_cache_acknowledgements(hints.clone());
+    store.synchronize_committed_cache(&snapshot()).await;
+    store.synchronize_committed_cache_multi(&[snapshot()]).await;
+    let held = store.postgres.client.lock().await;
+    assert_eq!(
+        timeout(
+            Duration::from_millis(200),
+            hints.flush(&store.cache_repair_queue(), &store.metrics,)
+        )
+        .await
+        .expect("failed cache writes must never generate cleanup hints")
+        .unwrap(),
+        0
+    );
+    drop(held);
 }
 
 #[tokio::test]

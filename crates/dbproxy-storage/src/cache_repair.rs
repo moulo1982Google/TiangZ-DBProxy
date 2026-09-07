@@ -74,20 +74,31 @@ impl PostgresCacheRepairQueue {
         &self,
         snapshots: &[tiangz_dbproxy_core::SnapshotEnvelope],
     ) -> Result<u64, StorageError> {
-        if snapshots.is_empty() {
+        let targets: Vec<_> = snapshots
+            .iter()
+            .map(|snapshot| (snapshot.record.clone(), snapshot.revision))
+            .collect();
+        self.acknowledge_cached_revisions(&targets).await
+    }
+
+    pub(crate) async fn acknowledge_cached_revisions(
+        &self,
+        targets: &[(RecordKey, Revision)],
+    ) -> Result<u64, StorageError> {
+        if targets.is_empty() {
             return Ok(0);
         }
-        let namespaces = snapshots
+        let namespaces = targets
             .iter()
-            .map(|snapshot| snapshot.record.namespace.clone())
+            .map(|(record, _)| record.namespace.clone())
             .collect::<Vec<_>>();
-        let keys = snapshots
+        let keys = targets
             .iter()
-            .map(|snapshot| snapshot.record.key.clone())
+            .map(|(record, _)| record.key.clone())
             .collect::<Vec<_>>();
-        let revisions = snapshots
+        let revisions = targets
             .iter()
-            .map(|snapshot| required_revision_to_i64(&snapshot.record, snapshot.revision))
+            .map(|(record, revision)| required_revision_to_i64(record, *revision))
             .collect::<Result<Vec<_>, _>>()?;
         let mut client =
             crate::postgres_request::lock_client(&self.client, self.acknowledgement_wait).await?;
