@@ -2215,6 +2215,20 @@ impl Hasher for StableHasher {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn postgres_admission_errors_are_retryable_without_claiming_transaction_outcome() {
+        for error in [
+            super::StorageError::PostgresConnectionWaitTimeout { timeout_ms: 500 },
+            super::StorageError::PostgresReconnectCooldown {
+                retry_after_ms: 500,
+            },
+        ] {
+            let failure = super::RpcFailure::from_backend(super::BackendError::Storage(error));
+            assert_eq!(failure.code, super::wire::ErrorCode::StorageUnavailable);
+            assert!(failure.public_message.contains("same idempotency key"));
+            assert_eq!(failure.actual_revision, None);
+        }
+    }
     use super::*;
 
     #[test]

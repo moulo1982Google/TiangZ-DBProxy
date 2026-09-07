@@ -45,6 +45,8 @@ jobs:
     timeout-minutes: 20
     env:
       DBPROXY_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz
+      DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz
+      DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION: "1"
       DBPROXY_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6379/0
       DBPROXY_RUN_DOCKER_FAULTS: "1"
     steps:

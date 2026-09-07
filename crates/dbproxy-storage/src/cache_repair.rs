@@ -26,11 +26,18 @@ pub struct CacheRepairStats {
 #[derive(Clone)]
 pub struct PostgresCacheRepairQueue {
     client: SharedPostgresClient,
+    acknowledgement_wait: Option<std::time::Duration>,
 }
 
 impl PostgresCacheRepairQueue {
-    pub(crate) fn new(client: SharedPostgresClient) -> Self {
-        Self { client }
+    pub(crate) fn new(
+        client: SharedPostgresClient,
+        acknowledgement_wait: Option<std::time::Duration>,
+    ) -> Self {
+        Self {
+            client,
+            acknowledgement_wait,
+        }
     }
 
     pub async fn enqueue(
@@ -50,7 +57,8 @@ impl PostgresCacheRepairQueue {
         cached_revision: Revision,
     ) -> Result<bool, StorageError> {
         let cached_revision = required_revision_to_i64(record, cached_revision)?;
-        let mut client = self.client.lock().await;
+        let mut client =
+            crate::postgres_request::lock_client(&self.client, self.acknowledgement_wait).await?;
         client.ensure_connected().await?;
         let removed = client
             .execute(
@@ -81,7 +89,8 @@ impl PostgresCacheRepairQueue {
             .iter()
             .map(|snapshot| required_revision_to_i64(&snapshot.record, snapshot.revision))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut client = self.client.lock().await;
+        let mut client =
+            crate::postgres_request::lock_client(&self.client, self.acknowledgement_wait).await?;
         client.ensure_connected().await?;
         Ok(client
             .execute(

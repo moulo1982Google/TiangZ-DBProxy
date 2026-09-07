@@ -50,6 +50,8 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
             cache_fallback_concurrency,
             cache_fallback_timeout_ms,
             cache_operation_timeout_ms,
+            postgres_connection_wait_timeout_ms,
+            postgres_reconnect_cooldown_ms,
             cache_fallback_circuit_failure_threshold,
             cache_fallback_circuit_cooldown_ms,
             cache_fallback_lock_lease_ms,
@@ -68,6 +70,14 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
                     StorageBackendConfig {
                         shard_count: shards,
                         tiered: tiangz_dbproxy_storage::TieredSnapshotStoreConfig {
+                            postgres: tiangz_dbproxy_storage::PostgresRequestConfig {
+                                connection_wait_timeout: Duration::from_millis(
+                                    postgres_connection_wait_timeout_ms,
+                                ),
+                                reconnect_cooldown: Duration::from_millis(
+                                    postgres_reconnect_cooldown_ms,
+                                ),
+                            },
                             cache_operation_timeout: Duration::from_millis(
                                 cache_operation_timeout_ms,
                             ),

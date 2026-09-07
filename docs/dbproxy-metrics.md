@@ -128,6 +128,19 @@ A cache write error can be transient without affecting PostgreSQL durability. A 
 age or any dead letter is the actionable signal. The local rules warn above 60 seconds for five
 minutes and alert critically on any dead letter.
 
+## PostgreSQL request queue budgets
+
+Request-shard PostgreSQL mutex waits are now bounded by
+`storage.postgresConnectionWaitTimeoutMs` (default 2,000 ms). Queue expiry still closes
+`postgres_connection_wait` and does not start `postgres_operation`. Once a caller owns the
+connection, SQL execution is unaffected by that queue budget. A reconnect failure or cancelled
+reconnect starts the shared `storage.postgresReconnectCooldownMs` (default 500 ms); cooldown
+rejections can therefore appear as short `postgres_operation` samples without executing SQL.
+Request-shard repair ACK queue waits use the same budget but remain in `cache_repair_ack`,
+without duplicate PostgreSQL stage timing. Dedicated maintenance queue connections keep their
+existing policy. See [PostgreSQL request budgets](postgres-request-budget.md) for worker scope
+and the distinction between an unsent Store operation and an RPC with an unknown commit result.
+
 ## PostgreSQL outbox
 
 - `dbproxy_outbox_pending`, `dbproxy_outbox_processing`, and

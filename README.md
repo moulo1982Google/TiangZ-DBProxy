@@ -53,7 +53,7 @@ TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transpor
 
 缓存与 PG 回源的等待预算现分离：`storage.cacheOperationTimeoutMs` 默认 200 ms，`cacheFallbackTimeoutMs` 仍默认 2,000 ms。升级兼容、正确性边界与测试见[缓存操作预算](docs/cache-operation-budget.md)。可靠 Redis AOF/MQ 确认不使用该缓存预算。
 
-下一步 PG 故障连接排队优化尚未实施；已完成验证、实施顺序、正确性约束和换机准备见[2026-09-07 交接计划](docs/handoff-2026-09-07.md)。
+PG 请求分片现使用独立的连接排队预算与重连失败冷却：`storage.postgresConnectionWaitTimeoutMs` 默认 2,000 ms，`storage.postgresReconnectCooldownMs` 默认 500 ms。只限制取得连接前的等待，不缩短已发送 SQL/事务的执行时间；提交后修复 ACK 排队失败保留修复目标。范围、兼容和验证见[PG 请求预算](docs/postgres-request-budget.md)，后续演练安排见[交接记录](docs/handoff-2026-09-07.md)。
 
 通用 Outbox Relay 的 Redis 路由、禁用的未来 MQ 声明、离线检查和审计管理命令见[Outbox Relay](docs/outbox-relay.md)与[配置示例](configs/outbox-relay.example.json)。旧配置及旧 Stream 地址保持兼容；新来源不能在所有 worker 升级前启用。
 

@@ -102,7 +102,10 @@ fn count(metrics: &StorageMetrics, name: &str) -> u64 {
 
 async fn tiered(fail_cache: bool) -> (TieredSnapshotStore, oneshot::Receiver<()>, Peer, Peer) {
     let metrics = Arc::new(StorageMetrics::default());
-    let (postgres, arrived, pg_peer) = postgres(metrics.clone()).await;
+    let (mut postgres, arrived, pg_peer) = postgres(metrics.clone()).await;
+    postgres
+        .configure_requests(PostgresRequestConfig::default())
+        .await;
     let (cache, cache_peer) = cache(metrics.clone(), fail_cache).await;
     let mut coordinator = CacheReadCoordinator::new_with_circuit_and_lock(
         CacheFallbackConfig::default(),
@@ -134,6 +137,310 @@ fn snapshot() -> SnapshotEnvelope {
         payload: vec![1],
         updated_at_unix_ms: 1,
     }
+}
+
+#[tokio::test]
+async fn request_postgres_queue_expires_without_sending_sql() {
+    let (mut store, mut arrived, _pg, _redis) = tiered(false).await;
+    store.postgres.connection_wait_timeout = Some(Duration::from_millis(20));
+    let held = store.postgres.client.lock().await;
+    let record = snapshot().record;
+    let mut pending = Box::pin(store.postgres.load(&record));
+    std::future::poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(
+        stage(&store.metrics, "postgres_connection_wait").in_flight,
+        1
+    );
+    let result = timeout(Duration::from_millis(900), pending).await;
+    assert!(result.is_ok(), "request queue must have its own deadline");
+    assert!(matches!(
+        result.unwrap(),
+        Err(StorageError::PostgresConnectionWaitTimeout { timeout_ms: 20 })
+    ));
+    assert_eq!(count(&store.metrics, "postgres_operation"), 0);
+    assert_eq!(
+        stage(&store.metrics, "postgres_connection_wait").in_flight,
+        0
+    );
+    assert!(matches!(
+        arrived.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    drop(held);
+}
+
+#[tokio::test]
+async fn request_postgres_all_entries_and_repair_ack_obey_queue_budget() {
+    use tiangz_dbproxy_core::{AsyncTradeStore, TradeState, TradeTransaction, TradeTransition};
+    timeout(Duration::from_secs(3), async {
+        let (mut store, mut arrived, _pg, _redis) = tiered(false).await;
+        store.postgres.connection_wait_timeout = Some(Duration::from_millis(15));
+        let client = store.postgres.client.clone();
+        let held = client.lock().await;
+        let snapshot = snapshot();
+        let record = snapshot.record.clone();
+        let writes = vec![TransactionalRecordWrite {
+            record: record.clone(),
+            schema: "timing".into(),
+            schema_version: 1,
+            expected_revision: Revision::ZERO,
+            payload: vec![1],
+            updated_at_unix_ms: 1,
+        }];
+        let multi = MultiRecordTransactionalWrite {
+            operation_id: "op".into(),
+            writes: writes.clone(),
+            result: vec![],
+        };
+        let single = SnapshotWrite {
+            request_id: "request".into(),
+            record: record.clone(),
+            schema: "timing".into(),
+            schema_version: 1,
+            expected_revision: Some(Revision::ZERO),
+            payload: vec![1],
+            updated_at_unix_ms: 1,
+        };
+        let trade = TradeTransaction {
+            operation_id: "trade-op".into(),
+            transition: TradeTransition {
+                trade_id: "trade".into(),
+                expected_version: Revision::ZERO,
+                expected_state: None,
+                next_state: TradeState::Proposed,
+                payload: vec![],
+                updated_at_unix_ms: 1,
+            },
+            writes,
+            ledger_postings: vec![],
+            outbox_events: vec![],
+            result: vec![],
+        };
+        let pg = &mut store.postgres;
+        for result in [
+            pg.load(&record).await.map(|_| ()),
+            pg.load_multi(std::slice::from_ref(&record))
+                .await
+                .map(|_| ()),
+            pg.save(single.clone()).await.map(|_| ()),
+            pg.save_batch(&[single]).await.map(|_| ()),
+            pg.load_receipt("op", &record).await.map(|_| ()),
+            pg.apply(TransactionalWrite {
+                operation_id: "op".into(),
+                record: record.clone(),
+                schema: "timing".into(),
+                schema_version: 1,
+                expected_revision: Revision::ZERO,
+                payload: vec![1],
+                result: vec![],
+                updated_at_unix_ms: 1,
+            })
+            .await
+            .map(|_| ()),
+            pg.load_multi_receipt("op", std::slice::from_ref(&record))
+                .await
+                .map(|_| ()),
+            pg.apply_multi(multi.clone()).await.map(|_| ()),
+            pg.commit_records(multi, CommitEffects::default())
+                .await
+                .map(|_| ()),
+            pg.load_trade("trade").await.map(|_| ()),
+            pg.load_trade_receipt("trade-op", "trade").await.map(|_| ()),
+            pg.apply_trade(trade).await.map(|_| ()),
+            pg.cache_repair_queue()
+                .acknowledge_cached(&record, Revision(1))
+                .await
+                .map(|_| ()),
+            pg.cache_repair_queue()
+                .acknowledge_cached_multi(std::slice::from_ref(&snapshot))
+                .await
+                .map(|_| ()),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(StorageError::PostgresConnectionWaitTimeout { timeout_ms: 15 })
+                ),
+                "{result:?}"
+            );
+        }
+        store.synchronize_committed_cache(&snapshot).await;
+        store
+            .synchronize_committed_cache_multi(std::slice::from_ref(&snapshot))
+            .await;
+        assert_eq!(count(&store.metrics, "cache_repair_ack"), 2);
+        assert_eq!(count(&store.metrics, "postgres_operation"), 0);
+        assert!(matches!(
+            arrived.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            store
+                .metrics
+                .latency_snapshot()
+                .iter()
+                .all(|s| s.in_flight == 0)
+        );
+        drop(held);
+        // Expired waiters no longer occupy the queue: the next request reaches the peer.
+        let mut load = Box::pin(store.postgres.load(&record));
+        tokio::select! { _ = &mut load => panic!("peer stalls SQL"), r = arrived => r.unwrap() }
+    })
+    .await
+    .expect("all entry points must use the queue budget");
+}
+
+#[tokio::test]
+async fn request_queue_budget_does_not_bound_sql_or_maintenance_wait() {
+    timeout(Duration::from_secs(2), async {
+        let (mut store, arrived, _pg, _redis) = tiered(false).await;
+        store.postgres.connection_wait_timeout = Some(Duration::from_millis(15));
+        let record = snapshot().record;
+        let mut load = Box::pin(store.postgres.load(&record));
+        tokio::select! { _ = &mut load => panic!("peer stalls SQL"), r = arrived => r.unwrap() }
+        assert!(timeout(Duration::from_millis(60), &mut load).await.is_err());
+        assert_eq!(stage(&store.metrics, "postgres_operation").in_flight, 1);
+        drop(load);
+
+        let metrics = Arc::new(StorageMetrics::default());
+        let (maintenance, arrived, _peer) = postgres(metrics.clone()).await;
+        assert_eq!(maintenance.connection_wait_timeout, None);
+        let held = maintenance.client.lock().await;
+        assert!(held.reconnect_cooldown.is_zero());
+        let queue = maintenance.cache_repair_queue();
+        let mut ack = Box::pin(queue.acknowledge_cached(&record, Revision(1)));
+        std::future::poll_fn(|cx| {
+            assert!(ack.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(timeout(Duration::from_millis(60), &mut ack).await.is_err());
+        drop(held);
+        tokio::select! { _ = &mut ack => panic!("peer stalls ACK"), r = arrived => r.unwrap() }
+    })
+    .await
+    .expect("execution and maintenance retain separate budgets");
+}
+
+#[tokio::test]
+async fn request_postgres_invalid_policy_is_rejected_before_connecting() {
+    for duration in [Duration::ZERO, Duration::from_micros(999)] {
+        for config in [
+            PostgresRequestConfig {
+                connection_wait_timeout: duration,
+                ..Default::default()
+            },
+            PostgresRequestConfig {
+                reconnect_cooldown: duration,
+                ..Default::default()
+            },
+        ] {
+            let result =
+                PostgresSnapshotStore::connect_with_request_config("invalid-pg", config).await;
+            assert!(matches!(
+                result,
+                Err(StorageError::InvalidPostgresConnectionWaitTimeout
+                    | StorageError::InvalidPostgresReconnectCooldown)
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn request_postgres_cancelled_reconnect_cools_down_then_recovers() {
+    timeout(Duration::from_secs(3), async {
+        let (store, _arrival, pg, _redis) = tiered(false).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("postgresql://test@{}/test?sslmode=disable", listener.local_addr().unwrap());
+        let attempts = Arc::new(AtomicU64::new(0));
+        let observed = attempts.clone();
+        let (sent, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let _peer = Peer(tokio::spawn(async move {
+            let mut streams = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let length = stream.read_u32().await.unwrap();
+                stream.read_exact(&mut vec![0; length as usize - 4]).await.unwrap();
+                let index = observed.fetch_add(1, Ordering::SeqCst);
+                if index > 0 { stream.write_all(b"R\0\0\0\x08\0\0\0\0Z\0\0\0\x05I").await.unwrap(); }
+                sent.send(()).unwrap();
+                streams.push(stream);
+            }
+        }));
+        {
+            let mut client = store.postgres.client.lock().await;
+            client.url = Arc::from(url);
+            client.reconnect_cooldown = Duration::from_millis(80);
+        }
+        drop(pg);
+        while !store.postgres.client.lock().await.is_closed() { tokio::task::yield_now().await; }
+        let record = snapshot().record;
+        let mut reconnect = Box::pin(store.postgres.load(&record));
+        tokio::select! { _ = &mut reconnect => panic!("first reconnect stalls"), _ = arrivals.recv() => {} }
+        drop(reconnect);
+        assert!(matches!(store.postgres.load(&record).await, Err(StorageError::PostgresReconnectCooldown { .. })));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(store.metrics.latency_snapshot().iter().all(|s| s.in_flight == 0));
+        sleep(Duration::from_millis(90)).await;
+        let mut client = store.postgres.client.lock().await;
+        client.ensure_connected().await.unwrap();
+        assert!(client.retry_at.is_none());
+        assert!(!client.is_closed());
+        client.ensure_connected().await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }).await.expect("cancelled reconnect must permit one later recovery");
+}
+
+#[tokio::test]
+async fn request_postgres_reconnect_failure_is_shared_by_waiters() {
+    timeout(Duration::from_secs(5), async {
+        let (store, _arrived, pg, _redis) = tiered(false).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let observed = attempts.clone();
+        let url = format!(
+            "postgresql://test@{}/test?sslmode=disable",
+            listener.local_addr().unwrap()
+        );
+        let _failed_server = Peer(tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let length = stream.read_u32().await.unwrap();
+                let mut startup = vec![0; length as usize - 4];
+                stream.read_exact(&mut startup).await.unwrap();
+                observed.fetch_add(1, Ordering::SeqCst);
+                // Reject after observing a complete startup packet, without accepting any SQL.
+                drop(stream);
+            }
+        }));
+        store.postgres.client.lock().await.url = Arc::from(url);
+        drop(pg);
+        loop {
+            if store.postgres.client.lock().await.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let record = snapshot().record;
+        let (a, b, c, d) = tokio::join!(
+            store.postgres.load(&record),
+            store.postgres.load(&record),
+            store.postgres.load(&record),
+            store.postgres.load(&record)
+        );
+        assert!([a, b, c, d].iter().all(Result::is_err));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "waiters must reuse one failed reconnect"
+        );
+    })
+    .await
+    .expect("reconnect fixture deadline");
 }
 
 // 固定住缓存连接锁，验证预算覆盖排队，而不是仅覆盖已经发出的 Redis 命令。

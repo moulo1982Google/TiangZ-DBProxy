@@ -4,6 +4,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "support/postgres_request.rs"]
+mod postgres_request;
+
 use tiangz_dbproxy_core::{
     AsyncMultiRecordTransactionStore, AsyncSnapshotStore, AsyncTradeStore, AsyncTransactionalStore,
     LedgerPosting, MultiRecordTransactionalWrite, MultiRecordTransactionalWriteOutcome,

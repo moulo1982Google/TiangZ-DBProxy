@@ -57,6 +57,8 @@
             "cacheFallbackConcurrency": { "type": "integer", "minimum": 1, "default": 16 },
             "cacheFallbackTimeoutMs": { "type": "integer", "minimum": 1, "default": 2000 },
             "cacheOperationTimeoutMs": { "type": "integer", "minimum": 1, "default": 200 },
+            "postgresConnectionWaitTimeoutMs": { "type": "integer", "minimum": 1, "default": 2000 },
+            "postgresReconnectCooldownMs": { "type": "integer", "minimum": 1, "default": 500 },
             "cacheFallbackCircuitFailureThreshold": { "type": "integer", "minimum": 1, "default": 5 },
             "cacheFallbackCircuitCooldownMs": { "type": "integer", "minimum": 1, "default": 5000 },
             "cacheFallbackLockLeaseMs": { "type": "integer", "minimum": 1, "default": 3000 },
