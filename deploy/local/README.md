@@ -105,3 +105,8 @@ powershell -ExecutionPolicy Bypass -File tools/fault_matrix.ps1
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/network_smoke.ps1
 ```
+## 独立 PG 数据路径对照
+
+仅在本机演练需要比较存储路径时，设置 `DBPROXY_VALIDATION_PG_DATA_DIR` 为已存在的独立空目录，再在主配置、laptop、validation 三份文件之后叠加 `docker-compose.validation-postgres-bind.yml`，仅对 `postgres` 执行 `up -d --no-deps --wait`。该文件保留原 named volume，使用新的 PG 数据目录，不复制原业务库。不得让两个 PG 实例同时打开该目录。
+
+回退时不叠加 bind 文件，使用原三份 Compose 配置对 `postgres` 执行 `up -d --no-deps --force-recreate`；原卷仍在。它不迁移 Docker Desktop 全局数据，不影响其他项目。路径对照必须保留镜像、持久化参数和验收负载，完整证据见[2026-09-07 存储路径验收](../../docs/storage-path-acceptance-2026-09-07.md)。
