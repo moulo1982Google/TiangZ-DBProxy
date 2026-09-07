@@ -70,6 +70,7 @@ const MIGRATION_LOCK_ID: i64 = 8_390_417_203;
 pub const SNAPSHOT_PARTITION_COUNT: usize = 32;
 pub const DEFAULT_CACHE_FALLBACK_CONCURRENCY: usize = 16;
 pub const DEFAULT_CACHE_FALLBACK_TIMEOUT_MS: u64 = 2_000;
+pub const DEFAULT_CACHE_OPERATION_TIMEOUT_MS: u64 = 200;
 pub const DEFAULT_CACHE_FALLBACK_CIRCUIT_FAILURE_THRESHOLD: u32 = 5;
 pub const DEFAULT_CACHE_FALLBACK_CIRCUIT_COOLDOWN_MS: u64 = 5_000;
 pub const DEFAULT_CACHE_FALLBACK_LOCK_LEASE_MS: u64 = 3_000;
@@ -407,6 +408,8 @@ pub enum StorageError {
     InvalidCacheFallbackConcurrency,
     #[error("cache fallback timeout must be greater than zero")]
     InvalidCacheFallbackTimeout,
+    #[error("cache operation timeout must be at least one millisecond")]
+    InvalidCacheOperationTimeout,
     #[error("cache fallback circuit failure threshold must be greater than zero")]
     InvalidCacheFallbackCircuitThreshold,
     #[error("cache fallback circuit cooldown must be greater than zero")]
@@ -619,12 +622,27 @@ impl SnapshotCacheConfig {
 ///
 /// Keeping these related knobs in one value avoids constructor growth whenever a cache policy is
 /// added. Callers can override only the policies they need with struct update syntax.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TieredSnapshotStoreConfig {
+    /// 缓存单次操作预算，包含连接排队；不缩短 PG 回源或可靠 Redis AOF 等待。
+    /// Per-cache-operation budget including connection wait, independent of PG fallback and AOF.
+    pub cache_operation_timeout: Duration,
     pub fallback: CacheFallbackConfig,
     pub circuit: CacheFallbackCircuitConfig,
     pub lock: CacheFallbackLockConfig,
     pub cache: SnapshotCacheConfig,
+}
+
+impl Default for TieredSnapshotStoreConfig {
+    fn default() -> Self {
+        Self {
+            cache_operation_timeout: Duration::from_millis(DEFAULT_CACHE_OPERATION_TIMEOUT_MS),
+            fallback: CacheFallbackConfig::default(),
+            circuit: CacheFallbackCircuitConfig::default(),
+            lock: CacheFallbackLockConfig::default(),
+            cache: SnapshotCacheConfig::default(),
+        }
+    }
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -2180,6 +2198,7 @@ impl CacheFallbackCircuit {
 /// The key map stores weak references: completed keys do not retain an ever-growing lock map.
 /// A shared semaphore also bounds fallback reads across unrelated keys when Redis is unavailable.
 struct CacheReadCoordinator {
+    cache_operation_timeout: Duration,
     metrics: Arc<StorageMetrics>,
     key_locks: Mutex<HashMap<RecordKey, Weak<Mutex<()>>>>,
     fallback_slots: Arc<Semaphore>,
@@ -2200,6 +2219,7 @@ impl CacheReadCoordinator {
         let lock_config = lock_config.validate()?;
         Ok(Self {
             key_locks: Mutex::new(HashMap::new()),
+            cache_operation_timeout: Duration::from_millis(DEFAULT_CACHE_OPERATION_TIMEOUT_MS),
             metrics: Arc::new(StorageMetrics::default()),
             fallback_slots: Arc::new(Semaphore::new(config.max_concurrent)),
             refresh_slots: Arc::new(Semaphore::new(config.max_concurrent)),
@@ -2238,7 +2258,7 @@ impl CacheReadCoordinator {
     fn cache_timeout_error(&self, operation: &'static str) -> StorageError {
         StorageError::CacheOperationTimeout {
             operation,
-            timeout_ms: self.fallback_timeout_ms,
+            timeout_ms: duration_millis(self.cache_operation_timeout),
         }
     }
 
@@ -2710,6 +2730,9 @@ impl TieredSnapshotStore {
         config: TieredSnapshotStoreConfig,
         metrics: Arc<StorageMetrics>,
     ) -> Result<Self, StorageError> {
+        if config.cache_operation_timeout < Duration::from_millis(1) {
+            return Err(StorageError::InvalidCacheOperationTimeout);
+        }
         let mut postgres = PostgresSnapshotStore::connect(postgres_url).await?;
         // 启动迁移不混入请求路径计时；所有请求分片共享同一组指标。
         // Exclude startup migration and aggregate every request shard into shared telemetry.
@@ -2726,6 +2749,7 @@ impl TieredSnapshotStore {
             config.lock,
         )?;
         coordinator.metrics = Arc::clone(&metrics);
+        coordinator.cache_operation_timeout = config.cache_operation_timeout;
         Ok(Self {
             postgres,
             cache,
@@ -2813,10 +2837,14 @@ impl TieredSnapshotStore {
     ) -> Result<CacheLookup, StorageError> {
         let _timer = self.metrics.latency.start(Stage::CacheLookup);
         let result = if observed {
-            timeout(self.read_coordinator.timeout(), self.cache.lookup(record)).await
+            timeout(
+                self.read_coordinator.cache_operation_timeout,
+                self.cache.lookup(record),
+            )
+            .await
         } else {
             timeout(
-                self.read_coordinator.timeout(),
+                self.read_coordinator.cache_operation_timeout,
                 self.cache.lookup_unobserved(record),
             )
             .await
@@ -2838,13 +2866,13 @@ impl TieredSnapshotStore {
         let _timer = self.metrics.latency.start(Stage::CacheLookup);
         let result = if observed {
             timeout(
-                self.read_coordinator.timeout(),
+                self.read_coordinator.cache_operation_timeout,
                 self.cache.lookup_multi(records),
             )
             .await
         } else {
             timeout(
-                self.read_coordinator.timeout(),
+                self.read_coordinator.cache_operation_timeout,
                 self.cache.lookup_multi_unobserved(records),
             )
             .await
@@ -2860,7 +2888,12 @@ impl TieredSnapshotStore {
 
     async fn put_cache(&self, snapshot: &SnapshotEnvelope) -> Result<(), StorageError> {
         let _timer = self.metrics.latency.start(Stage::CacheWrite);
-        match timeout(self.read_coordinator.timeout(), self.cache.put(snapshot)).await {
+        match timeout(
+            self.read_coordinator.cache_operation_timeout,
+            self.cache.put(snapshot),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => {
                 self.metrics.cache_write_error();
@@ -2872,7 +2905,7 @@ impl TieredSnapshotStore {
     async fn put_cache_multi(&self, snapshots: &[SnapshotEnvelope]) -> Result<(), StorageError> {
         let _timer = self.metrics.latency.start(Stage::CacheWrite);
         match timeout(
-            self.read_coordinator.timeout(),
+            self.read_coordinator.cache_operation_timeout,
             self.cache.put_multi(snapshots),
         )
         .await
@@ -2963,7 +2996,7 @@ impl TieredSnapshotStore {
     ) -> Result<(), StorageError> {
         let _timer = self.metrics.latency.start(Stage::CacheWrite);
         match timeout(
-            self.read_coordinator.timeout(),
+            self.read_coordinator.cache_operation_timeout,
             self.cache
                 .put_negative_if_revision(record, expected_revision),
         )
@@ -2979,7 +3012,12 @@ impl TieredSnapshotStore {
 
     async fn delete_cache(&self, record: &RecordKey) -> Result<(), StorageError> {
         let _timer = self.metrics.latency.start(Stage::CacheWrite);
-        match timeout(self.read_coordinator.timeout(), self.cache.delete(record)).await {
+        match timeout(
+            self.read_coordinator.cache_operation_timeout,
+            self.cache.delete(record),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => {
                 self.metrics.cache_write_error();
@@ -3016,7 +3054,7 @@ impl TieredSnapshotStore {
             }
             let attempt = timeout(
                 self.read_coordinator
-                    .timeout()
+                    .cache_operation_timeout
                     .min(remaining_before_attempt),
                 self.cache
                     .try_acquire_fallback_lock(record, &lock.token, config.lease_ms()),
@@ -3049,7 +3087,7 @@ impl TieredSnapshotStore {
             }
             let recheck = timeout(
                 self.read_coordinator
-                    .timeout()
+                    .cache_operation_timeout
                     .min(remaining_before_recheck),
                 self.cache.lookup_unobserved(record),
             )
@@ -3085,7 +3123,7 @@ impl TieredSnapshotStore {
     async fn release_fallback_lock(&self, lock: CacheFallbackLock) {
         let _timer = self.metrics.latency.start(Stage::FallbackRelease);
         match timeout(
-            self.read_coordinator.timeout(),
+            self.read_coordinator.cache_operation_timeout,
             self.cache.release_fallback_lock(&lock),
         )
         .await

@@ -17,7 +17,8 @@ use tiangz_dbproxy_storage::{
     DEFAULT_CACHE_FALLBACK_CONCURRENCY, DEFAULT_CACHE_FALLBACK_LOCK_LEASE_MS,
     DEFAULT_CACHE_FALLBACK_LOCK_POLL_MS, DEFAULT_CACHE_FALLBACK_LOCK_WAIT_MS,
     DEFAULT_CACHE_FALLBACK_TIMEOUT_MS, DEFAULT_CACHE_NEGATIVE_TTL_MS,
-    DEFAULT_CACHE_STALE_WHILE_REVALIDATE_MS, DEFAULT_CACHE_TTL_JITTER_MS, DEFAULT_CACHE_TTL_MS,
+    DEFAULT_CACHE_OPERATION_TIMEOUT_MS, DEFAULT_CACHE_STALE_WHILE_REVALIDATE_MS,
+    DEFAULT_CACHE_TTL_JITTER_MS, DEFAULT_CACHE_TTL_MS,
 };
 
 const DEFAULT_CONFIG_PATH: &str = "configs/local.json";
@@ -98,6 +99,11 @@ pub enum StorageSection {
             default = "default_cache_fallback_timeout_ms"
         )]
         cache_fallback_timeout_ms: u64,
+        #[serde(
+            rename = "cacheOperationTimeoutMs",
+            default = "default_cache_operation_timeout_ms"
+        )]
+        cache_operation_timeout_ms: u64,
         #[serde(
             rename = "cacheFallbackCircuitFailureThreshold",
             default = "default_cache_fallback_circuit_failure_threshold"
@@ -268,6 +274,7 @@ pub enum ResolvedStorage {
         shards: usize,
         cache_fallback_concurrency: usize,
         cache_fallback_timeout_ms: u64,
+        cache_operation_timeout_ms: u64,
         cache_fallback_circuit_failure_threshold: u32,
         cache_fallback_circuit_cooldown_ms: u64,
         cache_fallback_lock_lease_ms: u64,
@@ -435,6 +442,7 @@ impl DbProxyConfig {
                 shards,
                 cache_fallback_concurrency,
                 cache_fallback_timeout_ms,
+                cache_operation_timeout_ms,
                 cache_fallback_circuit_failure_threshold,
                 cache_fallback_circuit_cooldown_ms,
                 cache_fallback_lock_lease_ms,
@@ -451,6 +459,10 @@ impl DbProxyConfig {
                     cache_fallback_concurrency,
                 )?;
                 require_positive("storage.cacheFallbackTimeoutMs", cache_fallback_timeout_ms)?;
+                require_positive(
+                    "storage.cacheOperationTimeoutMs",
+                    cache_operation_timeout_ms,
+                )?;
                 require_positive(
                     "storage.cacheFallbackCircuitFailureThreshold",
                     cache_fallback_circuit_failure_threshold,
@@ -484,6 +496,7 @@ impl DbProxyConfig {
                     shards,
                     cache_fallback_concurrency,
                     cache_fallback_timeout_ms,
+                    cache_operation_timeout_ms,
                     cache_fallback_circuit_failure_threshold,
                     cache_fallback_circuit_cooldown_ms,
                     cache_fallback_lock_lease_ms,
@@ -595,6 +608,9 @@ const fn default_storage_shards() -> usize {
 }
 const fn default_cache_fallback_concurrency() -> usize {
     DEFAULT_CACHE_FALLBACK_CONCURRENCY
+}
+const fn default_cache_operation_timeout_ms() -> u64 {
+    DEFAULT_CACHE_OPERATION_TIMEOUT_MS
 }
 const fn default_cache_fallback_timeout_ms() -> u64 {
     DEFAULT_CACHE_FALLBACK_TIMEOUT_MS
@@ -748,6 +764,7 @@ mod tests {
                 cache_redis_url,
                 cache_fallback_concurrency,
                 cache_fallback_timeout_ms,
+                cache_operation_timeout_ms,
                 cache_fallback_circuit_failure_threshold,
                 cache_fallback_circuit_cooldown_ms,
                 cache_fallback_lock_lease_ms,
@@ -760,6 +777,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(cache_redis_url, redis_url);
+                assert_eq!(
+                    *cache_operation_timeout_ms,
+                    DEFAULT_CACHE_OPERATION_TIMEOUT_MS
+                );
                 assert_eq!(
                     *cache_fallback_concurrency,
                     DEFAULT_CACHE_FALLBACK_CONCURRENCY
@@ -1129,6 +1150,41 @@ mod tests {
                 assert_eq!(cache_stale_while_revalidate_ms, 0);
             }
             ResolvedStorage::Memory { .. } => panic!("expected postgresRedis storage"),
+        }
+    }
+
+    #[test]
+    fn cache_operation_budget_is_independent_and_rejects_zero() {
+        for millis in [0, 75] {
+            let path = write_config(&format!(
+                r#"{{
+                "configVersion":1,
+                "server":{{"listenAddr":"127.0.0.1:7800","authTokenEnv":"AUTH"}},
+                "storage":{{"backend":"postgresRedis","postgresUrlEnv":"PG","redisUrlEnv":"REDIS",
+                    "cacheOperationTimeoutMs":{millis},"cacheFallbackTimeoutMs":4321}}
+            }}"#
+            ));
+            let result = load_config_with(&path, |_| Some("0123456789abcdef".into()));
+            fs::remove_file(path).unwrap();
+            if millis == 0 {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("storage.cacheOperationTimeoutMs must be greater than zero")
+                );
+            } else {
+                let ResolvedStorage::PostgresRedis {
+                    cache_operation_timeout_ms,
+                    cache_fallback_timeout_ms,
+                    ..
+                } = result.unwrap().storage
+                else {
+                    panic!("wrong backend")
+                };
+                assert_eq!(cache_operation_timeout_ms, 75);
+                assert_eq!(cache_fallback_timeout_ms, 4321);
+            }
         }
     }
 

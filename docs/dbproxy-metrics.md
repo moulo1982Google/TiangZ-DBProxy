@@ -48,8 +48,12 @@ Memory backends do not require these dependencies and return `not-configured` fr
   `dbproxy_cache_fallback_lock_release_errors_total` identify Redis coordination failures.
 
 The fallback path is bounded by `storage.cacheFallbackConcurrency` and
-`storage.cacheFallbackTimeoutMs`; the same timeout also bounds Redis lookup, warmup, delete, and
-lock-release operations so a half-open Redis connection cannot hang a request indefinitely. The circuit breaker opens after
+`storage.cacheFallbackTimeoutMs` (default 2,000 ms). Redis cache lookup, write, warmup, delete,
+lease acquisition/recheck and release instead use `storage.cacheOperationTimeoutMs` (default 200 ms,
+positive integer), including time waiting for the cache connection. The lease coordination still
+respects its separate total wait limit. This is a per-operation budget, not an end-to-end RPC deadline.
+The PostgreSQL repair ACK, reliable Redis backlog, AOF confirmation and MQ publication are unchanged.
+The circuit breaker opens after
 `cacheFallbackCircuitFailureThreshold` consecutive PostgreSQL fallback failures, rejects new
 fallbacks during `cacheFallbackCircuitCooldownMs`, then permits one half-open probe. A successful
 probe closes the circuit; another failure reopens it. A sustained increase in timeout or circuit

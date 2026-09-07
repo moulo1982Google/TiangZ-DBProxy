@@ -51,6 +51,10 @@ TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transpor
 
 ## 启动配置
 
+缓存与 PG 回源的等待预算现分离：`storage.cacheOperationTimeoutMs` 默认 200 ms，`cacheFallbackTimeoutMs` 仍默认 2,000 ms。升级兼容、正确性边界与测试见[缓存操作预算](docs/cache-operation-budget.md)。可靠 Redis AOF/MQ 确认不使用该缓存预算。
+
+下一步 PG 故障连接排队优化尚未实施；已完成验证、实施顺序、正确性约束和换机准备见[2026-09-07 交接计划](docs/handoff-2026-09-07.md)。
+
 通用 Outbox Relay 的 Redis 路由、禁用的未来 MQ 声明、离线检查和审计管理命令见[Outbox Relay](docs/outbox-relay.md)与[配置示例](configs/outbox-relay.example.json)。旧配置及旧 Stream 地址保持兼容；新来源不能在所有 worker 升级前启用。
 
 DBProxy使用带`configVersion: 1`的严格JSON保存普通启动参数，默认读取`configs/local.json`，并由`configs/dbproxy.schema.json`提供编辑器提示。`runtime.workerThreads`可以固定Tokio Runtime工作线程数，省略时沿用Tokio按逻辑CPU选择的行为；它与只负责Redis积压消费的`backlog.workers`不是同一个参数。连接串和认证令牌不能写进JSON；配置文件只记录环境变量名，由部署环境注入实际密钥：

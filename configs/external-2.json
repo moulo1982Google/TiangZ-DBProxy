@@ -20,6 +20,7 @@
     "shards": 4,
     "cacheFallbackConcurrency": 16,
     "cacheFallbackTimeoutMs": 2000,
+    "cacheOperationTimeoutMs": 200,
     "cacheFallbackCircuitFailureThreshold": 5,
     "cacheFallbackCircuitCooldownMs": 5000,
     "cacheFallbackLockLeaseMs": 3000,

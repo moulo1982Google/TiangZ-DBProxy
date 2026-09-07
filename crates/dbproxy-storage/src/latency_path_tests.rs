@@ -136,6 +136,114 @@ fn snapshot() -> SnapshotEnvelope {
     }
 }
 
+// 固定住缓存连接锁，验证预算覆盖排队，而不是仅覆盖已经发出的 Redis 命令。
+// Hold the cache mutex: the independent budget must include queueing, not just network I/O.
+#[tokio::test]
+async fn cache_queue_timeouts_use_cache_budget_without_attempting_repair_ack() {
+    timeout(Duration::from_secs(1), async {
+        let (mut store, mut arrived, _pg, _redis) = tiered(false).await;
+        let coordinator = Arc::get_mut(&mut store.read_coordinator).unwrap();
+        coordinator.cache_operation_timeout = Duration::from_millis(20);
+        assert_eq!(coordinator.timeout(), Duration::from_secs(2));
+        let held = store.cache.connection.lock().await;
+        let snapshot = snapshot();
+        let record = &snapshot.record;
+        let records = [record.clone()];
+        for result in [
+            store.lookup_cache(record, true).await.map(|_| ()),
+            store.lookup_cache_multi(&records, true).await.map(|_| ()),
+            store.put_cache(&snapshot).await,
+            store.put_cache_multi(std::slice::from_ref(&snapshot)).await,
+            store.put_negative_cache(record, None).await,
+            store.delete_cache(record).await,
+        ] {
+            assert!(matches!(
+                result,
+                Err(StorageError::CacheOperationTimeout { timeout_ms: 20, .. })
+            ));
+        }
+        store.synchronize_committed_cache(&snapshot).await;
+        store
+            .synchronize_committed_cache_multi(std::slice::from_ref(&snapshot))
+            .await;
+        assert_eq!(count(&store.metrics, "cache_repair_ack"), 0);
+        assert_eq!(count(&store.metrics, "committed_cache_sync"), 2);
+        assert!(matches!(
+            store.acquire_fallback_lock(record).await,
+            CacheFallbackLockOutcome::Unavailable
+        ));
+        store
+            .release_fallback_lock(CacheFallbackLock {
+                key: RedisSnapshotCache::fallback_lock_key(record),
+                token: "test".into(),
+            })
+            .await;
+        assert_eq!(store.metrics.snapshot().cache_fallback_lock_errors, 1);
+        assert_eq!(
+            store.metrics.snapshot().cache_fallback_lock_release_errors,
+            1
+        );
+        assert!(matches!(
+            arrived.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            store
+                .metrics
+                .latency_snapshot()
+                .iter()
+                .all(|s| s.in_flight == 0)
+        );
+        drop(held);
+    })
+    .await
+    .expect("cache queue must not wait for the 2-second PG budget");
+}
+
+#[tokio::test]
+async fn shorter_cache_budget_does_not_cancel_pg_fallback() {
+    timeout(Duration::from_secs(1), async {
+        let (mut store, arrived, _pg, _redis) = tiered(false).await;
+        Arc::get_mut(&mut store.read_coordinator)
+            .unwrap()
+            .cache_operation_timeout = Duration::from_millis(20);
+        let record = snapshot().record;
+        let mut load = Box::pin(store.load(&record));
+        tokio::select! {
+            result = &mut load => panic!("PG fixture must stall: {result:?}"),
+            arrival = arrived => arrival.unwrap(),
+        }
+        assert!(timeout(Duration::from_millis(80), &mut load).await.is_err());
+        assert_eq!(stage(&store.metrics, "postgres_operation").in_flight, 1);
+        drop(load);
+    })
+    .await
+    .expect("PG fallback retains its own budget");
+}
+
+#[tokio::test]
+async fn invalid_cache_budget_is_rejected_before_connecting() {
+    for budget in [Duration::ZERO, Duration::from_micros(999)] {
+        let result = TieredSnapshotStore::connect_with_config(
+            "invalid-pg",
+            "invalid-redis",
+            TieredSnapshotStoreConfig {
+                cache_operation_timeout: budget,
+                ..Default::default()
+            },
+            Arc::new(StorageMetrics::default()),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(StorageError::InvalidCacheOperationTimeout)
+        ));
+    }
+    let defaults = TieredSnapshotStoreConfig::default();
+    assert_eq!(defaults.cache_operation_timeout, Duration::from_millis(200));
+    assert_eq!(defaults.fallback.timeout, Duration::from_secs(2));
+}
+
 #[tokio::test]
 async fn postgres_mutex_wait_and_cancelled_query_are_distinct_real_call_scopes() {
     timeout(Duration::from_secs(5), async {

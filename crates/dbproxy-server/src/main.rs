@@ -49,6 +49,7 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
             shards,
             cache_fallback_concurrency,
             cache_fallback_timeout_ms,
+            cache_operation_timeout_ms,
             cache_fallback_circuit_failure_threshold,
             cache_fallback_circuit_cooldown_ms,
             cache_fallback_lock_lease_ms,
@@ -67,6 +68,9 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
                     StorageBackendConfig {
                         shard_count: shards,
                         tiered: tiangz_dbproxy_storage::TieredSnapshotStoreConfig {
+                            cache_operation_timeout: Duration::from_millis(
+                                cache_operation_timeout_ms,
+                            ),
                             fallback: tiangz_dbproxy_storage::CacheFallbackConfig {
                                 max_concurrent: cache_fallback_concurrency,
                                 timeout: Duration::from_millis(cache_fallback_timeout_ms),

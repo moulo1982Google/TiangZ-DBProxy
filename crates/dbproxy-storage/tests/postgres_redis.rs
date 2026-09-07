@@ -27,6 +27,112 @@ fn test_suffix() -> String {
 }
 
 #[tokio::test]
+#[ignore = "需要独立 PostgreSQL/Redis；会暂停缓存写入，必须串行运行"]
+async fn cache_write_timeout_preserves_committed_batch_and_durable_repair() {
+    let pg_url = std::env::var("DBPROXY_POSTGRES_URL").unwrap();
+    let redis_url = std::env::var("DBPROXY_CACHE_REDIS_URL")
+        .or_else(|_| std::env::var("DBPROXY_REDIS_URL"))
+        .unwrap();
+    let metrics = Arc::new(StorageMetrics::default());
+    let mut store = TieredSnapshotStore::connect_with_config(
+        &pg_url,
+        &redis_url,
+        TieredSnapshotStoreConfig {
+            cache_operation_timeout: Duration::from_millis(40),
+            ..Default::default()
+        },
+        metrics.clone(),
+    )
+    .await
+    .unwrap();
+    let postgres = PostgresSnapshotStore::connect(&pg_url).await.unwrap();
+    let cache = RedisSnapshotCache::connect(&redis_url).await.unwrap();
+    let (sql, driver) = tokio_postgres::connect(&pg_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let driver = tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let mut admin = redis::Client::open(redis_url)
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let namespace = format!("cache-budget-{}", test_suffix());
+    let requests: Vec<_> = (0..2)
+        .map(|i| SnapshotWrite {
+            request_id: format!("{namespace}-{i}"),
+            record: RecordKey::new(&namespace, i.to_string()).unwrap(),
+            schema: "budget.v1".into(),
+            schema_version: 1,
+            payload: vec![i as u8],
+            expected_revision: Some(Revision::ZERO),
+            updated_at_unix_ms: 1,
+        })
+        .collect();
+    let _: () = redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(10_000)
+        .arg("WRITE")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let saved =
+        tokio::time::timeout(Duration::from_secs(1), store.save_batch(requests.clone())).await;
+    // 先恢复 Redis 再断言；即便旧实现耗尽外层预算，也不遗留人为暂停。
+    // Unpause before assertions, including when the old implementation hits the test deadline.
+    let unpause: redis::RedisResult<()> = redis::cmd("CLIENT")
+        .arg("UNPAUSE")
+        .query_async(&mut admin)
+        .await;
+    unpause.unwrap();
+    let saved = saved
+        .expect("cache must not consume the 2-second PG fallback budget")
+        .unwrap();
+    assert!(saved.iter().all(|r| matches!(
+        r,
+        Ok(SnapshotWriteOutcome::Applied {
+            revision: Revision(1)
+        })
+    )));
+    assert_eq!(metrics.snapshot().cache_write_errors, 1);
+    let pending: i64 = sql
+        .query_one(
+            "SELECT count(*) FROM dbproxy_cache_repairs WHERE namespace=$1 AND target_revision=1",
+            &[&namespace],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(pending, 2, "timeout must not ACK durable repair rows");
+    for request in &requests {
+        let durable = postgres.load(&request.record).await.unwrap().unwrap();
+        assert_eq!(durable.revision, Revision(1));
+        assert_eq!(durable.payload, request.payload);
+        let repaired = store.repair_cache(&request.record).await.unwrap().unwrap();
+        assert!(
+            store
+                .cache_repair_queue()
+                .acknowledge_cached(&request.record, repaired)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cache.get(&request.record).await.unwrap().unwrap().payload,
+            request.payload
+        );
+    }
+    let duplicate = store.save_batch(requests).await.unwrap();
+    assert!(duplicate.iter().all(|r| matches!(
+        r,
+        Ok(SnapshotWriteOutcome::Duplicate {
+            revision: Revision(1)
+        })
+    )));
+    driver.abort();
+}
+
+#[tokio::test]
 #[ignore = "需要独立 PostgreSQL；使用 --ignored 显式运行"]
 async fn generic_commit_preserves_atomic_effects_and_immutable_facts() {
     use tiangz_dbproxy_core::{AppendRecord, CommitEffects};
