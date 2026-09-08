@@ -469,14 +469,20 @@ impl DbProxyClient {
     pub async fn connect(config: ClientConfig) -> Result<Self, ClientError> {
         let candidates = config.endpoint_candidates()?;
         let mut last_error = None;
+        let mut last_rejection = None;
         for endpoint_index in 0..candidates.len() {
             match Self::connect_observed(config.clone(), endpoint_index).await {
                 Ok(client) => return Ok(client),
                 Err(error) if is_endpoint_unavailable(&error) => last_error = Some(error),
+                Err(error) if is_candidate_handshake_rejection(&error) => {
+                    last_rejection = Some(error)
+                }
                 Err(error) => return Err(error),
             }
         }
-        Err(last_error.unwrap_or(ClientError::ConnectionClosed))
+        Err(last_rejection
+            .or(last_error)
+            .unwrap_or(ClientError::ConnectionClosed))
     }
 
     async fn connect_observed(
@@ -683,6 +689,7 @@ impl DbProxyClient {
         }
         let current_index = connection.endpoint_index;
         let mut last_error = None;
+        let mut last_rejection = None;
         for offset in 1..=candidates.len() {
             let endpoint_index = (current_index + offset) % candidates.len();
             match Self::connect_observed(self.config.clone(), endpoint_index).await {
@@ -697,11 +704,16 @@ impl DbProxyClient {
                     return Ok(());
                 }
                 Err(error) if is_endpoint_unavailable(&error) => last_error = Some(error),
+                Err(error) if is_candidate_handshake_rejection(&error) => {
+                    last_rejection = Some(error)
+                }
                 Err(error) => return Err(error),
             }
         }
         connection.usable = false;
-        Err(last_error.unwrap_or(ClientError::ConnectionClosed))
+        Err(last_rejection
+            .or(last_error)
+            .unwrap_or(ClientError::ConnectionClosed))
     }
 
     pub async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, ClientError> {
@@ -1515,6 +1527,18 @@ fn is_endpoint_unavailable(error: &ClientError) -> bool {
     )
 }
 
+// Only candidate connection loops use this rule. Business Remote errors never trigger it,
+// local InvalidConfig errors fail immediately, and observations remain Rejected.
+fn is_candidate_handshake_rejection(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Remote(RemoteError {
+            code: wire::ErrorCode::Unauthorized | wire::ErrorCode::ProtocolMismatch,
+            ..
+        }) | ClientError::UnexpectedResponse(_)
+    )
+}
+
 fn request_operation(body: &wire::request_envelope::Body) -> &'static str {
     match body {
         wire::request_envelope::Body::LoadSnapshot(_) => "load_snapshot",
@@ -1596,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn only_transport_failures_are_failover_candidates() {
+    fn only_transport_failures_are_classified_as_unavailable() {
         assert!(is_endpoint_unavailable(&ClientError::ConnectTimeout));
         assert!(is_endpoint_unavailable(&ClientError::ConnectionClosed));
         assert!(!is_endpoint_unavailable(&ClientError::Remote(

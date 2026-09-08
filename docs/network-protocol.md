@@ -72,7 +72,7 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 
 一个 `DbProxyClient` 连接内只有一个在途请求。请求写出后超时会废弃连接，防止后续 RPC 读取旧响应。`DbProxyClientPool::connect` 按 RecordKey 在一组共享读写连接中稳定路由，保持原有连接数和顺序语义；`connect_split(read_size, write_size)` 使用两组物理连接，读查询进入 read pool，写入、事务和 enqueue 进入 write pool，避免慢写造成跨用途队头阻塞。它不替代业务锁或 revision/CAS。服务端再按记录或 operation ID 路由到独立存储 shard。
 
-Rust 客户端接收有序 Endpoint 列表。连接建立失败、超时或断开才切换；Revision/Operation/Trade 等确定性远程错误不会触发切换。所有候选都必须共享同一 PostgreSQL/Redis，否则幂等和 Revision 契约不成立。
+Rust 客户端接收有序 Endpoint 列表。初次连接和故障重连都跳过不可达候选，以及握手阶段的认证拒绝、协议拒绝、指纹或 Relay 能力不匹配；仍严格验证每个候选，不降低协议或认证要求。候选握手拒绝继续记录为 `Rejected`，不会改记为 `Unavailable`；全部候选失败时优先返回拒绝原因，避免被后续网络错误覆盖。端点无关的本地配置错误立即失败。业务 RPC 阶段的 Remote 错误（包括 Unauthorized、Revision/Operation/Trade 冲突）不触发切换。所有候选都必须共享同一 PostgreSQL/Redis，否则幂等和 Revision 契约不成立。
 
 PostgreSQL 已断连接在下一次操作前做 2 秒有界重连；当前失败写不在底层自动重放。Redis 使用 connection manager 自动重连。调用方仍是唯一有权根据业务语义决定是否以原 ID 重试的一方。
 
