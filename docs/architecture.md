@@ -146,6 +146,7 @@ Redis 使用自动重连的 `ConnectionManager`。PostgreSQL 连接发现关闭�
 - `008_generic_commit.sql`：通用提交效果、不可变追加记录以及与交易无关的 Outbox；
 - `009_outbox_relay.sql`：持久路由/Publisher 身份、入队序号、租约令牌与管理审计。新配置与兼容限制见 [Outbox Relay](outbox-relay.md)。
 - `010_cache_repair_leases.sql`：缓存修复全局租约 sequence 与 token。不得在清理任务时重置 sequence；全部旧队列写入端、worker 和管理进程退出升级后，新保证才生效，详见 [恢复手册](durability-recovery-runbook.md)。
+- `011_outbox_index_cleanup.sql`：删除 007 遗留的 topic/timestamp 排序索引，保留未发布排序组索引；没有新增可能使死信积压查询退化的 enqueue_order 单列索引。执行计划对比见 [索引验证](outbox-claim-index-review.md)。
 
 ## 网络和 SDK
 

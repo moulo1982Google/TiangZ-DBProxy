@@ -1311,6 +1311,13 @@ impl PostgresSnapshotStore {
             include_str!("../migrations/010_cache_repair_leases.sql"),
         )
         .await?;
+        apply_schema_migration(
+            &transaction,
+            11,
+            "outbox-index-cleanup",
+            include_str!("../migrations/011_outbox_index_cleanup.sql"),
+        )
+        .await?;
         transaction.commit().await?;
         Ok(())
     }

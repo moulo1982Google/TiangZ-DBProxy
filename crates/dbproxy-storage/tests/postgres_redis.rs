@@ -309,9 +309,19 @@ async fn postgres_snapshot_table_uses_32_hash_partitions() {
             (8, "generic-commit".to_string()),
             (9, "outbox-relay".to_string()),
             (10, "cache-repair-leases".to_string()),
+            (11, "outbox-index-cleanup".to_string()),
         ]
     );
 
+    let indexes = sql.query_one("SELECT to_regclass('dbproxy_outbox_partition_order') IS NULL, to_regclass('dbproxy_outbox_order') IS NOT NULL", &[]).await.unwrap();
+    assert!(
+        indexes.get::<_, bool>(0),
+        "obsolete topic ordering index must be removed"
+    );
+    assert!(
+        indexes.get::<_, bool>(1),
+        "unpublished ordering-group index must remain"
+    );
     let children = sql
         .query(
             r#"

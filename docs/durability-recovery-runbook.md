@@ -96,6 +96,8 @@ powershell -ExecutionPolicy Bypass -File tools/local_laptop.ps1 down
 
 ## 积压与死信处理
 
+Outbox 死信告警表示该 `(publisher_id, destination, partition_key)` 排序组会持续停止后续投递，直到原事件被处理并完成发布；其他 producer 只有共用这三个值时才同样受阻。同 destination 下其他 partition 不受这一死信阻塞。先 inspect 定位原事件、检查持久路由和 publisher 失败原因，修复根因后通过要求 operator/reason 的审计管理工具重试原 event_id。不得跳过、删除或伪造 published_at 来消除告警。
+
 先观察指标，不要直接删表或删 Redis key：
 
 - backlog：`dbproxy_backlog_pending`、`dbproxy_backlog_processing`、`dbproxy_backlog_oldest_pending_age_seconds`
