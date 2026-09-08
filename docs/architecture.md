@@ -70,7 +70,9 @@ Redis revision-aware fast-path refresh
   failure -> return committed result; repair worker retries
 ```
 
-这消除了“数据库已经提交，但 Redis 失败导致客户端收到模糊失败”的旧语义。修复表按 `RecordKey` 合并，只保留最高 `target_revision`；worker 使用 PostgreSQL 时钟、短租约和 `FOR UPDATE SKIP LOCKED`，指数退避后进入死信。旧 lease 只能 ACK 自己领取的目标，不能删除并发产生的新版本。
+这消除了“数据库已经提交，但 Redis 失败导致客户端收到模糊失败”的旧语义。修复表按 `RecordKey` 合并，只提升 `target_revision`，保留本轮未完成修复的首次 `requested_at`、退避时间、失败计数、死信和有效租约；热点提交不会把任务推到队尾或重新启动失败预算。worker 使用 PostgreSQL 时钟、短租约和 `FOR UPDATE SKIP LOCKED`，指数退避后进入死信，显式定点重放才重置失败状态。
+
+每次领取从全局 sequence 分配 `lease_token`，任务删除后重新入队也不会复用租约身份；ACK/fail 同时校验 owner、token 和有效期。ACK 在行锁事务内按实际修复 revision 判断：覆盖当前目标则删除，否则保留更高目标并释放有效租约；`repair_cache` 返回 `None` 时只覆盖领取时的精确目标。成功释放更高目标也算完成本轮处理，不记为 LeaseLost。失败按当前有效租约累积次数，不因目标提升失效。快路径仍只删除已被成功缓存 revision 覆盖的目标。
 
 缓存写入由 Lua 脚本比较 Revision，旧快照不能覆盖新快照。普通批量快照、multi transaction 和 trade 提交后的缓存刷新都使用一次批量 Lua 调用，再用一条 PostgreSQL `unnest` 删除已覆盖的修复目标；如果任一步失败，事务内预先写入的修复行仍然存在。读取失败、编码损坏或 miss 会回源 PostgreSQL；缓存预热失败不影响权威读取结果。
 
@@ -143,6 +145,7 @@ Redis 使用自动重连的 `ConnectionManager`。PostgreSQL 连接发现关闭�
 - `007_hardening.sql`：旧库兼容字段和交易状态约束；
 - `008_generic_commit.sql`：通用提交效果、不可变追加记录以及与交易无关的 Outbox；
 - `009_outbox_relay.sql`：持久路由/Publisher 身份、入队序号、租约令牌与管理审计。新配置与兼容限制见 [Outbox Relay](outbox-relay.md)。
+- `010_cache_repair_leases.sql`：缓存修复全局租约 sequence 与 token。不得在清理任务时重置 sequence；全部旧队列写入端、worker 和管理进程退出升级后，新保证才生效，详见 [恢复手册](durability-recovery-runbook.md)。
 
 ## 网络和 SDK
 

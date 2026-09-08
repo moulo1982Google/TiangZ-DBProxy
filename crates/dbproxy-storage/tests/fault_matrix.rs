@@ -315,7 +315,7 @@ async fn redis_outage_falls_back_and_retry_repairs_cache() {
         recovered.repair_cache(&key).await.unwrap(),
         Some(Revision(2))
     );
-    assert!(queue.acknowledge(&lease).await.unwrap());
+    assert!(queue.acknowledge(&lease, Some(Revision(2))).await.unwrap());
     assert_eq!(
         recovered.apply(second).await.unwrap(),
         TransactionalWriteOutcome::Duplicate {

@@ -308,6 +308,7 @@ async fn postgres_snapshot_table_uses_32_hash_partitions() {
             (7, "hardening".to_string()),
             (8, "generic-commit".to_string()),
             (9, "outbox-relay".to_string()),
+            (10, "cache-repair-leases".to_string()),
         ]
     );
 
@@ -1203,8 +1204,11 @@ async fn durable_cache_repair_queue_keeps_the_newest_revision() {
         }
     );
     assert!(
-        !queue.acknowledge(&old_lease).await.unwrap(),
-        "an old lease must not delete a newer repair target"
+        queue
+            .acknowledge(&old_lease, Some(Revision(1)))
+            .await
+            .unwrap(),
+        "a live lease must release, but not delete, an uncovered newer target"
     );
     sql.execute(
         "UPDATE dbproxy_cache_repairs SET requested_at = to_timestamp(0) WHERE namespace = $1 AND record_key = $2",
@@ -1242,7 +1246,12 @@ async fn durable_cache_repair_queue_keeps_the_newest_revision() {
         store.repair_cache(&record).await.unwrap(),
         Some(Revision(2))
     );
-    assert!(queue.acknowledge(&current).await.unwrap());
+    assert!(
+        queue
+            .acknowledge(&current, Some(Revision(2)))
+            .await
+            .unwrap()
+    );
     let cached = RedisSnapshotCache::connect(&redis_url)
         .await
         .unwrap()

@@ -451,8 +451,12 @@ impl StorageBackend {
             return Ok(DurableQueueProcessOutcome::Empty);
         };
         match self.shard(&lease.record).repair_cache(&lease.record).await {
-            Ok(_) => {
-                if self.cache_repairs.acknowledge(&lease).await? {
+            Ok(repaired_revision) => {
+                if self
+                    .cache_repairs
+                    .acknowledge(&lease, repaired_revision)
+                    .await?
+                {
                     Ok(DurableQueueProcessOutcome::Committed)
                 } else {
                     Ok(DurableQueueProcessOutcome::LeaseLost)

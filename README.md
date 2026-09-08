@@ -107,10 +107,21 @@ GitHub Actions 的普通分支和 Pull Request 只运行开发门禁；推送 `v
 docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml up -d
 $env:DBPROXY_POSTGRES_URL = "postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz"
 $env:DBPROXY_REDIS_URL = "redis://:tiangz_dev@127.0.0.1:6379/15"
+$env:DBPROXY_TEST_POSTGRES_URL = $env:DBPROXY_POSTGRES_URL
+$env:DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION = "1"
+$env:DBPROXY_CACHE_REDIS_URL = $env:DBPROXY_REDIS_URL
 cargo test -p tiangz-dbproxy-storage --test postgres_redis -- --ignored --nocapture --test-threads=1
 ```
 
 运行这组直接存储集成测试前先停止本机 DBProxy。测试会主动认领 backlog、缓存修复和 outbox 任务；若业务 worker 同时运行，会消费测试刚写入的任务并造成竞争性假失败。database 15 用于隔离测试数据，执行前仍应确认其中没有需要保留的数据。
+
+缓存修复并发回归使用独立、可丢弃且无业务 worker 的 PostgreSQL 数据库，设置 `DBPROXY_TEST_POSTGRES_URL` 和 `DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION=1` 后执行：
+
+```powershell
+cargo test -p tiangz-dbproxy-storage --test cache_repair_concurrency -- --ignored --nocapture --test-threads=1
+```
+
+该组验证目标合并、实际修复 revision/缺失记录的 ACK、排队顺序、退避/死信保留、过期租约、同名 worker 和删除后重新入队隔离。它不在默认 `cargo test --workspace` 的通过数量中；真实 Redis 缓存读写还需执行上面的 `postgres_redis` 测试。迁移 010 的受控切换要求见[恢复手册](docs/durability-recovery-runbook.md)。
 
 运行故障矩阵。该命令会短暂停止并恢复本机 PostgreSQL/Redis 容器，但不会删除数据卷：
 

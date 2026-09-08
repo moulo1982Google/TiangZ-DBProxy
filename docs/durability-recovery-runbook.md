@@ -20,7 +20,7 @@ Redis 保存 Payload、pending 索引和 processing lease。worker 领取后写 
 
 ### 已提交快照的缓存修复
 
-每次 PostgreSQL 权威写入在同一数据库事务内 upsert `dbproxy_cache_repairs`。Redis 快速回写成功后定点 ACK；失败时客户端仍得到 PostgreSQL 已提交结果。worker 按租约领取，读取最新权威快照并做 revision-aware Redis 写入；旧 lease 只能 ACK 自己领取的 target Revision，并发产生的新目标会继续保留。
+每次 PostgreSQL 权威写入在同一数据库事务内 upsert `dbproxy_cache_repairs`。Redis 快速回写成功后定点 ACK；失败时客户端仍得到 PostgreSQL 已提交结果。合并只提升目标，保留原排队时间、退避、死信和有效租约。worker 按租约领取，读取最新权威快照并做 revision-aware Redis 写入；有效 owner/token 的 ACK 按实际修复 revision 删除已覆盖目标，未覆盖的新目标保留并释放本次租约。权威记录缺失时只 ACK 领取时的精确目标；过期或已被替换的租约不能 ACK/fail。
 
 ### PostgreSQL Outbox
 
@@ -85,6 +85,14 @@ powershell -ExecutionPolicy Bypass -File tools/run_fault_soak.ps1
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/local_laptop.ps1 down
 ```
+
+## 缓存修复租约升级（迁移 010）
+
+迁移完成不代表新修复队列语义已经生效。所有可能写入或处理该队列的旧版 DBProxy 实例及管理进程退出，并完成升级后，新的退避、死信保留及租约隔离保证才成立。旧业务提交也会执行旧 enqueue SQL，重置失败状态和租约，因此仅升级 worker 不够。
+
+安排受控切换：先停止旧队列写入端、worker 和管理进程，确认在途旧任务已退出，再由新版本执行迁移并启动处理。迁移按原有数据库锁和事务机制执行；现存租约按有效期回收。混版本期间不宣称新保证成立，回退旧 binary 也会失去这些保证。不得在正在进行的固定版本验收窗口中替换版本。
+
+`requested_at` 保留本轮未完成修复的首次入队时间。普通提交只合并最高目标，不重置退避、死信或有效租约；修复成功覆盖目标后删除任务。运维确认根因已修复后，`requeue_dead_letter` 才重置失败计数和可用时间、清理旧租约并分配新 token。全局 `dbproxy_cache_repair_lease_seq` 不随任务删除或清理重置。
 
 ## 积压与死信处理
 

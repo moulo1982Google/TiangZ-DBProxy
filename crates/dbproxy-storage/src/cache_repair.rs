@@ -12,6 +12,7 @@ pub struct CacheRepairLease {
     pub record: RecordKey,
     pub target_revision: Revision,
     pub attempt_count: u64,
+    pub lease_token: i64,
     lease_owner: String,
 }
 
@@ -143,11 +144,12 @@ WITH candidate AS (
 )
 UPDATE dbproxy_cache_repairs AS repair
 SET lease_owner = $1,
+    lease_token = nextval('dbproxy_cache_repair_lease_seq'),
     lease_until = clock_timestamp() + ($2::BIGINT * interval '1 millisecond')
 FROM candidate
 WHERE repair.namespace = candidate.namespace
   AND repair.record_key = candidate.record_key
-RETURNING repair.namespace, repair.record_key, repair.target_revision, repair.attempt_count
+RETURNING repair.namespace, repair.record_key, repair.target_revision, repair.attempt_count, repair.lease_token
 "#,
                 &[&worker_id, &lease_ms],
             )
@@ -163,27 +165,51 @@ RETURNING repair.namespace, repair.record_key, repair.target_revision, repair.at
             target_revision: revision_from_i64(&record, row.get(2))?,
             record,
             attempt_count,
+            lease_token: row.get(4),
             lease_owner: worker_id.to_string(),
         }))
     }
 
-    /// ACK only the exact claimed target. A concurrent newer enqueue remains pending.
-    pub async fn acknowledge(&self, lease: &CacheRepairLease) -> Result<bool, StorageError> {
+    /// Settle a live lease using the revision actually repaired. None covers only its exact target.
+    /// Returns true for deletion OR release of an uncovered newer target; false means lease lost.
+    pub async fn acknowledge(
+        &self,
+        lease: &CacheRepairLease,
+        repaired_revision: Option<Revision>,
+    ) -> Result<bool, StorageError> {
         let target_revision = required_revision_to_i64(&lease.record, lease.target_revision)?;
+        let repaired_revision = repaired_revision
+            .map(|revision| required_revision_to_i64(&lease.record, revision))
+            .transpose()?;
         let mut client = self.client.lock().await;
         client.ensure_connected().await?;
-        let removed = client
+        let transaction = client.transaction().await?;
+        // Lock before deciding: enqueue and fast-path deletion cannot change this row
+        // between coverage inspection and settlement. Recheck expiry at the mutation.
+        let Some(current) = lock_lease(&transaction, lease).await? else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+        let covered =
+            repaired_revision.map_or(current == target_revision, |revision| current <= revision);
+        let statement = if covered {
+            "DELETE FROM dbproxy_cache_repairs WHERE namespace = $1 AND record_key = $2 AND lease_owner = $3 AND lease_token = $4 AND lease_until > clock_timestamp()"
+        } else {
+            "UPDATE dbproxy_cache_repairs SET lease_owner = NULL, lease_until = NULL WHERE namespace = $1 AND record_key = $2 AND lease_owner = $3 AND lease_token = $4 AND lease_until > clock_timestamp()"
+        };
+        let settled = transaction
             .execute(
-                "DELETE FROM dbproxy_cache_repairs WHERE namespace = $1 AND record_key = $2 AND target_revision = $3 AND lease_owner = $4",
+                statement,
                 &[
                     &lease.record.namespace,
                     &lease.record.key,
-                    &target_revision,
                     &lease.lease_owner,
+                    &lease.lease_token,
                 ],
             )
             .await?;
-        Ok(removed == 1)
+        transaction.commit().await?;
+        Ok(settled == 1)
     }
 
     pub async fn fail(
@@ -200,12 +226,18 @@ RETURNING repair.namespace, repair.record_key, repair.target_revision, repair.at
         }
         let delay = i64::try_from(retry_delay_ms)
             .map_err(|_| StorageError::QueueProtocol("retry delay is too large".to_string()))?;
-        let target_revision = required_revision_to_i64(&lease.record, lease.target_revision)?;
         let error = bounded_error(error);
         let maximum = i64::from(max_attempts);
         let mut client = self.client.lock().await;
         client.ensure_connected().await?;
-        let updated = client
+        let transaction = client.transaction().await?;
+        // UPDATE can evaluate its expiry predicate before waiting on an unchanged locked
+        // tuple. Acquire the lock first, then recheck time in the UPDATE itself.
+        if lock_lease(&transaction, lease).await?.is_none() {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let updated = transaction
             .execute(
                 r#"
 UPDATE dbproxy_cache_repairs
@@ -223,13 +255,14 @@ SET attempt_count = attempt_count + 1,
     END
 WHERE namespace = $1
   AND record_key = $2
-  AND target_revision = $3
+  AND lease_token = $3
   AND lease_owner = $4
+  AND lease_until > clock_timestamp()
 "#,
                 &[
                     &lease.record.namespace,
                     &lease.record.key,
-                    &target_revision,
+                    &lease.lease_token,
                     &lease.lease_owner,
                     &error,
                     &delay,
@@ -237,6 +270,7 @@ WHERE namespace = $1
                 ],
             )
             .await?;
+        transaction.commit().await?;
         Ok(updated == 1)
     }
 
@@ -249,12 +283,14 @@ WHERE namespace = $1
                 r#"
 UPDATE dbproxy_cache_repairs
 SET attempt_count = 0,
+    lease_token = nextval('dbproxy_cache_repair_lease_seq'),
     available_at = clock_timestamp(),
     lease_owner = NULL,
     lease_until = NULL,
     last_error = NULL,
     dead_lettered_at = NULL
 WHERE namespace = $1 AND record_key = $2 AND dead_lettered_at IS NOT NULL
+  AND (lease_until IS NULL OR lease_until <= clock_timestamp())
 "#,
                 &[&record.namespace, &record.key],
             )
@@ -287,6 +323,16 @@ FROM dbproxy_cache_repairs
     }
 }
 
+async fn lock_lease(
+    transaction: &Transaction<'_>,
+    lease: &CacheRepairLease,
+) -> Result<Option<i64>, StorageError> {
+    Ok(transaction.query_opt(
+        "SELECT target_revision FROM dbproxy_cache_repairs WHERE namespace = $1 AND record_key = $2 AND lease_owner = $3 AND lease_token = $4 AND lease_until > clock_timestamp() FOR UPDATE",
+        &[&lease.record.namespace, &lease.record.key, &lease.lease_owner, &lease.lease_token],
+    ).await?.map(|row| row.get(0)))
+}
+
 pub(crate) async fn enqueue_in_transaction(
     transaction: &Transaction<'_>,
     record: &RecordKey,
@@ -310,14 +356,7 @@ where
 INSERT INTO dbproxy_cache_repairs (namespace, record_key, target_revision)
 VALUES ($1, $2, $3)
 ON CONFLICT (namespace, record_key) DO UPDATE
-SET target_revision = GREATEST(dbproxy_cache_repairs.target_revision, EXCLUDED.target_revision),
-    requested_at = clock_timestamp(),
-    available_at = clock_timestamp(),
-    attempt_count = 0,
-    lease_owner = NULL,
-    lease_until = NULL,
-    last_error = NULL,
-    dead_lettered_at = NULL
+SET target_revision = GREATEST(dbproxy_cache_repairs.target_revision, EXCLUDED.target_revision)
 "#,
             &[&record.namespace, &record.key, &target_revision],
         )
