@@ -239,6 +239,8 @@ pub struct DbProxyMetrics {
     redis_dependency_up: AtomicBool,
     accepted_connections: AtomicU64,
     active_connections: AtomicU64,
+    rejected_connections: AtomicU64,
+    connection_limit: AtomicU64,
     connection_errors: AtomicU64,
     handshake_rejections: [AtomicU64; 3],
     requests_in_flight: AtomicU64,
@@ -295,6 +297,8 @@ impl Default for DbProxyMetrics {
             redis_dependency_up: AtomicBool::new(true),
             accepted_connections: AtomicU64::new(0),
             active_connections: AtomicU64::new(0),
+            rejected_connections: AtomicU64::new(0),
+            connection_limit: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
             handshake_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             requests_in_flight: AtomicU64::new(0),
@@ -384,6 +388,14 @@ impl DbProxyMetrics {
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn connection_rejected(&self) {
+        self.rejected_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn connection_limit_updated(&self, limit: usize) {
+        self.connection_limit.store(limit as u64, Ordering::Relaxed);
+    }
+
     pub(crate) fn connection_failed(&self) {
         self.connection_errors.fetch_add(1, Ordering::Relaxed);
     }
@@ -394,6 +406,10 @@ impl DbProxyMetrics {
 
     pub(crate) fn request_started(&self) {
         self.requests_in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn request_abandoned(&self) {
+        self.requests_in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub(crate) fn request_finished(
@@ -686,7 +702,7 @@ impl DbProxyMetrics {
         write_atomic_metric(
             &mut output,
             "dbproxy_connections_total",
-            "Accepted DBProxy TCP connections",
+            "Admitted DBProxy TCP connections including handshakes",
             "counter",
             &self.accepted_connections,
         );
@@ -703,6 +719,20 @@ impl DbProxyMetrics {
             "DBProxy TCP connections closed with an error",
             "counter",
             &self.connection_errors,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_connections_rejected_total",
+            "Connections closed before handshake because all slots are occupied",
+            "counter",
+            &self.rejected_connections,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_connections_limit",
+            "Configured maximum admitted TCP connections including handshakes",
+            "gauge",
+            &self.connection_limit,
         );
         metric_header(
             &mut output,
@@ -1227,13 +1257,56 @@ pub struct ObservabilityServer {
     task: JoinHandle<()>,
 }
 
+pub(crate) fn validate_binding(address: SocketAddr, allow_non_loopback: bool) -> io::Result<()> {
+    let ip = match address.ip() {
+        std::net::IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(ip), std::net::IpAddr::V4),
+        ip => ip,
+    };
+    if ip.is_loopback() {
+        return Ok(());
+    }
+    if !allow_non_loopback {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "observability.listenAddr requires allowNonLoopback=true for a protected non-loopback binding",
+        ));
+    }
+    let allowed = match ip {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_link_local() || ip.is_unspecified(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_unique_local() || ip.is_unicast_link_local() || ip.is_unspecified()
+        }
+    };
+    if !allowed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "observability.listenAddr must be loopback, a private management address, or an explicitly protected wildcard binding",
+        ));
+    }
+    Ok(())
+}
+
 impl ObservabilityServer {
     pub async fn start(
         listen_addr: SocketAddr,
         metrics: Arc<DbProxyMetrics>,
         storage_backend: &'static str,
+        shutdown: watch::Receiver<bool>,
+    ) -> io::Result<Self> {
+        Self::start_with_binding_policy(listen_addr, false, metrics, storage_backend, shutdown)
+            .await
+    }
+
+    pub async fn start_with_binding_policy(
+        listen_addr: SocketAddr,
+        allow_non_loopback: bool,
+        metrics: Arc<DbProxyMetrics>,
+        storage_backend: &'static str,
         mut shutdown: watch::Receiver<bool>,
     ) -> io::Result<Self> {
+        validate_binding(listen_addr, allow_non_loopback)?;
         let listener = TcpListener::bind(listen_addr).await?;
         let local_addr = listener.local_addr()?;
         let task = tokio::spawn(async move {
@@ -1442,6 +1515,19 @@ mod tests {
         assert!(output.contains("dbproxy_outbox_dead_lettered 1"));
         assert!(output.contains("dbproxy_outbox_oldest_age_seconds 4.500"));
         assert!(!output.contains("hot-key"));
+    }
+
+    #[tokio::test]
+    async fn direct_observability_api_rejects_wildcard_without_opt_in() {
+        let (_shutdown, receiver) = watch::channel(false);
+        let result = ObservabilityServer::start(
+            "0.0.0.0:0".parse().unwrap(),
+            Arc::new(DbProxyMetrics::default()),
+            "memory",
+            receiver,
+        )
+        .await;
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::InvalidInput));
     }
 
     #[test]

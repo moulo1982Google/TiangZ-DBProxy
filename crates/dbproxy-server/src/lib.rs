@@ -6,6 +6,8 @@
 //! game repositories, entity lifecycle, and business validation stay in TiangZ.
 
 pub mod config;
+#[cfg(test)]
+mod connection_limit_tests;
 mod memory_backend;
 mod observability;
 pub mod relay_config;
@@ -47,7 +49,7 @@ use tiangz_dbproxy_storage::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::watch,
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
     task::JoinSet,
     time::{sleep, timeout},
 };
@@ -1053,6 +1055,9 @@ pub async fn run_storage_metrics_poller(
     }
 }
 
+/// Per-instance TCP admission limit, including unauthenticated handshakes.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
 /// TCP 服务配置。认证令牌必须通过部署密钥注入，禁止使用仓库中的本地示例密码。
 /// TCP server settings. Inject the auth token as a deployment secret, never from sample credentials.
 #[derive(Clone)]
@@ -1061,6 +1066,7 @@ pub struct ServerConfig {
     pub auth_token: String,
     pub max_frame_bytes: usize,
     pub max_payload_bytes: usize,
+    pub max_connections: usize,
     pub handshake_timeout: Duration,
     pub shutdown_grace: Duration,
     pub metrics: Arc<DbProxyMetrics>,
@@ -1074,6 +1080,7 @@ impl fmt::Debug for ServerConfig {
             .field("auth_token", &"[REDACTED]")
             .field("max_frame_bytes", &self.max_frame_bytes)
             .field("max_payload_bytes", &self.max_payload_bytes)
+            .field("max_connections", &self.max_connections)
             .field("handshake_timeout", &self.handshake_timeout)
             .field("shutdown_grace", &self.shutdown_grace)
             .field("metrics", &"[PROMETHEUS]")
@@ -1088,6 +1095,7 @@ impl ServerConfig {
             auth_token: auth_token.into(),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             handshake_timeout: Duration::from_secs(5),
             shutdown_grace: Duration::from_secs(5),
             metrics: Arc::new(DbProxyMetrics::default()),
@@ -1095,6 +1103,11 @@ impl ServerConfig {
     }
 
     fn validate(&self) -> Result<(), ServerError> {
+        if !(1..=Semaphore::MAX_PERMITS).contains(&self.max_connections) {
+            return Err(ServerError::InvalidConfig(
+                "max connections is outside the supported range",
+            ));
+        }
         if !(16..=MAX_AUTH_TOKEN_BYTES).contains(&self.auth_token.len()) {
             return Err(ServerError::InvalidConfig(
                 "auth token length is outside 16..=512 bytes",
@@ -1129,6 +1142,18 @@ pub struct DbProxyServer {
     backend: Arc<dyn DbProxyBackend>,
 }
 
+// Own the permit and gauge together, including panic, cancellation and unpolled task drop.
+struct ConnectionSlot {
+    _permit: OwnedSemaphorePermit,
+    metrics: Arc<DbProxyMetrics>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.metrics.connection_closed();
+    }
+}
+
 impl DbProxyServer {
     pub async fn bind(
         config: ServerConfig,
@@ -1136,6 +1161,9 @@ impl DbProxyServer {
     ) -> Result<Self, ServerError> {
         config.validate()?;
         let listener = TcpListener::bind(config.listen_addr).await?;
+        config
+            .metrics
+            .connection_limit_updated(config.max_connections);
         Ok(Self {
             listener,
             config: Arc::new(config),
@@ -1151,7 +1179,14 @@ impl DbProxyServer {
     /// Accept until shutdown, then signal connection tasks and wait within a bounded grace period.
     pub async fn serve(self, mut shutdown: watch::Receiver<bool>) -> Result<(), ServerError> {
         let mut connections = JoinSet::new();
+        let slots = Arc::new(Semaphore::new(self.config.max_connections));
         loop {
+            while let Some(joined) = connections.try_join_next() {
+                if let Err(error) = joined {
+                    self.config.metrics.connection_failed();
+                    tracing::error!(%error, "DBProxy connection task panicked");
+                }
+            }
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
@@ -1160,28 +1195,29 @@ impl DbProxyServer {
                 }
                 accepted = self.listener.accept() => {
                     let (stream, peer) = accepted?;
+                    let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+                        self.config.metrics.connection_rejected();
+                        drop(stream);
+                        continue;
+                    };
                     self.config.metrics.connection_opened();
+                    let slot = ConnectionSlot { _permit: permit, metrics: Arc::clone(&self.config.metrics) };
                     let config = Arc::clone(&self.config);
                     let backend = Arc::clone(&self.backend);
                     let connection_shutdown = shutdown.clone();
                     connections.spawn(async move {
+                        let _slot = slot;
                         let result = handle_connection(
                             stream,
                             Arc::clone(&config),
                             backend,
                             connection_shutdown,
                         ).await;
-                        config.metrics.connection_closed();
                         if let Err(error) = result {
                             config.metrics.connection_failed();
                             tracing::warn!(%peer, %error, "DBProxy connection closed with an error");
                         }
                     });
-                }
-            }
-            while let Some(joined) = connections.try_join_next() {
-                if let Err(error) = joined {
-                    tracing::error!(%error, "DBProxy connection task panicked");
                 }
             }
         }
@@ -1198,6 +1234,7 @@ impl DbProxyServer {
         .is_err()
         {
             connections.abort_all();
+            while connections.join_next().await.is_some() {}
             tracing::warn!(?grace, "DBProxy connection shutdown grace expired");
         }
         Ok(())
@@ -1352,6 +1389,15 @@ async fn write_hello_rejection(
     .await
 }
 
+struct InFlightRequest<'a>(Option<&'a DbProxyMetrics>);
+impl Drop for InFlightRequest<'_> {
+    fn drop(&mut self) {
+        if let Some(metrics) = self.0 {
+            metrics.request_abandoned();
+        }
+    }
+}
+
 async fn dispatch(
     request: wire::RequestEnvelope,
     backend: &dyn DbProxyBackend,
@@ -1364,6 +1410,7 @@ async fn dispatch(
     let payload_bytes = RpcOperation::payload_bytes(request.body.as_ref());
     let started_at = Instant::now();
     metrics.request_started();
+    let mut in_flight = InFlightRequest(Some(metrics));
     let result = dispatch_body(request.body, backend, max_payload_bytes).await;
     let error_code = result.as_ref().err().map(|failure| failure.code);
     metrics.request_finished(
@@ -1373,6 +1420,7 @@ async fn dispatch(
         started_at.elapsed(),
         error_code,
     );
+    in_flight.0 = None;
     tracing::debug!(
         rpc_id,
         operation = operation.name(),

@@ -18,7 +18,9 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 - 交易 Posting 最多 512 条，Outbox 事件最多 64 条；
 - 所有 ID、Schema、topic 等文本都有 UTF-8 字节上限，topic 仅允许字母、数字、`.`、`_`、`-`。
 
-第一帧必须是 `ClientHello(protocol_version, protocol_fingerprint, auth_token, client_name)`。当前握手版本是 2，fingerprint 是权威 proto 先统一为 LF 后的 SHA-256。为滚动升级已在线的旧 v2 客户端，server 还精确接受换行规范化前的已知指纹`d20f…e4f1f`并向该连接原样回显；它不接受任意别名，新客户端也不会主动降级。版本或这两个明确指纹以外的值都不会进入 RPC 调度。下一次协议版本提升时旧别名因版本不匹配自然失效。proto 的 package 名保留 `tiangz.dbproxy.v1` 只是生成代码命名空间；兼容性由握手版本和指纹共同决定。
+第一帧必须是 `ClientHello(protocol_version, protocol_fingerprint, auth_token, client_name)`。当前握手版本是 2，fingerprint 是权威 proto 先统一为 LF 后的 SHA-256。server 精确接受当前指纹及 `LEGACY_PROTOCOL_FINGERPRINT_V2`、`PRE_COMMIT_PROTOCOL_FINGERPRINT_V2`、`PRE_RELAY_PROTOCOL_FINGERPRINT_V2` 三个已知旧指纹，并向连接回显客户端原值；具体清单以 `dbproxy-protocol/src/lib.rs` 为准。未列出的指纹或不匹配的版本不进入 RPC 调度。proto 的 package 名保留 `tiangz.dbproxy.v1` 只是生成代码命名空间；兼容性由握手版本和指纹共同决定。
+
+升级方向是服务端先行：先完成服务端及其数据库迁移的受控切换，再更新客户端。新客户端要求精确的版本/指纹和 `supports_outbox_relay`，不会主动降级到旧服务端。A3 的候选跳过只保证继续寻找兼容服务端，不代表旧服务端可以处理新请求，也不保证混版本的存储/队列语义。所有候选均不兼容时应保留明确拒绝原因并修正部署版本，不能放宽握手检查来掩盖问题。
 
 ## 十三类 RPC
 
@@ -69,6 +71,8 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 | `INTERNAL` (9000) | 服务端持久化不变量损坏 | 告警并人工排查 |
 
 ## 连接、并发和 Endpoint
+
+`server.maxConnections` 默认 256，必须为正数；每个实例独立限制 TCP 连接总数，包含尚未认证的握手。accept 后先尝试取得名额，满额直接关闭连接，不读取帧、不创建连接任务，也不发送握手成功。正常断开、握手失败/超时、任务 panic 或取消均释放名额。`dbproxy_connections_rejected_total` 记录容量拒绝，`dbproxy_connections_limit` 给出上限；认证失败仍使用握手拒绝指标。根据客户端池总连接数及 `maxFrameBytes` 的内存预算设置上限，不能把玩家数直接当作连接数。观测 HTTP 端口不占业务连接名额。
 
 一个 `DbProxyClient` 连接内只有一个在途请求。请求写出后超时会废弃连接，防止后续 RPC 读取旧响应。`DbProxyClientPool::connect` 按 RecordKey 在一组共享读写连接中稳定路由，保持原有连接数和顺序语义；`connect_split(read_size, write_size)` 使用两组物理连接，读查询进入 read pool，写入、事务和 enqueue 进入 write pool，避免慢写造成跨用途队头阻塞。它不替代业务锁或 revision/CAS。服务端再按记录或 operation ID 路由到独立存储 shard。
 

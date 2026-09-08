@@ -125,6 +125,7 @@ async fn run_server(
 ) -> Result<(), Box<dyn Error>> {
     let mut server_config = ServerConfig::new(config.listen_addr, config.auth_token.clone());
     server_config.max_frame_bytes = config.max_frame_bytes;
+    server_config.max_connections = config.max_connections;
     server_config.max_payload_bytes = config.max_payload_bytes;
     server_config.handshake_timeout = config.handshake_timeout;
     server_config.shutdown_grace = config.shutdown_grace;
@@ -144,8 +145,9 @@ async fn run_server(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let observability = match config.observability_listen_addr {
         Some(address) => Some(
-            ObservabilityServer::start(
+            ObservabilityServer::start_with_binding_policy(
                 address,
+                config.observability_allow_non_loopback,
                 Arc::clone(&metrics),
                 config.storage.name(),
                 shutdown_rx.clone(),
@@ -222,6 +224,7 @@ async fn run_server(
         storage_backend = config.storage.name(),
         shard_count = config.storage.shards(),
         runtime_worker_threads = config.runtime_worker_threads,
+        max_connections = config.max_connections,
         backlog_worker_count = if matches!(config.storage, ResolvedStorage::PostgresRedis { .. }) {
             config.backlog_workers
         } else {
