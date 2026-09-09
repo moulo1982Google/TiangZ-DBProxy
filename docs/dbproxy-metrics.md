@@ -48,8 +48,12 @@ Memory backends do not require these dependencies and return `not-configured` fr
   `dbproxy_cache_fallback_lock_release_errors_total` identify Redis coordination failures.
 
 The fallback path is bounded by `storage.cacheFallbackConcurrency` and
-`storage.cacheFallbackTimeoutMs`; the same timeout also bounds Redis lookup, warmup, delete, and
-lock-release operations so a half-open Redis connection cannot hang a request indefinitely. The circuit breaker opens after
+`storage.cacheFallbackTimeoutMs` (default 2,000 ms). Redis cache lookup, write, warmup, delete,
+lease acquisition/recheck and release instead use `storage.cacheOperationTimeoutMs` (default 200 ms,
+positive integer), including time waiting for the cache connection. The lease coordination still
+respects its separate total wait limit. This is a per-operation budget, not an end-to-end RPC deadline.
+The PostgreSQL repair ACK, reliable Redis backlog, AOF confirmation and MQ publication are unchanged.
+The circuit breaker opens after
 `cacheFallbackCircuitFailureThreshold` consecutive PostgreSQL fallback failures, rejects new
 fallbacks during `cacheFallbackCircuitCooldownMs`, then permits one half-open probe. A successful
 probe closes the circuit; another failure reopens it. A sustained increase in timeout or circuit
@@ -123,6 +127,19 @@ in-memory best-effort task:
 A cache write error can be transient without affecting PostgreSQL durability. A growing oldest
 age or any dead letter is the actionable signal. The local rules warn above 60 seconds for five
 minutes and alert critically on any dead letter.
+
+## PostgreSQL request queue budgets
+
+Request-shard PostgreSQL mutex waits are now bounded by
+`storage.postgresConnectionWaitTimeoutMs` (default 2,000 ms). Queue expiry still closes
+`postgres_connection_wait` and does not start `postgres_operation`. Once a caller owns the
+connection, SQL execution is unaffected by that queue budget. A reconnect failure or cancelled
+reconnect starts the shared `storage.postgresReconnectCooldownMs` (default 500 ms); cooldown
+rejections can therefore appear as short `postgres_operation` samples without executing SQL.
+Request-shard repair ACK queue waits use the same budget but remain in `cache_repair_ack`,
+without duplicate PostgreSQL stage timing. Dedicated maintenance queue connections keep their
+existing policy. See [PostgreSQL request budgets](postgres-request-budget.md) for worker scope
+and the distinction between an unsent Store operation and an RPC with an unknown commit result.
 
 ## PostgreSQL outbox
 

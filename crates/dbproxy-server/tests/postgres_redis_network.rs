@@ -22,6 +22,133 @@ fn unique_suffix() -> String {
     format!("{}-{nanos}", std::process::id())
 }
 
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL/Redis; batch commit count and partial outcomes"]
+async fn snapshot_batch_uses_one_commit_and_preserves_independent_results() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let pg = env::var("DBPROXY_POSTGRES_URL").unwrap();
+        let redis = env::var("DBPROXY_REDIS_URL").unwrap();
+        let backend = StorageBackend::connect(&pg, &redis, 2).await.unwrap();
+        let suffix = unique_suffix();
+        let requests: Vec<_> = (0..32)
+            .map(|i| {
+                snapshot(
+                    format!("batch-{suffix}-{i}"),
+                    RecordKey::new("batch-commit", format!("{suffix}-{i}")).unwrap(),
+                    b"one",
+                    Some(Revision::ZERO),
+                )
+            })
+            .collect();
+        let operations = || {
+            backend
+                .metrics()
+                .latency_snapshot()
+                .into_iter()
+                .find(|s| s.stage == "postgres_operation")
+                .unwrap()
+                .buckets
+                .iter()
+                .sum::<u64>()
+        };
+        let before = operations();
+        let results = backend.save_multi(requests.clone()).await.unwrap();
+        assert!(results.iter().all(|r| matches!(
+            r,
+            Ok(SnapshotWriteOutcome::Applied {
+                revision: Revision(1)
+            })
+        )));
+        assert_eq!(
+            operations() - before,
+            1,
+            "one same-database batch must not fan out into several commits"
+        );
+        assert!(
+            backend
+                .save_multi(requests.clone())
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| matches!(
+                    r,
+                    Ok(SnapshotWriteOutcome::Duplicate {
+                        revision: Revision(1)
+                    })
+                ))
+        );
+        let mut next = requests.clone();
+        for request in &mut next {
+            request.request_id.push_str("-next");
+            request.expected_revision = Some(Revision(1));
+            request.payload = b"two".to_vec();
+        }
+        next[7].expected_revision = Some(Revision::ZERO);
+        next[19].request_id = requests[19].request_id.clone();
+        let results = backend.save_multi(next.clone()).await.unwrap();
+        for (index, outcome) in results.iter().enumerate() {
+            if [7, 19].contains(&index) {
+                assert!(outcome.is_err());
+            } else {
+                assert!(matches!(
+                    outcome,
+                    Ok(SnapshotWriteOutcome::Applied {
+                        revision: Revision(2)
+                    })
+                ));
+            }
+        }
+        let retry = backend.save_multi(next).await.unwrap();
+        for (index, outcome) in retry.iter().enumerate() {
+            if [7, 19].contains(&index) {
+                assert!(outcome.is_err());
+            } else {
+                assert!(matches!(
+                    outcome,
+                    Ok(SnapshotWriteOutcome::Duplicate {
+                        revision: Revision(2)
+                    })
+                ));
+            }
+            assert_eq!(
+                backend
+                    .load(&requests[index].record)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                Revision(if [7, 19].contains(&index) { 1 } else { 2 })
+            );
+        }
+        // 相反输入顺序的重叠批次仍各自按记录排序，并保持每条 CAS 只成功一次。
+        // Opposite input orders must preserve record lock order and exactly one CAS winner.
+        let racing = |suffix: &str| {
+            requests
+                .iter()
+                .enumerate()
+                .map(|(index, request)| {
+                    let mut request = request.clone();
+                    request.request_id.push_str(suffix);
+                    request.expected_revision =
+                        Some(Revision(if [7, 19].contains(&index) { 1 } else { 2 }));
+                    request
+                })
+                .collect::<Vec<_>>()
+        };
+        let left = racing("-left");
+        let mut right = racing("-right");
+        right.reverse();
+        let (left, right) = tokio::join!(backend.save_multi(left), backend.save_multi(right));
+        let left = left.unwrap();
+        let right = right.unwrap();
+        for (left, right) in left.iter().zip(right.iter().rev()) {
+            assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        }
+    })
+    .await
+    .expect("batch commit regression deadline");
+}
+
 fn snapshot(
     request_id: String,
     record: RecordKey,

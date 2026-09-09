@@ -2,6 +2,10 @@ use std::{env, fs, path::PathBuf};
 
 use sha2::{Digest, Sha256};
 
+mod fingerprint;
+
+use fingerprint::normalize_line_endings;
+
 fn main() {
     const SCHEMA: &str = "proto/dbproxy.proto";
 
@@ -14,7 +18,11 @@ fn main() {
     }
     prost_build::compile_protos(&[SCHEMA], &["proto"]).expect("DBProxy proto generation failed");
 
-    let schema = fs::read(SCHEMA).expect("DBProxy proto schema is unreadable");
+    // Git's text filter can make a clean Windows worktree contain CRLF while Cargo's Git
+    // checkout uses LF. The wire schema is identical, so line endings must not alter the
+    // compatibility fingerprint.
+    let schema =
+        normalize_line_endings(&fs::read(SCHEMA).expect("DBProxy proto schema is unreadable"));
     let fingerprint = format!("{:x}", Sha256::digest(schema));
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is missing"))
         .join("protocol_fingerprint.rs");

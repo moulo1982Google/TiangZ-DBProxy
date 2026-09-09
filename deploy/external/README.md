@@ -1,12 +1,14 @@
 # 外网双 DBProxy
 
-外网演示使用两个无状态对等 DBProxy，两个实例共享同一套 Redis 和 PostgreSQL：
+外网演示使用两个无状态对等 DBProxy，两个实例共享同一 PostgreSQL、一个可靠队列 Redis 和一个易失快照缓存 Redis：
 
 ```text
 DBProxy 1: 127.0.0.1:7800
 DBProxy 2: 127.0.0.1:7801
        \      /
-        Redis + PostgreSQL
+        PostgreSQL
+        ├─ Redis 6379：AOF backlog / Outbox
+        └─ Redis 6380：无持久化快照缓存
 ```
 
 DBProxy 之间没有 Leader、复制或内部 RPC。TiangZ 的每个 Process 把 `7800` 配为首选、把 `7801` 配为故障切换地址；客户端切换地址时保留原 `requestId` 和 `operationId`。
@@ -19,6 +21,7 @@ DBProxy 之间没有 Leader、复制或内部 RPC。TiangZ 的每个 Process 把
 DBPROXY_AUTH_TOKEN=<strong-token>
 DBPROXY_POSTGRES_URL=postgres://<user>:<password>@127.0.0.1:5432/<db>
 DBPROXY_REDIS_URL=redis://:<password>@127.0.0.1:6379/0
+DBPROXY_CACHE_REDIS_URL=redis://:<password>@127.0.0.1:6380/0
 ```
 
 已有外网部署使用 `/etc/tiangz/dbproxy.env`，两个实例共享同一份环境文件；密码不要写入配置文件或 Git。
@@ -43,7 +46,9 @@ configs/deploy/external-multiprocess/StartMachine.json
 
 ## 4C8G 七日故障演练
 
-单机开发演练使用 `docker-compose.chaos.yml`：PostgreSQL 固定为 18.4，Redis 固定为 8.8.1；前者限制为 2 GiB/1.5 CPU，后者限制为 768 MiB/0.5 CPU，并启用 AOF `everysec`、512 MiB `maxmemory` 和 `noeviction`。同一台 4C8G 主机不再部署 PostgreSQL standby 或 Redis replica：同机副本不能提供整机高可用，却会污染恢复故障边界和资源数据。主从、多节点自动切换与多可用区属于后续独立验收。
+单机开发演练使用 `docker-compose.chaos.yml`：PostgreSQL 固定为 18.4；可靠队列 Redis 固定为 8.8.1、限制为 768 MiB/0.5 CPU，并启用 AOF `everysec`、512 MiB `maxmemory` 和 `noeviction`；快照缓存 Redis 同版本、限制为 384 MiB/0.25 CPU，关闭 AOF/RDB、使用易失 `tmpfs` 和 `allkeys-lru`。缓存与 AOF Redis 必须分离：否则 Redis 重启可能从 AOF 恢复旧快照与旧 freshness 标记，在 PostgreSQL cache-repair 赶上前产生短暂旧读。缓存重启为空时，DBProxy 会安全回源 PostgreSQL并重新预热。
+
+第二个 Redis 是职责隔离，不是 replica。同一台 4C8G 主机仍不部署 PostgreSQL standby 或 Redis replica：同机副本不能提供整机高可用，却会污染恢复故障边界和资源数据。主从、多节点自动切换与多可用区属于后续独立验收。
 
 首次切换到分区 schema 会永久删除旧开发数据，必须先核对 Compose project 和两个旧数据卷的精确名称。新的固定卷为：
 
@@ -62,7 +67,7 @@ docker compose --env-file /opt/tiangz-dbproxy/.env \
 systemctl restart tiangz-dbproxy@1.service tiangz-dbproxy@2.service
 ```
 
-首个 DBProxy peer 在 PostgreSQL advisory lock 内执行 001 到 007 migration，第二个 peer 等待并复用结果。启动后必须确认 `dbproxy_snapshots` 的 `relkind=p`、叶子分区数为 32、migration 数为 7，并检查两个 `/dependencies` 都返回 PostgreSQL/Redis `up`。
+首个 DBProxy peer 在 PostgreSQL advisory lock 内执行 001 到 007 migration，第二个 peer 等待并复用结果。启动后必须确认 `dbproxy_snapshots` 的 `relkind=p`、叶子分区数为 32、migration 数为 7，并检查两个 `/dependencies` 都返回 PostgreSQL/可靠队列 Redis `up`。快照缓存是可降级依赖：单独停掉它时 `/ready` 保持成功，缓存错误与 PostgreSQL fallback 指标上升，重启后不允许出现低于已确认 Revision 的读取。
 
 `dbproxy_fault_soak` 是独立的 100 玩家正确性负载。安装 `tiangz-dbproxy-soak.service` 后，先完成短时预演，再启用七日服务：
 
@@ -87,4 +92,4 @@ systemctl enable --now tiangz-dbproxy-soak.service
 journalctl -u tiangz-dbproxy-soak.service -f
 ```
 
-它持续覆盖 revision、幂等事务、AOF backlog、交易状态、不可变账本和 Outbox，并在连接级传输故障时从 7800 切到 7801。unit 只 `Wants` 两个 peer，不能 `Requires` 任一 peer，否则故障计划停止该 peer 时 systemd 会把负载一起停止。它还显式使用 `Restart=no`：驱动没有可跨进程恢复的逐玩家内存状态，异常退出后静默重启会换 run ID、重算七天并漏掉中断 epoch 的最终对账，因此必须把退出视为本轮失败并人工重新开始。最终通过标准不是“进程一直活着”，而是逐玩家对账通过、账本总和为零、backlog/cache-repair/outbox 排空且无死信。完整的 500 游戏玩家、MapHost、动态副本和双重安全故障开关见 TiangZ 仓库的 `docs/tutorials/21-external-chaos-drill.md`。
+它持续覆盖 revision、幂等事务、AOF backlog、交易状态、不可变账本和 Outbox，并在连接级传输故障时从 7800 切到 7801。unit 只 `Wants` 两个 peer，不能 `Requires` 任一 peer，否则故障计划停止该 peer 时 systemd 会把负载一起停止。它还显式使用 `Restart=no`：驱动没有可跨进程恢复的逐玩家内存状态，异常退出后静默重启会换 run ID、重算七天并漏掉中断 epoch 的最终对账，因此必须把退出视为本轮失败并人工重新开始。最终通过标准不是“进程一直活着”，而是逐玩家对账通过、整个运行期间 `readsBehindAcknowledgedRevision=0`、账本总和为零、backlog/cache-repair/outbox 排空且无死信。完整的 500 游戏玩家、MapHost、动态副本和双重安全故障开关见 TiangZ 仓库的 `docs/tutorials/21-external-chaos-drill.md`。

@@ -1,0 +1,13 @@
+{
+  "event_id": "event-neutral-1",
+  "producer": "game",
+  "event_type": "DocumentChanged",
+  "aggregate_type": "document",
+  "aggregate_id": "文档-1",
+  "partition_key": "文档-1",
+  "schema_version": 1,
+  "content_type": "application/octet-stream",
+  "payload": [0, 255, 128],
+  "occurred_at_unix_ms": "18446744073709551615",
+  "route_version": 1
+}

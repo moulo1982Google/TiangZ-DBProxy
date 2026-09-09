@@ -32,6 +32,12 @@ single、multi、trade 原先分别拥有主键表，同一 operation ID 可以�
 
 仅执行 Redis 写命令不能证明 AOF 已落本机。backlog 入队和 Outbox 发布现在调用 `WAITAOF`，AOF 未启用或超时会明确失败。Redis 连接统一使用 `ConnectionManager`，重启后 worker 可以继续重试。
 
+### AOF 恢复旧缓存造成短暂旧读
+
+外网故障演练复现了 31 次低于客户端已确认 Revision 的读取。PostgreSQL 权威值和持久 cache-repair 都没有丢；问题是缓存与可靠队列共用 AOF Redis：Redis 停机期间的新写入只进入 PostgreSQL，重启后 AOF 又恢复了旧缓存值和仍处于 fresh 的时间标记，repair worker 修复前的读取会把它当成新值返回。revision-aware 写只能阻止在线旧写覆盖新写，无法识别一次进程重启恢复出的旧内存。
+
+配置现在允许用`cacheRedisUrlEnv`指定独立快照缓存，`redisUrlEnv`继续承载 AOF backlog 与 Outbox。外网部署的缓存实例关闭 AOF、RDB并使用易失`tmpfs`；每次重启都是空缓存，读取安全回源 PostgreSQL。单 Redis 配置继续向后兼容，但不再作为严格 read-after-write 的故障恢复部署。故障驱动分别强杀两个 Redis，soak 自身和最终审计均要求`readsBehindAcknowledgedRevision=0`，不能再用“最终对账恢复”掩盖运行期间的旧读。
+
 ### Outbox 年龄与分区乱序
 
 原队列使用业务传入的 `occurred_at` 计算积压年龄，错误时钟会制造虚假告警；多个 worker 也可能同时越过同一分区的前序事件。现在年龄基于 PostgreSQL `created_at`；写入前按 `topic + partition_key` 取得事务级 advisory lock，claim 只允许该分区最早的未发布事件。这样也封住了“较早事务尚未提交、较晚事务先被 worker 看见”的窗口。前序死信会阻塞后序，必须先定点修复，不能静默产生事件缺口。
@@ -39,6 +45,10 @@ single、multi、trade 原先分别拥有主键表，同一 operation ID 可以�
 ### 缓存故障等待被串行放大
 
 Redis 断线时，读路径原先可能依次等待初次读取、锁内复查、分布式锁和回填；每一步单独有界，但总延迟会叠加。现在一旦确认是 Redis 连接错误或缓存命令超时，本次请求就跳过后续 Redis 协调步骤，直接执行有界 PostgreSQL 回源。真实停容器演练验证了该路径。
+
+### 正确性驱动截止前忙循环
+
+玩家循环原先只在“完整下一周期仍早于 deadline”时 sleep，却没有在最后不足一个周期时退出，于是会在截止前忙循环，制造与正式频率无关的末秒请求尖峰。现在下一周期越过 deadline 就直接结束；最终对账仍在所有玩家退出后执行。
 
 ### 内存后端与 PostgreSQL 语义漂移
 
@@ -55,6 +65,8 @@ MemoryBackend 的快照幂等指纹曾遗漏 `updated_at_unix_ms`，账本 Posti
 ### 协议版本双写漂移
 
 Rust 已升级协议 v2，但 TypeScript 生成脚本仍硬编码 v1，测试实际捕获了漂移。生成器现在从 Rust `PROTOCOL_VERSION` 提取权威值，并继续从 proto 计算 SHA-256 指纹。
+
+Windows 工作树中的 proto 曾混有 CRLF/LF，导致相同 schema 在不同 checkout 产生不同指纹。Rust build script 与 TypeScript generator 现在都先规范化为 LF。已部署的 v2 TiangZ 二进制仍携带旧`d20f…e4f1f`，所以新 server 只为协议版本 2 精确接受这一个旧别名并原样回显，支持先升级 server 的滚动窗口；任意其他指纹仍拒绝。新客户端不会对旧 server 降级，必须等所有 server 升级后再发布。
 
 ### 分区配置静默漂移
 
@@ -99,7 +111,7 @@ Rust 已升级协议 v2，但 TypeScript 生成脚本仍硬编码 v1，测试实
 
 ## 保留的设计及理由
 
-- PostgreSQL 仍是唯一权威数据源；Redis 既做缓存又承载 AOF backlog/Stream，是当前部署约束，不被抽象成虚假的通用消息总线。
+- PostgreSQL 仍是唯一权威数据源；Redis 提供快照缓存与 AOF backlog/Stream 两种职责，但严格恢复部署使用独立实例隔离持久性。它们不被抽象成虚假的通用消息总线。
 - Outbox 是至少一次而不是恰好一次。跨 Redis 与 PostgreSQL 声称恰好一次需要分布式事务，复杂且不真实；稳定 event ID + 消费者去重是明确契约。
 - Worker 使用数据库租约和 `SKIP LOCKED`，不引入单独协调服务。租约丢失只产生安全的重复工作。
 - 账本允许空 Posting 列表，以支持不涉及资产的交易状态变化；只要存在 Posting，就按每种 asset 强制零和。
@@ -109,7 +121,7 @@ Rust 已升级协议 v2，但 TypeScript 生成脚本仍硬编码 v1，测试实
 
 - PostgreSQL 当前每个 shard 是一条串行 Client，不是动态连接池；容量应先通过真实指标决定是否更换池实现。
 - 当前没有只读副本路由。Revision/CAS、事务回执、交易、账本、Outbox 和 read-after-write 都必须读主库；以后即使增加 replica，也只能给明确允许陈旧的查询单独建 API，并依据 replay lag 自动回主，不能把现有 `LoadSnapshot` 静默改成读从库。
-- 真实存储的 `/ready` 已要求 PostgreSQL 与 Redis 最近一次采样都健康，`/dependencies` 和 `dbproxy_dependency_up` 可定位具体依赖；状态转换存在最长约一个 5 秒采样周期，不承诺瞬时故障检测。
+- 真实存储的 `/ready` 要求 PostgreSQL 与可靠队列 Redis 最近一次采样都健康，`/dependencies` 和 `dbproxy_dependency_up` 可定位这两个持久依赖；易失快照缓存失败通过缓存错误/回源指标观测并安全降级，不令实例退出 Ready。状态转换存在最长约一个 5 秒采样周期，不承诺瞬时故障检测。
 - Rust 客户端仍保留共享连接的 `connect(size)` 兼容入口；故障敏感调用方应显式使用 `connect_split(read_size, write_size)`。两种模式的单条连接仍串行，没有在协议中引入多路复用。
 - Redis backlog 已把 enqueue、worker lease/ACK 和 stats 拆为三条连接；每个角色内部仍使用 mutex 保证脚本与 `WAITAOF` 的顺序。高吞吐路径继续优先使用批量 API，是否增加 enqueue 连接分片由正式延迟数据决定。
 - Redis Stream 没有在 publisher 中强制裁剪，因为盲目 `MAXLEN` 可能在消费者落后时丢事件；消费组和保留策略必须由部署明确配置。

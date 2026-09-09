@@ -98,6 +98,43 @@ services:
         max-size: "32m"
         max-file: "5"
 
+  snapshot-cache:
+    image: redis:8.8.1-trixie
+    container_name: tiangz-dbproxy-cache
+    restart: unless-stopped
+    mem_limit: 384m
+    cpus: 0.25
+    environment:
+      REDIS_PASSWORD: ${DBPROXY_REDIS_PASSWORD:?DBPROXY_REDIS_PASSWORD is required}
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --requirepass
+      - ${DBPROXY_REDIS_PASSWORD:?DBPROXY_REDIS_PASSWORD is required}
+    ports:
+      - "127.0.0.1:${DBPROXY_CACHE_REDIS_PORT:-6380}:6379"
+    tmpfs:
+      - /data:size=16m
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    stop_grace_period: 5s
+    logging:
+      driver: local
+      options:
+        max-size: "16m"
+        max-file: "3"
+
 volumes:
   postgres-chaos-data:
     name: tiangz-dbproxy-chaos-postgres-data

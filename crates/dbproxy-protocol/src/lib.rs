@@ -18,6 +18,10 @@ use tiangz_dbproxy_core::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+#[cfg(test)]
+#[path = "../fingerprint.rs"]
+mod fingerprint;
+
 pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/tiangz.dbproxy.v1.rs"));
 }
@@ -27,6 +31,57 @@ include!(concat!(env!("OUT_DIR"), "/protocol_fingerprint.rs"));
 /// 第一版公开网络协议。修改不兼容字段时必须提升版本，而不能只改实现。
 /// First public wire version. Incompatible schema changes must increment this value.
 pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Protocol v2 fingerprint produced before line endings were canonicalized. Servers accept this
+/// exact alias during the rolling migration and echo it to legacy clients; other fingerprints
+/// remain incompatible.
+pub const LEGACY_PROTOCOL_FINGERPRINT_V2: &str =
+    "d20f64198cedce3fd673708a08a9700c230d5a7aecc3d2ede47e4701143e4f1f";
+
+/// Exact pre-CommitRecords schema; old clients retain their original RPC semantics.
+pub const PRE_COMMIT_PROTOCOL_FINGERPRINT_V2: &str =
+    "a5296d1ef9b288fcbd7f43ac9328c3a59187bf5e7ffdb31972d333a289509456";
+
+pub const PRE_RELAY_PROTOCOL_FINGERPRINT_V2: &str =
+    "63894bf08f30464ba807fbfe6507bbd74a0aa30de8da1913d7857904f52e3e17";
+
+pub fn is_compatible_protocol_fingerprint(candidate: &str) -> bool {
+    candidate == PROTOCOL_FINGERPRINT
+        || candidate == LEGACY_PROTOCOL_FINGERPRINT_V2
+        || candidate == PRE_COMMIT_PROTOCOL_FINGERPRINT_V2
+        || candidate == PRE_RELAY_PROTOCOL_FINGERPRINT_V2
+}
+
+impl From<&tiangz_dbproxy_core::AppendRecord> for wire::AppendRecord {
+    fn from(value: &tiangz_dbproxy_core::AppendRecord) -> Self {
+        Self {
+            record: Some((&value.record).into()),
+            schema: value.schema.clone(),
+            schema_version: value.schema_version,
+            payload: value.payload.clone(),
+            occurred_at_unix_ms: value.occurred_at_unix_ms,
+        }
+    }
+}
+
+impl TryFrom<wire::AppendRecord> for tiangz_dbproxy_core::AppendRecord {
+    type Error = ProtocolError;
+    fn try_from(value: wire::AppendRecord) -> Result<Self, Self::Error> {
+        if value.schema.trim().is_empty() || value.schema.len() > MAX_SCHEMA_BYTES {
+            return Err(ProtocolError::InvalidField("append.schema"));
+        }
+        Ok(Self {
+            record: value
+                .record
+                .ok_or(ProtocolError::MissingField("append.record"))?
+                .try_into()?,
+            schema: value.schema,
+            schema_version: value.schema_version,
+            payload: value.payload,
+            occurred_at_unix_ms: value.occurred_at_unix_ms,
+        })
+    }
+}
 
 /// 默认单帧上限；业务快照超过该值应拆分领域记录，而不是无限放大网络缓冲。
 /// Default frame limit; larger snapshots should be split by domain instead of growing buffers.
@@ -688,6 +743,15 @@ mod tests {
                 maximum: 64
             }
         ));
+    }
+
+    #[test]
+    fn protocol_fingerprint_compatibility_is_explicit_and_bounded() {
+        assert!(is_compatible_protocol_fingerprint(PROTOCOL_FINGERPRINT));
+        assert!(is_compatible_protocol_fingerprint(
+            LEGACY_PROTOCOL_FINGERPRINT_V2
+        ));
+        assert!(!is_compatible_protocol_fingerprint("unknown"));
     }
 
     #[test]

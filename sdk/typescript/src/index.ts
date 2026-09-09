@@ -145,6 +145,64 @@ export interface DbProxyMultiTransactionReceipt {
   readonly result: Uint8Array;
 }
 
+/** Immutable facts are uniquely addressed in a collection separate from snapshots. */
+export interface DbProxyAppendRecord {
+  readonly record: DbProxyRecordKey;
+  readonly schema: string;
+  readonly schemaVersion: number;
+  readonly payload: Uint8Array;
+  readonly occurredAtUnixMs: bigint;
+}
+
+export interface DbProxyCommitEffects {
+  readonly appends: readonly DbProxyAppendRecord[];
+  readonly outboxEvents: readonly DbProxyOutboxEvent[];
+}
+
+/** 业务提供信封内容；producer 是生产者，payload 仍是不透明字节。 / Producer-owned envelope with opaque payload bytes. */
+export interface DbProxyEventEnvelope {
+  readonly eventId: string;
+  readonly producer: string;
+  readonly eventType: string;
+  readonly aggregateType: string;
+  readonly aggregateId: string;
+  readonly partitionKey: string;
+  readonly schemaVersion: number;
+  readonly contentType: string;
+  readonly payload: Uint8Array;
+  readonly occurredAtUnixMs: bigint;
+  readonly routeVersion: number;
+}
+
+/** 构造跨 MQ 的 v1 信封；只通过新版 SDK/服务端使用，不手写保留 topic。 / Builds the v1 envelope for relay-aware SDKs and servers. */
+export function CreateOutboxEvent(input: DbProxyEventEnvelope): DbProxyOutboxEvent {
+  const text = (value: string) => {
+    const result = requireText(value, "envelope text", 256);
+    if (/[\u0000-\u001f\u007f-\u009f]/.test(result)) throw new TypeError("envelope text contains control characters");
+    return result;
+  };
+  const producer = text(input.producer);
+  if (!/^[A-Za-z0-9_-]+$/.test(producer)) throw new TypeError("invalid producer");
+  const schemaVersion = requireUint32(input.schemaVersion, "schemaVersion");
+  const routeVersion = requireUint32(input.routeVersion, "routeVersion");
+  if (schemaVersion === 0 || routeVersion === 0) throw new TypeError("envelope versions must be positive");
+  const occurredAtUnixMs = requireUint64(input.occurredAtUnixMs, "occurredAtUnixMs");
+  const eventId = text(input.eventId);
+  const partitionKey = text(input.partitionKey);
+  const json = JSON.stringify({
+    event_id: eventId, producer, event_type: text(input.eventType), aggregate_type: text(input.aggregateType),
+    aggregate_id: text(input.aggregateId), partition_key: partitionKey, schema_version: schemaVersion,
+    content_type: text(input.contentType), payload: Array.from(copyBytes(input.payload)),
+    occurred_at_unix_ms: occurredAtUnixMs.toString(), route_version: routeVersion,
+  });
+  // ASCII JSON is valid UTF-8 and avoids requiring TextEncoder in bare V8 hosts.
+  const ascii = json.replace(/[\u0080-\uffff]/g, ch => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  const payload = Uint8Array.from(ascii, ch => ch.charCodeAt(0));
+  return { eventId, topic: `dbproxy.relay.v1.${producer}.${routeVersion}`, partitionKey, payload, occurredAtUnixMs };
+}
+
+export interface DbProxyRecordCommit extends DbProxyMultiTransactionalWrite, DbProxyCommitEffects {}
+
 export type DbProxyTradeState = "proposed" | "escrowed" | "settled" | "cancelled";
 
 export interface DbProxyTradeEnvelope {
@@ -214,6 +272,9 @@ export interface DbProxyTradeTransactionResult {
  * not be reused when its response boundary is unknown.
  */
 export interface DbProxyTransport {
+  /** 仅在宿主/服务端确认新版 Relay 契约后设为 true。 / True only after host/server relay capability verification. */
+  readonly supportsOutboxRelay?: boolean;
+  commitRecords?(write: DbProxyRecordCommit): Promise<DbProxyMultiTransactionalWriteResult>;
   load(record: DbProxyRecordKey): Promise<DbProxySnapshotEnvelope | undefined>;
   loadMulti(
     records: readonly DbProxyRecordKey[],
@@ -240,11 +301,11 @@ export interface DbProxyTransport {
     operationId: string,
     records: readonly DbProxyRecordKey[],
   ): Promise<DbProxyMultiTransactionReceipt | undefined>;
-  loadTrade(tradeId: string): Promise<DbProxyTradeEnvelope | undefined>;
-  applyTradeTransaction(
+  loadTrade?(tradeId: string): Promise<DbProxyTradeEnvelope | undefined>;
+  applyTradeTransaction?(
     transaction: DbProxyTradeTransaction,
   ): Promise<DbProxyTradeTransactionResult>;
-  loadTradeTransaction(
+  loadTradeTransaction?(
     operationId: string,
     tradeId: string,
   ): Promise<DbProxyTradeReceipt | undefined>;
@@ -272,6 +333,24 @@ export class DbProxyRemoteError extends Error {
  */
 export class DbProxyClient {
   constructor(private readonly transport: DbProxyTransport) {}
+
+  /** 原子提交快照、不可变事实与事件；旧宿主必须拒绝，不能丢弃效果降级。 / Atomically commits all effects; older hosts must fail closed. */
+  CommitRecords(write: DbProxyRecordCommit): Promise<DbProxyMultiTransactionalWriteResult> {
+    const stable = { ...cloneMultiTransactionalWrite(write), ...CloneDbProxyCommitEffects(write) };
+    if (stable.outboxEvents.some(event => event.topic.startsWith("dbproxy.relay.v1.")) && this.transport.supportsOutboxRelay !== true) {
+      throw new Error("DBProxy transport has not verified Outbox Relay support");
+    }
+    if (!this.transport.commitRecords) throw new Error("DBProxy transport does not support CommitRecords");
+    return this.transport.commitRecords(stable).then(result => {
+      if (result.disposition !== "applied" && result.disposition !== "duplicate") throw new TypeError("invalid commit disposition");
+      const records = result.records.map(cloneMultiTransactionRecordReceipt);
+      if (records.length !== stable.writes.length || new Set(records.map(r => JSON.stringify(r.record))).size !== records.length
+        || stable.writes.some(w => !records.some(r => r.record.namespace === w.record.namespace && r.record.key === w.record.key && r.newRevision === w.expectedRevision + 1n))) {
+        throw new TypeError("commit receipt does not match requested records");
+      }
+      return { disposition: result.disposition, records, result: copyBytes(result.result) };
+    });
+  }
 
   Load(record: DbProxyRecordKey): Promise<DbProxySnapshotEnvelope | undefined> {
     return this.transport.load(cloneRecordKey(record)).then((snapshot) =>
@@ -380,6 +459,7 @@ export class DbProxyClient {
   }
 
   LoadTrade(tradeId: string): Promise<DbProxyTradeEnvelope | undefined> {
+    if (!this.transport.loadTrade) throw new Error("DBProxy transport does not support legacy trades");
     const stableTradeId = requireText(tradeId, "trade.tradeId", MAX_TRADE_ID_BYTES);
     return this.transport.loadTrade(stableTradeId).then((trade) =>
       trade ? cloneTradeEnvelope(trade) : undefined
@@ -389,6 +469,7 @@ export class DbProxyClient {
   ApplyTradeTransaction(
     transaction: DbProxyTradeTransaction,
   ): Promise<DbProxyTradeTransactionResult> {
+    if (!this.transport.applyTradeTransaction) throw new Error("DBProxy transport does not support legacy trades");
     const stable = cloneTradeTransaction(transaction);
     return this.transport.applyTradeTransaction(stable).then((result) => {
       if (result.disposition !== "applied" && result.disposition !== "duplicate") {
@@ -404,6 +485,7 @@ export class DbProxyClient {
     operationId: string,
     tradeId: string,
   ): Promise<DbProxyTradeReceipt | undefined> {
+    if (!this.transport.loadTradeTransaction) throw new Error("DBProxy transport does not support legacy trades");
     const stableOperationId = requireText(
       operationId,
       "tradeTransaction.operationId",
@@ -414,6 +496,17 @@ export class DbProxyClient {
       .loadTradeTransaction(stableOperationId, stableTradeId)
       .then((receipt) => receipt ? cloneTradeReceipt(receipt) : undefined);
   }
+}
+
+/** 校验、复制并规范化事务效果，避免等待期间调用者修改缓冲区。 / Validates and snapshots effects before asynchronous submission. */
+export function CloneDbProxyCommitEffects(effects: DbProxyCommitEffects): DbProxyCommitEffects {
+  if (effects.appends.length > MAX_TRANSACTION_RECORDS || effects.outboxEvents.length > MAX_OUTBOX_EVENTS) throw new TypeError("commit effect count exceeds limits");
+  const appends = effects.appends.map(a => ({ record: cloneRecordKey(a.record), schema: requireText(a.schema, "append.schema", MAX_SCHEMA_BYTES), schemaVersion: requireUint32(a.schemaVersion, "append.schemaVersion"), payload: copyBytes(a.payload), occurredAtUnixMs: requireUint64(a.occurredAtUnixMs, "append.occurredAtUnixMs") }));
+  const outboxEvents = effects.outboxEvents.map(cloneOutboxEvent);
+  appends.sort((a,b) => JSON.stringify(a.record).localeCompare(JSON.stringify(b.record)));
+  outboxEvents.sort((a,b) => a.eventId.localeCompare(b.eventId));
+  if (new Set(appends.map(a => JSON.stringify(a.record))).size !== appends.length || new Set(outboxEvents.map(e => e.eventId)).size !== outboxEvents.length) throw new TypeError("duplicate commit effect identity");
+  return { appends, outboxEvents };
 }
 
 function cloneRecordKey(record: DbProxyRecordKey): DbProxyRecordKey {

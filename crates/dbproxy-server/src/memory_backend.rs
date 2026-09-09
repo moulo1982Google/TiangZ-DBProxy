@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use tiangz_dbproxy_core::{AppendRecord, CommitEffects};
 use tiangz_dbproxy_core::{
     MultiRecordTransactionReceipt, MultiRecordTransactionalWrite,
     MultiRecordTransactionalWriteOutcome, RecordKey, Revision, SnapshotEnvelope, SnapshotWrite,
@@ -39,6 +40,7 @@ struct TradeShard {
 
 #[derive(Default)]
 struct TradeIdentifiers {
+    appends: HashMap<RecordKey, AppendRecord>,
     ledger_posting_ids: HashSet<String>,
     outbox_event_ids: HashSet<String>,
 }
@@ -105,6 +107,7 @@ impl TransactionFingerprint {
 
 #[derive(Clone)]
 struct StoredMultiTransactionReceipt {
+    effects: CommitEffects,
     fingerprint: MultiTransactionFingerprint,
     records: Vec<TransactionRecordReceipt>,
     result: Vec<u8>,
@@ -494,13 +497,22 @@ impl DbProxyBackend for MemoryBackend {
         &self,
         request: MultiRecordTransactionalWrite,
     ) -> Result<MultiRecordTransactionalWriteOutcome, BackendError> {
+        self.commit_records(request, CommitEffects::default()).await
+    }
+
+    async fn commit_records(
+        &self,
+        request: MultiRecordTransactionalWrite,
+        effects: CommitEffects,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, BackendError> {
+        let effects = effects.normalize()?;
         let request = Self::normalize_multi(request)?;
         let receipt_index = self.receipt_index(&request.operation_id);
         let mut receipts = self.receipt_shards[receipt_index].lock().await;
         Self::claim_operation(&mut receipts, &request.operation_id, "multi")?;
         let fingerprint = MultiTransactionFingerprint::from_request(&request);
         if let Some(receipt) = receipts.multi_transactions.get(&request.operation_id) {
-            if receipt.fingerprint != fingerprint {
+            if receipt.fingerprint != fingerprint || receipt.effects != effects {
                 return Err(StoreError::OperationIdConflict {
                     operation_id: request.operation_id,
                 }
@@ -512,6 +524,29 @@ impl DbProxyBackend for MemoryBackend {
             });
         }
 
+        let mut identifiers = if effects.is_empty() {
+            None
+        } else {
+            Some(self.trade_identifiers.lock().await)
+        };
+        if let Some(ids) = &identifiers {
+            for append in &effects.appends {
+                if ids.appends.contains_key(&append.record) {
+                    return Err(StoreError::AppendRecordConflict {
+                        record: append.record.clone(),
+                    }
+                    .into());
+                }
+            }
+            for event in &effects.outbox_events {
+                if ids.outbox_event_ids.contains(&event.event_id) {
+                    return Err(StoreError::OutboxEventConflict {
+                        event_id: event.event_id.clone(),
+                    }
+                    .into());
+                }
+            }
+        }
         let mut data = self.lock_data_shards(&request.writes).await;
         let mut committed = Vec::with_capacity(request.writes.len());
         for write in &request.writes {
@@ -570,9 +605,18 @@ impl DbProxyBackend for MemoryBackend {
         receipts
             .operation_kinds
             .insert(request.operation_id.clone(), "multi");
+        if let Some(ids) = &mut identifiers {
+            for append in &effects.appends {
+                ids.appends.insert(append.record.clone(), append.clone());
+            }
+            for event in &effects.outbox_events {
+                ids.outbox_event_ids.insert(event.event_id.clone());
+            }
+        }
         receipts.multi_transactions.insert(
             request.operation_id,
             StoredMultiTransactionReceipt {
+                effects,
                 fingerprint,
                 records: committed.clone(),
                 result: request.result.clone(),

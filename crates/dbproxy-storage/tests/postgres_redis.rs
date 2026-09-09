@@ -4,6 +4,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "support/postgres_request.rs"]
+mod postgres_request;
+
 use tiangz_dbproxy_core::{
     AsyncMultiRecordTransactionStore, AsyncSnapshotStore, AsyncTradeStore, AsyncTransactionalStore,
     LedgerPosting, MultiRecordTransactionalWrite, MultiRecordTransactionalWriteOutcome,
@@ -24,6 +27,237 @@ fn test_suffix() -> String {
         .expect("system clock must be after Unix epoch")
         .as_nanos();
     format!("{}-{}", std::process::id(), nanos)
+}
+
+#[tokio::test]
+#[ignore = "需要独立 PostgreSQL/Redis；会暂停缓存写入，必须串行运行"]
+async fn cache_write_timeout_preserves_committed_batch_and_durable_repair() {
+    let pg_url = std::env::var("DBPROXY_POSTGRES_URL").unwrap();
+    let redis_url = std::env::var("DBPROXY_CACHE_REDIS_URL")
+        .or_else(|_| std::env::var("DBPROXY_REDIS_URL"))
+        .unwrap();
+    let metrics = Arc::new(StorageMetrics::default());
+    let mut store = TieredSnapshotStore::connect_with_config(
+        &pg_url,
+        &redis_url,
+        TieredSnapshotStoreConfig {
+            cache_operation_timeout: Duration::from_millis(40),
+            ..Default::default()
+        },
+        metrics.clone(),
+    )
+    .await
+    .unwrap();
+    let postgres = PostgresSnapshotStore::connect(&pg_url).await.unwrap();
+    let cache = RedisSnapshotCache::connect(&redis_url).await.unwrap();
+    let (sql, driver) = tokio_postgres::connect(&pg_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let driver = tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let mut admin = redis::Client::open(redis_url)
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let namespace = format!("cache-budget-{}", test_suffix());
+    let requests: Vec<_> = (0..2)
+        .map(|i| SnapshotWrite {
+            request_id: format!("{namespace}-{i}"),
+            record: RecordKey::new(&namespace, i.to_string()).unwrap(),
+            schema: "budget.v1".into(),
+            schema_version: 1,
+            payload: vec![i as u8],
+            expected_revision: Some(Revision::ZERO),
+            updated_at_unix_ms: 1,
+        })
+        .collect();
+    let _: () = redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(10_000)
+        .arg("WRITE")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let saved =
+        tokio::time::timeout(Duration::from_secs(1), store.save_batch(requests.clone())).await;
+    // 先恢复 Redis 再断言；即便旧实现耗尽外层预算，也不遗留人为暂停。
+    // Unpause before assertions, including when the old implementation hits the test deadline.
+    let unpause: redis::RedisResult<()> = redis::cmd("CLIENT")
+        .arg("UNPAUSE")
+        .query_async(&mut admin)
+        .await;
+    unpause.unwrap();
+    let saved = saved
+        .expect("cache must not consume the 2-second PG fallback budget")
+        .unwrap();
+    assert!(saved.iter().all(|r| matches!(
+        r,
+        Ok(SnapshotWriteOutcome::Applied {
+            revision: Revision(1)
+        })
+    )));
+    assert_eq!(metrics.snapshot().cache_write_errors, 1);
+    let pending: i64 = sql
+        .query_one(
+            "SELECT count(*) FROM dbproxy_cache_repairs WHERE namespace=$1 AND target_revision=1",
+            &[&namespace],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(pending, 2, "timeout must not ACK durable repair rows");
+    for request in &requests {
+        let durable = postgres.load(&request.record).await.unwrap().unwrap();
+        assert_eq!(durable.revision, Revision(1));
+        assert_eq!(durable.payload, request.payload);
+        let repaired = store.repair_cache(&request.record).await.unwrap().unwrap();
+        assert!(
+            store
+                .cache_repair_queue()
+                .acknowledge_cached(&request.record, repaired)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cache.get(&request.record).await.unwrap().unwrap().payload,
+            request.payload
+        );
+    }
+    let duplicate = store.save_batch(requests).await.unwrap();
+    assert!(duplicate.iter().all(|r| matches!(
+        r,
+        Ok(SnapshotWriteOutcome::Duplicate {
+            revision: Revision(1)
+        })
+    )));
+    driver.abort();
+}
+
+#[tokio::test]
+#[ignore = "需要独立 PostgreSQL；使用 --ignored 显式运行"]
+async fn generic_commit_preserves_atomic_effects_and_immutable_facts() {
+    use tiangz_dbproxy_core::{AppendRecord, CommitEffects};
+    let url = std::env::var("DBPROXY_POSTGRES_URL").unwrap();
+    let mut store = PostgresSnapshotStore::connect(&url).await.unwrap();
+    let (sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    let id = format!("generic-{}", test_suffix());
+    let write = TransactionalRecordWrite {
+        record: RecordKey::new("document", &id).unwrap(),
+        schema: "document".into(),
+        schema_version: 1,
+        expected_revision: Revision::ZERO,
+        payload: b"state".to_vec(),
+        updated_at_unix_ms: 1,
+    };
+    let request = MultiRecordTransactionalWrite {
+        operation_id: id.clone(),
+        writes: vec![write],
+        result: b"ok".to_vec(),
+    };
+    let effects = CommitEffects {
+        appends: vec![AppendRecord {
+            record: RecordKey::new("audit", &id).unwrap(),
+            schema: "fact".into(),
+            schema_version: 1,
+            payload: b"fact".to_vec(),
+            occurred_at_unix_ms: 1,
+        }],
+        outbox_events: vec![OutboxEvent {
+            event_id: id.clone(),
+            topic: "document.changed".into(),
+            partition_key: id.clone(),
+            payload: b"event".to_vec(),
+            occurred_at_unix_ms: 1,
+        }],
+    };
+    let mut stale = request.clone();
+    stale.writes[0].expected_revision = Revision(10);
+    assert!(store.commit_records(stale, effects.clone()).await.is_err());
+    assert!(
+        store
+            .load(&request.writes[0].record)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        store
+            .commit_records(request.clone(), effects.clone())
+            .await
+            .unwrap(),
+        MultiRecordTransactionalWriteOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        store
+            .commit_records(request.clone(), effects.clone())
+            .await
+            .unwrap(),
+        MultiRecordTransactionalWriteOutcome::Duplicate { .. }
+    ));
+    assert!(store.apply_multi(request.clone()).await.is_err());
+    let row = sql
+        .query_one(
+            "SELECT trade_id, payload FROM dbproxy_outbox WHERE event_id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, Option<String>>(0), None);
+    assert_eq!(row.get::<_, Vec<u8>>(1), b"event");
+    assert!(sql.execute("UPDATE dbproxy_append_records SET payload=$1 WHERE namespace='audit' AND record_key=$2", &[&b"tampered".to_vec(), &id]).await.is_err());
+    assert!(
+        sql.execute(
+            "DELETE FROM dbproxy_append_records WHERE namespace='audit' AND record_key=$1",
+            &[&id]
+        )
+        .await
+        .is_err()
+    );
+    let mut next = request.clone();
+    next.operation_id.push_str("-next");
+    next.writes[0].expected_revision = Revision(1);
+    next.writes[0].payload = b"wrong".to_vec();
+    assert!(
+        store
+            .commit_records(next.clone(), effects.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .commit_records(
+                next,
+                CommitEffects {
+                    appends: vec![],
+                    outbox_events: effects.outbox_events
+                }
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load(&request.writes[0].record)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"state"
+    );
+    assert!(
+        store
+            .load_multi_receipt(&format!("{id}-next"), &[request.writes[0].record.clone()])
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -72,9 +306,22 @@ async fn postgres_snapshot_table_uses_32_hash_partitions() {
             (5, "trade-outbox".to_string()),
             (6, "operation-registry".to_string()),
             (7, "hardening".to_string()),
+            (8, "generic-commit".to_string()),
+            (9, "outbox-relay".to_string()),
+            (10, "cache-repair-leases".to_string()),
+            (11, "outbox-index-cleanup".to_string()),
         ]
     );
 
+    let indexes = sql.query_one("SELECT to_regclass('dbproxy_outbox_partition_order') IS NULL, to_regclass('dbproxy_outbox_order') IS NOT NULL", &[]).await.unwrap();
+    assert!(
+        indexes.get::<_, bool>(0),
+        "obsolete topic ordering index must be removed"
+    );
+    assert!(
+        indexes.get::<_, bool>(1),
+        "unpublished ordering-group index must remain"
+    );
     let children = sql
         .query(
             r#"
@@ -967,8 +1214,11 @@ async fn durable_cache_repair_queue_keeps_the_newest_revision() {
         }
     );
     assert!(
-        !queue.acknowledge(&old_lease).await.unwrap(),
-        "an old lease must not delete a newer repair target"
+        queue
+            .acknowledge(&old_lease, Some(Revision(1)))
+            .await
+            .unwrap(),
+        "a live lease must release, but not delete, an uncovered newer target"
     );
     sql.execute(
         "UPDATE dbproxy_cache_repairs SET requested_at = to_timestamp(0) WHERE namespace = $1 AND record_key = $2",
@@ -1006,7 +1256,12 @@ async fn durable_cache_repair_queue_keeps_the_newest_revision() {
         store.repair_cache(&record).await.unwrap(),
         Some(Revision(2))
     );
-    assert!(queue.acknowledge(&current).await.unwrap());
+    assert!(
+        queue
+            .acknowledge(&current, Some(Revision(2)))
+            .await
+            .unwrap()
+    );
     let cached = RedisSnapshotCache::connect(&redis_url)
         .await
         .unwrap()
@@ -1025,6 +1280,26 @@ async fn trade_state_ledger_and_outbox_commit_atomically() {
         .expect("DBPROXY_POSTGRES_URL must be set for the integration test");
     let redis_url = std::env::var("DBPROXY_REDIS_URL")
         .expect("DBPROXY_REDIS_URL must be set for the integration test");
+    // Legacy claims intentionally scan all publishers. Give this test its own schema
+    // instead of marking unrelated pending events published to make its assertions pass.
+    assert!(postgres_url.starts_with("postgres://") || postgres_url.starts_with("postgresql://"));
+    assert!(
+        !postgres_url.contains("options="),
+        "test requires an unscoped PostgreSQL URI"
+    );
+    let schema = format!("trade_test_{}", test_suffix().replace('-', "_"));
+    let (admin, connection) = tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let admin_task = tokio::spawn(async move { connection.await.unwrap() });
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    drop(admin);
+    admin_task.await.unwrap();
+    let separator = if postgres_url.contains('?') { '&' } else { '?' };
+    let postgres_url = format!("{postgres_url}{separator}options=-csearch_path%3D{schema}");
     let mut store = TieredSnapshotStore::connect(&postgres_url, &redis_url)
         .await
         .expect("PostgreSQL and Redis must be available");
@@ -1032,12 +1307,6 @@ async fn trade_state_ledger_and_outbox_commit_atomically() {
         .await
         .unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
-    sql.execute(
-        "UPDATE dbproxy_outbox SET published_at = COALESCE(published_at, clock_timestamp()), attempt_count = 0, lease_owner = NULL, lease_until = NULL, last_error = NULL, dead_lettered_at = NULL WHERE event_id LIKE '000-event-%' OR event_id LIKE '001-event-%'",
-        &[],
-    )
-    .await
-    .unwrap();
     let suffix = test_suffix();
     let trade_id = format!("trade-{suffix}");
     let operation_id = format!("escrow-{suffix}");

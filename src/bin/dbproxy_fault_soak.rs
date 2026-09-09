@@ -10,13 +10,13 @@ use std::{
 };
 
 use serde_json::json;
-use tiangz_dbproxy_client::{ClientConfig, DbProxyClientPool};
+use tiangz_dbproxy_client::{ClientConfig, ClientError, DbProxyClientPool};
 use tiangz_dbproxy_core::{
     LedgerPosting, OutboxEvent, RecordKey, Revision, SnapshotWrite, TradeState, TradeTransaction,
     TradeTransactionOutcome, TradeTransition, TransactionalRecordWrite, TransactionalWrite,
     TransactionalWriteOutcome,
 };
-use tiangz_dbproxy_protocol::MAX_BATCH_SNAPSHOT_WRITES;
+use tiangz_dbproxy_protocol::{MAX_BATCH_SNAPSHOT_WRITES, ProtocolError, wire};
 use tokio::{task::JoinSet, time::Instant};
 
 type DynError = Box<dyn Error + Send + Sync>;
@@ -50,6 +50,7 @@ struct PlayerState {
 
 #[derive(Default)]
 struct Counters {
+    error_diagnostics: AtomicU64,
     load_ok: AtomicU64,
     load_errors: AtomicU64,
     missing_snapshots: AtomicU64,
@@ -251,7 +252,7 @@ async fn main() -> Result<(), DynError> {
     let acknowledged_enqueues = enqueue_worker.await?;
     reporter.await?;
 
-    let validation = validate_final_state(
+    let mut validation = validate_final_state(
         &pool,
         &final_states,
         &acknowledged_enqueues,
@@ -260,6 +261,9 @@ async fn main() -> Result<(), DynError> {
     )
     .await;
     let total = counters.snapshot();
+    if validation.is_ok() {
+        validation = validate_observed_consistency(total);
+    }
     emit(
         "SOAK_FINAL",
         json!({
@@ -273,6 +277,31 @@ async fn main() -> Result<(), DynError> {
         }),
     );
     validation
+}
+
+fn validate_observed_consistency(counters: CounterSnapshot) -> Result<(), DynError> {
+    let mut violations = Vec::new();
+    if counters.missing_snapshots > 0 {
+        violations.push(format!("missingSnapshots={}", counters.missing_snapshots));
+    }
+    if counters.reads_behind_acknowledged_revision > 0 {
+        violations.push(format!(
+            "readsBehindAcknowledgedRevision={}",
+            counters.reads_behind_acknowledged_revision
+        ));
+    }
+    if counters.invariant_errors > 0 {
+        violations.push(format!("invariantErrors={}", counters.invariant_errors));
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "observed consistency violations during the run: {}",
+            violations.join(", ")
+        )
+        .into())
+    }
 }
 
 async fn seed_and_warm_players(
@@ -383,6 +412,8 @@ async fn run_player(
         let next_cycle = cycle_started + cycle;
         if next_cycle < deadline {
             tokio::time::sleep_until(next_cycle).await;
+        } else {
+            break;
         }
     }
     state
@@ -397,9 +428,19 @@ async fn observe_direct_snapshot(
         Ok(Some(snapshot)) => {
             counters.load_ok.fetch_add(1, Ordering::Relaxed);
             if snapshot.revision < state.direct_revision {
-                counters
+                let previous = counters
                     .reads_behind_acknowledged_revision
                     .fetch_add(1, Ordering::Relaxed);
+                if previous < 16 {
+                    emit(
+                        "SOAK_OLD_READ",
+                        json!({
+                            "record": {"namespace":state.direct_record.namespace,"key":state.direct_record.key},
+                            "acknowledgedRevision":state.direct_revision.0,
+                            "observedRevision":snapshot.revision.0,
+                        }),
+                    );
+                }
             } else if snapshot.revision > state.direct_revision {
                 counters
                     .reads_ahead_of_local_revision
@@ -409,8 +450,9 @@ async fn observe_direct_snapshot(
         Ok(None) => {
             counters.missing_snapshots.fetch_add(1, Ordering::Relaxed);
         }
-        Err(_) => {
+        Err(error) => {
             counters.load_errors.fetch_add(1, Ordering::Relaxed);
+            record_operation_error(counters, "load_direct", &error);
         }
     }
 }
@@ -427,8 +469,9 @@ async fn observe_queued_snapshot(
         Ok(None) => {
             counters.missing_snapshots.fetch_add(1, Ordering::Relaxed);
         }
-        Err(_) => {
+        Err(error) => {
             counters.load_errors.fetch_add(1, Ordering::Relaxed);
+            record_operation_error(counters, "load_queued", &error);
         }
     }
 }
@@ -472,8 +515,13 @@ async fn run_enqueue_batches(
                                 acknowledged[player] = sequence;
                                 counters.enqueue_ok.fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(_) => {
+                            Err(error) => {
                                 counters.enqueue_errors.fetch_add(1, Ordering::Relaxed);
+                                record_operation_error(
+                                    &counters,
+                                    "enqueue_entry",
+                                    &ClientError::Remote(error),
+                                );
                             }
                         }
                     }
@@ -481,10 +529,11 @@ async fn run_enqueue_batches(
                 Ok(_) => {
                     counters.invariant_errors.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(_) => {
+                Err(error) => {
                     counters
                         .enqueue_errors
                         .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    record_operation_error(&counters, "enqueue_batch", &error);
                 }
             }
         }
@@ -533,8 +582,9 @@ async fn apply_direct_transaction(
                 .transaction_duplicate
                 .fetch_add(1, Ordering::Relaxed);
         }
-        Err(_) => {
+        Err(error) => {
             counters.transaction_errors.fetch_add(1, Ordering::Relaxed);
+            record_operation_error(counters, "apply_transaction", &error);
         }
     }
 }
@@ -581,9 +631,47 @@ async fn apply_trade(
             state.pending_trade = None;
             counters.trade_duplicate.fetch_add(1, Ordering::Relaxed);
         }
-        Err(_) => {
+        Err(error) => {
             counters.trade_errors.fetch_add(1, Ordering::Relaxed);
+            record_operation_error(counters, "apply_trade", &error);
         }
+    }
+}
+
+/// 故障窗口只允许明确的暂时不可用；独占测试记录上的冲突、协议或内部错误必须失败。
+/// Only transient unavailability is tolerated; conflicts on owned fixtures and protocol/internal errors fail validation.
+fn retryable_operation_error(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::ConnectTimeout
+            | ClientError::RequestTimeout
+            | ClientError::ConnectionUnusable
+            | ClientError::ConnectionClosed
+    ) || matches!(error, ClientError::Protocol(ProtocolError::Io(error)) if matches!(error.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted |
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotConnected |
+        io::ErrorKind::BrokenPipe | io::ErrorKind::TimedOut | io::ErrorKind::UnexpectedEof |
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock))
+        || matches!(error, ClientError::Remote(remote) if remote.code == wire::ErrorCode::StorageUnavailable)
+}
+
+/// 保留有限错误样本；永久契约错误立即加入最终失败计数，不混为普通故障重试。
+/// Retains bounded samples and makes permanent contract failures part of the final failure counters.
+fn record_operation_error(counters: &Counters, stage: &str, error: &ClientError) {
+    let retryable = retryable_operation_error(error);
+    let permanent_sample =
+        !retryable && counters.invariant_errors.fetch_add(1, Ordering::Relaxed) < 16;
+    let sampled = counters.error_diagnostics.fetch_add(1, Ordering::Relaxed) < 16;
+    if sampled || permanent_sample {
+        emit(
+            if retryable {
+                "SOAK_OPERATION_ERROR"
+            } else {
+                "SOAK_CONTRACT_ERROR"
+            },
+            json!({ "stage":stage, "retryable":retryable,
+                "error":error.to_string().chars().take(512).collect::<String>() }),
+        );
     }
 }
 
@@ -829,6 +917,58 @@ fn parse_options() -> Result<Options, DynError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn permanent_operation_errors_cannot_pass_as_fault_window_retries() {
+        use tiangz_dbproxy_client::RemoteError;
+        let counters = Counters::default();
+        for error in [
+            ClientError::RequestTimeout,
+            ClientError::ConnectionClosed,
+            ClientError::Protocol(ProtocolError::Io(
+                std::io::ErrorKind::ConnectionReset.into(),
+            )),
+            ClientError::Remote(RemoteError {
+                code: wire::ErrorCode::StorageUnavailable,
+                message: "fault".into(),
+                actual_revision: None,
+            }),
+        ] {
+            assert!(retryable_operation_error(&error));
+            record_operation_error(&counters, "fixture", &error);
+        }
+        assert!(validate_observed_consistency(counters.snapshot()).is_ok());
+        for code in [
+            wire::ErrorCode::RevisionConflict,
+            wire::ErrorCode::IdempotencyConflict,
+            wire::ErrorCode::TradeConflict,
+            wire::ErrorCode::Internal,
+            wire::ErrorCode::Unauthorized,
+        ] {
+            let error = ClientError::Remote(RemoteError {
+                code,
+                message: "contract".into(),
+                actual_revision: None,
+            });
+            assert!(!retryable_operation_error(&error));
+            record_operation_error(&counters, "fixture", &error);
+        }
+        record_operation_error(
+            &counters,
+            "fixture",
+            &ClientError::UnexpectedResponse("wrong message"),
+        );
+        for kind in [
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::PermissionDenied,
+        ] {
+            let error = ClientError::Protocol(ProtocolError::Io(kind.into()));
+            assert!(!retryable_operation_error(&error));
+            record_operation_error(&counters, "fixture", &error);
+        }
+        assert_eq!(counters.snapshot().invariant_errors, 9);
+        assert!(validate_observed_consistency(counters.snapshot()).is_err());
+    }
 
     #[test]
     fn periodic_deadline_preserves_an_on_time_schedule() {
@@ -850,6 +990,21 @@ mod tests {
         assert_eq!(
             next_periodic_deadline(origin, interval, now),
             now + interval
+        );
+    }
+
+    #[test]
+    fn observed_consistency_rejects_a_stale_acknowledged_read() {
+        let counters = CounterSnapshot {
+            reads_behind_acknowledged_revision: 1,
+            ..CounterSnapshot::default()
+        };
+
+        let error = validate_observed_consistency(counters).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("readsBehindAcknowledgedRevision=1")
         );
     }
 }

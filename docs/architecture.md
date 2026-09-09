@@ -1,5 +1,19 @@
 # DBProxy 架构说明
 
+2026-09-07：服务端提交后缓存修复清理改由现有维护 worker 有界合并处理，业务提交及持久修复契约不变，见[提交后清理](cache-repair-cleanup.md)。
+
+同库批量快照现由首记录选择一条连接、一次 PG 提交，保留逐条 CAS/幂等结果；连接分片不再把一批写入拆成多个提交，见[批次提交](snapshot-batch-commit.md)。
+
+## 通用提交集成（2026-09-05）
+
+`CommitRecords` 组合非空快照写集合、可选追加事实、可选 Outbox 和业务回执；复用多记录 CAS 提交，不解释 payload。`dbproxy_append_records` 使用独立 namespace/key 唯一键，禁止 UPDATE/DELETE/TRUNCATE；本轮没有新增扫描/索引查询 API，审计查询由后续只读工具或消费端投影承担。
+
+效果规范化后以 bincode standard 编码保存于 `dbproxy_multi_transaction_effects`，重复操作必须比较完整效果。该编码属于持久幂等契约，后续改变结构/编码必须设计兼容读取。普通无效果事务无需新增效果行；带效果的操作用普通多记录 API 重试会被新服务拒绝。
+
+迁移 008 将 Outbox 的 operation_id 外键转为通用操作注册表，trade_id 允许 NULL。旧交易行保留，通用事件的发布字段 trade_id 为空字符串。全部服务和 worker 升级后才启用通用写入；旧二进制不识别新效果和 NULL trade_id，启用后不得直接回滚二进制。
+
+`TradeState`、零和 Posting 和专用 Trade API 是过渡期兼容能力，尚未从内核移除。新领域采用通用提交，状态机与资产规则在游戏服务中实现。其余章节中的“交易原语”描述旧兼容入口，不能作为继续扩展领域规则的依据。详见[通用持久化调整](generic-persistence-plan.md)。
+
 ## 定位与边界
 
 DBProxy 是 TiangZ 的独立持久化边界。业务服务提交已经序列化的完整快照和事务计划；DBProxy 负责 Revision/CAS、幂等、同库原子提交、缓存、持久队列和恢复，不负责场景、道具价格、玩家资格、背包容量等玩法规则。
@@ -56,9 +70,13 @@ Redis revision-aware fast-path refresh
   failure -> return committed result; repair worker retries
 ```
 
-这消除了“数据库已经提交，但 Redis 失败导致客户端收到模糊失败”的旧语义。修复表按 `RecordKey` 合并，只保留最高 `target_revision`；worker 使用 PostgreSQL 时钟、短租约和 `FOR UPDATE SKIP LOCKED`，指数退避后进入死信。旧 lease 只能 ACK 自己领取的目标，不能删除并发产生的新版本。
+这消除了“数据库已经提交，但 Redis 失败导致客户端收到模糊失败”的旧语义。修复表按 `RecordKey` 合并，只提升 `target_revision`，保留本轮未完成修复的首次 `requested_at`、退避时间、失败计数、死信和有效租约；热点提交不会把任务推到队尾或重新启动失败预算。worker 使用 PostgreSQL 时钟、短租约和 `FOR UPDATE SKIP LOCKED`，指数退避后进入死信，显式定点重放才重置失败状态。
+
+每次领取从全局 sequence 分配 `lease_token`，任务删除后重新入队也不会复用租约身份；ACK/fail 同时校验 owner、token 和有效期。ACK 在行锁事务内按实际修复 revision 判断：覆盖当前目标则删除，否则保留更高目标并释放有效租约；`repair_cache` 返回 `None` 时只覆盖领取时的精确目标。成功释放更高目标也算完成本轮处理，不记为 LeaseLost。失败按当前有效租约累积次数，不因目标提升失效。快路径仍只删除已被成功缓存 revision 覆盖的目标。
 
 缓存写入由 Lua 脚本比较 Revision，旧快照不能覆盖新快照。普通批量快照、multi transaction 和 trade 提交后的缓存刷新都使用一次批量 Lua 调用，再用一条 PostgreSQL `unnest` 删除已覆盖的修复目标；如果任一步失败，事务内预先写入的修复行仍然存在。读取失败、编码损坏或 miss 会回源 PostgreSQL；缓存预热失败不影响权威读取结果。
+
+严格 read-after-write 部署必须把快照缓存与 AOF backlog/Outbox 分开。可靠队列 Redis 会从 AOF 恢复；若它同时保存缓存，崩溃前尚未刷入 AOF 的新缓存可能在重启后被旧值和旧 freshness 标记替代，并在 repair worker 赶上前产生短暂旧读。`cacheRedisUrlEnv`因此指向关闭 AOF/RDB 的易失实例：重启后缓存为空，只能回源 PostgreSQL，再由读预热或持久 repair 重建。`redisUrlEnv`仍只负责必须保留的 backlog 和 Outbox。单 Redis 配置保留用于兼容和本地开发，但不能通过这一严格恢复边界。
 
 ## 缓存击穿与生命周期
 
@@ -124,7 +142,11 @@ Redis 使用自动重连的 `ConnectionManager`。PostgreSQL 连接发现关闭�
 - `004_cache_repair.sql`：持久缓存修复队列；
 - `005_trade_outbox.sql`：交易、不可变账本和 Outbox；
 - `006_operation_registry.sql`：跨事务类型的 operation ID 注册表；
-- `007_hardening.sql`：旧库兼容字段和交易状态约束。
+- `007_hardening.sql`：旧库兼容字段和交易状态约束；
+- `008_generic_commit.sql`：通用提交效果、不可变追加记录以及与交易无关的 Outbox；
+- `009_outbox_relay.sql`：持久路由/Publisher 身份、入队序号、租约令牌与管理审计。新配置与兼容限制见 [Outbox Relay](outbox-relay.md)。
+- `010_cache_repair_leases.sql`：缓存修复全局租约 sequence 与 token。不得在清理任务时重置 sequence；全部旧队列写入端、worker 和管理进程退出升级后，新保证才生效，详见 [恢复手册](durability-recovery-runbook.md)。
+- `011_outbox_index_cleanup.sql`：删除 007 遗留的 topic/timestamp 排序索引，保留未发布排序组索引；没有新增可能使死信积压查询退化的 enqueue_order 单列索引。执行计划对比见 [索引验证](outbox-claim-index-review.md)。
 
 ## 网络和 SDK
 

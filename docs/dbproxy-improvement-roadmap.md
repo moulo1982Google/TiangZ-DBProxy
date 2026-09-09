@@ -1,5 +1,9 @@
 # DBProxy 改进路线图与完成状态
 
+## 当前本地工作：通用持久化边界
+
+已实现 CommitRecords、追加事实、通用 Outbox、完整效果幂等校验和 TiangZ 在线交易适配；远程七天演练仍使用原版本。旧 Trade API 为兼容暂留，真实存储验收和正式依赖发布尚待完成。以下历史“交易安全已完成”不代表其领域状态机属于通用内核。新计划与 WoW335 影响见[通用持久化计划](generic-persistence-plan.md)。
+
 本文记录本轮改进的实际状态。顺序仍是先保证写入和恢复语义，再逐步增加容量能力；当前已实现快照表库内分区，历史归档、其他表分区和物理分库继续延期。
 
 ## 已完成：输入与缓存护栏
@@ -27,6 +31,8 @@
 - [x] PostgreSQL 断线后有界重连；结果未知的当前请求不自动重放。
 - [x] 笔记本故障矩阵只启动限额 PostgreSQL/Redis，并强制 AOF。
 - [x] 演练覆盖 Redis 重启后 AOF 数据恢复、PostgreSQL 停机积压与恢复排空、lease/release、旧 ACK 不删除新快照、缓存故障后的 durable repair。
+- [x] 严格恢复部署把 AOF backlog/Outbox 与易失快照缓存拆到两个 Redis；缓存重启为空并回源 PostgreSQL，避免 AOF 恢复旧 freshness 产生短暂旧读。
+- [x] 正确性 soak 与最终日志审计均将任何低于已确认 Revision 的读取作为失败，而不只检查最终收敛。
 
 演练命令和故障处理见[持久化与故障恢复手册](durability-recovery-runbook.md)。
 
@@ -58,6 +64,7 @@
 - [x] 缓存修复、Outbox 和交易分别拆为存储模块，避免继续膨胀主文件。
 - [x] 修复 snapshot 幂等回执遗漏 `updated_at_unix_ms` 的内容比较；旧回执保持兼容。
 - [x] TypeScript 协议锁从 Rust 权威版本自动生成，消除手工双写常量。
+- [x] 协议指纹先规范化 CRLF/LF；server 为已部署 v2 旧指纹提供唯一、可测试的滚动兼容别名，不放宽其他握手校验。
 - [x] 修复跨 single/multi/trade 首次创建记录时的 CAS 竞争。
 - [x] 后台维护使用独立 PostgreSQL 连接，避免阻塞请求 shard。
 - [x] 删除 PostgreSQL 已提交后再返回 `CacheSync` 错误的旧分支。

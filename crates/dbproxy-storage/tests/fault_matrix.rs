@@ -11,6 +11,80 @@ use tiangz_dbproxy_storage::{
 
 const POSTGRES_CONTAINER: &str = "tiangz-dbproxy-postgres";
 const REDIS_CONTAINER: &str = "tiangz-dbproxy-redis";
+const CACHE_CONTAINER: &str = "tiangz-dbproxy-cache";
+
+#[tokio::test]
+#[ignore = "会强杀本机缓存 Redis；设置 DBPROXY_RUN_DOCKER_FAULTS=1 后显式运行"]
+async fn ephemeral_cache_restart_cannot_restore_an_acknowledged_old_revision() {
+    if !require_opt_in() {
+        return;
+    }
+    let (postgres_url, _) = env_urls();
+    let cache_url = std::env::var("DBPROXY_CACHE_REDIS_URL").unwrap();
+    let mut store = TieredSnapshotStore::connect(&postgres_url, &cache_url)
+        .await
+        .unwrap();
+    let key = RecordKey::new("fault-cache-restart", test_suffix()).unwrap();
+    store
+        .apply(transaction(
+            &test_suffix(),
+            key.clone(),
+            Revision::ZERO,
+            b"old",
+            b"ok",
+        ))
+        .await
+        .unwrap();
+    // Deliberately create an old disk image. Even an accidental SAVE must not survive
+    // the cache container restart: /data must be tmpfs, not a Redis image volume.
+    let mut connection = redis::Client::open(cache_url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SAVE")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let mut guard = RestartGuard {
+        container: CACHE_CONTAINER,
+        active: true,
+    };
+    docker(&["kill", CACHE_CONTAINER]);
+    let outcome = store
+        .apply(transaction(
+            &test_suffix(),
+            key.clone(),
+            Revision(1),
+            b"new",
+            b"ok",
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        TransactionalWriteOutcome::Applied {
+            new_revision: Revision(2),
+            ..
+        }
+    ));
+    guard.restart();
+    // No repair worker or duplicate write runs before this read; neither can hide old data.
+    let reader = TieredSnapshotStore::connect(&postgres_url, &cache_url)
+        .await
+        .unwrap();
+    for snapshot in [
+        reader.load(&key).await.unwrap().unwrap(),
+        reader.load_multi(&[key]).await.unwrap().remove(0).unwrap(),
+    ] {
+        assert_eq!(
+            snapshot.revision,
+            Revision(2),
+            "cache restored an older acknowledged revision"
+        );
+        assert_eq!(snapshot.payload, b"new");
+    }
+}
 
 fn test_suffix() -> String {
     let nanos = SystemTime::now()
@@ -38,7 +112,14 @@ fn docker(args: &[&str]) {
 }
 
 fn wait_healthy(container: &str) {
-    for _ in 0..40 {
+    // 本地 Compose 健康检查每 5 秒一次、允许 12 次失败；10 秒轮询会在
+    // AOF 已恢复但 Docker 尚未发布下一次探测结果时误判。这里只等待容器就绪，
+    // 不改变 DBProxy 请求超时或任何持久化/数据断言。
+    // Local Compose allows 12 health probes at 5-second intervals. Wait for that
+    // readiness contract plus a probe margin, independently of application RPC deadlines.
+    let deadline = std::time::Instant::now() + Duration::from_secs(70);
+    let mut last_status = String::new();
+    while std::time::Instant::now() < deadline {
         let output = Command::new("docker")
             .args(["inspect", "--format", "{{.State.Health.Status}}", container])
             .output()
@@ -47,9 +128,12 @@ fn wait_healthy(container: &str) {
         if status == "healthy" {
             return;
         }
+        last_status = status;
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("container {container} did not become healthy");
+    panic!(
+        "container {container} did not become healthy within the Compose readiness window; last status: {last_status}"
+    );
 }
 
 struct RestartGuard {
@@ -231,7 +315,7 @@ async fn redis_outage_falls_back_and_retry_repairs_cache() {
         recovered.repair_cache(&key).await.unwrap(),
         Some(Revision(2))
     );
-    assert!(queue.acknowledge(&lease).await.unwrap());
+    assert!(queue.acknowledge(&lease, Some(Revision(2))).await.unwrap());
     assert_eq!(
         recovered.apply(second).await.unwrap(),
         TransactionalWriteOutcome::Duplicate {

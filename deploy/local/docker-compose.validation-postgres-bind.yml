@@ -1,0 +1,12 @@
+# 仅用于显式本机存储路径对照；保留原 named volume，不迁移或复制业务数据。
+# Explicit local storage-path comparison only; preserves the original named volume.
+services:
+  postgres:
+    environment:
+      POSTGRES_DB: dbproxy_local_validation
+    volumes:
+      - type: bind
+        source: ${DBPROXY_VALIDATION_PG_DATA_DIR:?Set an existing dedicated PostgreSQL validation directory}
+        target: /var/lib/postgresql
+        bind:
+          create_host_path: false

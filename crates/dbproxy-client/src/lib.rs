@@ -46,6 +46,22 @@ pub enum ClientRequestOutcome {
     ProtocolError,
 }
 
+/// 单次已结束请求的互斥锁等待与持锁处理时间；不包含重连或外层重试。
+/// Timing for one completed attempt, excluding reconnects and outer retries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientRequestTiming {
+    pub queue_wait: Duration,
+    /// 包含客户端编解码、网络及服务端处理，不是数据库执行时间；失效连接可能未发送。
+    /// Includes codec, network and server work, not SQL alone; an unusable connection may not send.
+    pub exchange: Duration,
+}
+
+impl ClientRequestTiming {
+    pub fn total(self) -> Duration {
+        self.queue_wait.saturating_add(self.exchange)
+    }
+}
+
 /// 可选的低开销客户端观测器。实现只能记录有界指标，不得把RecordKey或幂等ID作为标签。
 /// Optional low-overhead client observer. Implementations must not label metrics with RecordKey or idempotency IDs.
 pub trait ClientObserver: Send + Sync + 'static {
@@ -65,6 +81,18 @@ pub trait ClientObserver: Send + Sync + 'static {
         elapsed: Duration,
         outcome: ClientRequestOutcome,
     );
+
+    /// 分阶段回调默认转发旧回调一次，已有观察者无需修改；回调不得阻塞。
+    /// Defaults to exactly one legacy callback for compatibility; observers must not block.
+    fn request_attempt_timed(
+        &self,
+        endpoint_index: usize,
+        operation: &'static str,
+        timing: ClientRequestTiming,
+        outcome: ClientRequestOutcome,
+    ) {
+        self.request_attempt(endpoint_index, operation, timing.total(), outcome);
+    }
 }
 
 /// 客户端连接参数；令牌只用于内部服务认证，不能写入日志或提交到生产配置。
@@ -382,6 +410,16 @@ impl DbProxyClientPool {
             .await
     }
 
+    pub async fn commit_records(
+        &self,
+        request: MultiRecordTransactionalWrite,
+        effects: tiangz_dbproxy_core::CommitEffects,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, ClientError> {
+        self.write_client_for_operation(&request.operation_id)
+            .commit_records(request, effects)
+            .await
+    }
+
     pub async fn load_trade(&self, trade_id: &str) -> Result<Option<TradeEnvelope>, ClientError> {
         self.read_client_for_operation(trade_id)
             .load_trade(trade_id)
@@ -431,14 +469,20 @@ impl DbProxyClient {
     pub async fn connect(config: ClientConfig) -> Result<Self, ClientError> {
         let candidates = config.endpoint_candidates()?;
         let mut last_error = None;
+        let mut last_rejection = None;
         for endpoint_index in 0..candidates.len() {
             match Self::connect_observed(config.clone(), endpoint_index).await {
                 Ok(client) => return Ok(client),
                 Err(error) if is_endpoint_unavailable(&error) => last_error = Some(error),
+                Err(error) if is_candidate_handshake_rejection(&error) => {
+                    last_rejection = Some(error)
+                }
                 Err(error) => return Err(error),
             }
         }
-        Err(last_error.unwrap_or(ClientError::ConnectionClosed))
+        Err(last_rejection
+            .or(last_error)
+            .unwrap_or(ClientError::ConnectionClosed))
     }
 
     async fn connect_observed(
@@ -523,6 +567,7 @@ impl DbProxyClient {
         }
         if hello.protocol_version != PROTOCOL_VERSION
             || hello.protocol_fingerprint != PROTOCOL_FINGERPRINT
+            || !hello.supports_outbox_relay
         {
             return Err(ClientError::UnexpectedResponse(
                 "server accepted a different protocol",
@@ -549,6 +594,7 @@ impl DbProxyClient {
         let operation = request_operation(&body);
         let started_at = Instant::now();
         let mut connection = self.connection.lock().await;
+        let queue_wait = started_at.elapsed();
         let endpoint_index = connection.endpoint_index;
         let result = async {
             if !connection.usable {
@@ -606,10 +652,13 @@ impl DbProxyClient {
         }
         .await;
         if let Some(observer) = &self.config.observer {
-            observer.request_attempt(
+            observer.request_attempt_timed(
                 endpoint_index,
                 operation,
-                started_at.elapsed(),
+                ClientRequestTiming {
+                    queue_wait,
+                    exchange: started_at.elapsed().saturating_sub(queue_wait),
+                },
                 request_outcome(&result),
             );
         }
@@ -633,8 +682,14 @@ impl DbProxyClient {
     async fn reconnect_next(&self) -> Result<(), ClientError> {
         let candidates = self.config.endpoint_candidates()?;
         let mut connection = self.connection.lock().await;
+        // 并发失败者可能排在成功重连者后面，不要再替换已修复的连接。
+        // A concurrent caller may already have repaired this shared connection.
+        if connection.usable {
+            return Ok(());
+        }
         let current_index = connection.endpoint_index;
         let mut last_error = None;
+        let mut last_rejection = None;
         for offset in 1..=candidates.len() {
             let endpoint_index = (current_index + offset) % candidates.len();
             match Self::connect_observed(self.config.clone(), endpoint_index).await {
@@ -649,11 +704,16 @@ impl DbProxyClient {
                     return Ok(());
                 }
                 Err(error) if is_endpoint_unavailable(&error) => last_error = Some(error),
+                Err(error) if is_candidate_handshake_rejection(&error) => {
+                    last_rejection = Some(error)
+                }
                 Err(error) => return Err(error),
             }
         }
         connection.usable = false;
-        Err(last_error.unwrap_or(ClientError::ConnectionClosed))
+        Err(last_rejection
+            .or(last_error)
+            .unwrap_or(ClientError::ConnectionClosed))
     }
 
     pub async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, ClientError> {
@@ -915,25 +975,59 @@ impl DbProxyClient {
         &self,
         request: MultiRecordTransactionalWrite,
     ) -> Result<MultiRecordTransactionalWriteOutcome, ClientError> {
+        self.apply_records(request, None).await
+    }
+
+    pub async fn commit_records(
+        &self,
+        request: MultiRecordTransactionalWrite,
+        effects: tiangz_dbproxy_core::CommitEffects,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, ClientError> {
+        self.apply_records(request, Some(effects)).await
+    }
+
+    async fn apply_records(
+        &self,
+        request: MultiRecordTransactionalWrite,
+        effects: Option<tiangz_dbproxy_core::CommitEffects>,
+    ) -> Result<MultiRecordTransactionalWriteOutcome, ClientError> {
         if request.writes.is_empty() || request.writes.len() > MAX_TRANSACTION_RECORDS {
             return Err(ClientError::InvalidConfig(
                 "multi-record transaction size is outside the protocol limit",
             ));
         }
-        let response = self
-            .call(wire::request_envelope::Body::ApplyMultiTransaction(
+        let is_commit = effects.is_some();
+        let body = if let Some(effects) = effects {
+            if effects.appends.len() > MAX_TRANSACTION_RECORDS
+                || effects.outbox_events.len() > tiangz_dbproxy_protocol::MAX_OUTBOX_EVENTS
+            {
+                return Err(ClientError::InvalidConfig("commit effects exceed limits"));
+            }
+            wire::request_envelope::Body::CommitRecords(wire::CommitRecordsRequest {
+                operation_id: request.operation_id,
+                writes: request.writes.iter().map(Into::into).collect(),
+                result: request.result,
+                appends: effects.appends.iter().map(Into::into).collect(),
+                outbox_events: effects.outbox_events.iter().map(Into::into).collect(),
+            })
+        } else {
+            wire::request_envelope::Body::ApplyMultiTransaction(
                 wire::ApplyMultiTransactionRequest {
                     operation_id: request.operation_id,
                     writes: request.writes.iter().map(Into::into).collect(),
                     result: request.result,
                 },
-            ))
-            .await?;
-        let Some(wire::response_envelope::Body::ApplyMultiTransaction(result)) = response.body
-        else {
-            return Err(ClientError::UnexpectedResponse(
-                "multi-transaction returned another response type",
-            ));
+            )
+        };
+        let response = self.call(body).await?;
+        let result = match response.body {
+            Some(wire::response_envelope::Body::ApplyMultiTransaction(r)) if !is_commit => r,
+            Some(wire::response_envelope::Body::CommitRecords(r)) if is_commit => r,
+            _ => {
+                return Err(ClientError::UnexpectedResponse(
+                    "record commit returned another response type",
+                ));
+            }
         };
         let records = result
             .records
@@ -1433,6 +1527,18 @@ fn is_endpoint_unavailable(error: &ClientError) -> bool {
     )
 }
 
+// Only candidate connection loops use this rule. Business Remote errors never trigger it,
+// local InvalidConfig errors fail immediately, and observations remain Rejected.
+fn is_candidate_handshake_rejection(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Remote(RemoteError {
+            code: wire::ErrorCode::Unauthorized | wire::ErrorCode::ProtocolMismatch,
+            ..
+        }) | ClientError::UnexpectedResponse(_)
+    )
+}
+
 fn request_operation(body: &wire::request_envelope::Body) -> &'static str {
     match body {
         wire::request_envelope::Body::LoadSnapshot(_) => "load_snapshot",
@@ -1448,6 +1554,7 @@ fn request_operation(body: &wire::request_envelope::Body) -> &'static str {
         wire::request_envelope::Body::ApplyTradeTransaction(_) => "apply_trade_transaction",
         wire::request_envelope::Body::LoadTrade(_) => "load_trade",
         wire::request_envelope::Body::LoadTradeTransaction(_) => "load_trade_transaction",
+        wire::request_envelope::Body::CommitRecords(_) => "commit_records",
     }
 }
 
@@ -1495,6 +1602,12 @@ impl Hasher for StableHasher {
 }
 
 #[cfg(test)]
+mod reconnect_tests;
+
+#[cfg(test)]
+mod timing_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1507,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn only_transport_failures_are_failover_candidates() {
+    fn only_transport_failures_are_classified_as_unavailable() {
         assert!(is_endpoint_unavailable(&ClientError::ConnectTimeout));
         assert!(is_endpoint_unavailable(&ClientError::ConnectionClosed));
         assert!(!is_endpoint_unavailable(&ClientError::Remote(

@@ -16,6 +16,17 @@ use tokio::{sync::watch, task::JoinSet};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let args = env::args().collect::<Vec<_>>();
+    if args.get(1).is_some_and(|a| a == "--check-config") {
+        if args.len() != 3 {
+            return Err("usage: --check-config PATH".into());
+        }
+        tiangz_dbproxy_server::config::check_config(&args[2])?;
+        println!(
+            "Configuration structure and capabilities verified; no environment secrets read, no connections opened. Secret availability is checked at startup."
+        );
+        return Ok(());
+    }
     let config_path = config_path_from_args(env::args())?;
     let config = load_config(config_path)?;
     tracing_subscriber::fmt()
@@ -34,9 +45,13 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
         ResolvedStorage::PostgresRedis {
             postgres_url,
             redis_url,
+            cache_redis_url,
             shards,
             cache_fallback_concurrency,
             cache_fallback_timeout_ms,
+            cache_operation_timeout_ms,
+            postgres_connection_wait_timeout_ms,
+            postgres_reconnect_cooldown_ms,
             cache_fallback_circuit_failure_threshold,
             cache_fallback_circuit_cooldown_ms,
             cache_fallback_lock_lease_ms,
@@ -48,12 +63,24 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
             cache_stale_while_revalidate_ms,
         } => {
             let backend = Arc::new(
-                StorageBackend::connect_with_config(
+                StorageBackend::connect_with_outbox(
                     &postgres_url,
                     &redis_url,
+                    &cache_redis_url,
                     StorageBackendConfig {
                         shard_count: shards,
                         tiered: tiangz_dbproxy_storage::TieredSnapshotStoreConfig {
+                            postgres: tiangz_dbproxy_storage::PostgresRequestConfig {
+                                connection_wait_timeout: Duration::from_millis(
+                                    postgres_connection_wait_timeout_ms,
+                                ),
+                                reconnect_cooldown: Duration::from_millis(
+                                    postgres_reconnect_cooldown_ms,
+                                ),
+                            },
+                            cache_operation_timeout: Duration::from_millis(
+                                cache_operation_timeout_ms,
+                            ),
                             fallback: tiangz_dbproxy_storage::CacheFallbackConfig {
                                 max_concurrent: cache_fallback_concurrency,
                                 timeout: Duration::from_millis(cache_fallback_timeout_ms),
@@ -77,6 +104,7 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
                             },
                         },
                     },
+                    &config.outbox_relay,
                 )
                 .await?,
             );
@@ -97,6 +125,7 @@ async fn run_server(
 ) -> Result<(), Box<dyn Error>> {
     let mut server_config = ServerConfig::new(config.listen_addr, config.auth_token.clone());
     server_config.max_frame_bytes = config.max_frame_bytes;
+    server_config.max_connections = config.max_connections;
     server_config.max_payload_bytes = config.max_payload_bytes;
     server_config.handshake_timeout = config.handshake_timeout;
     server_config.shutdown_grace = config.shutdown_grace;
@@ -104,14 +133,21 @@ async fn run_server(
     if durable_backend.is_some() {
         metrics.require_healthy_dependencies();
     }
+    if let Some(backend) = &durable_backend {
+        *metrics
+            .outbox_relay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&backend.outbox_relay_metrics));
+    }
     server_config.metrics = Arc::clone(&metrics);
     let server = DbProxyServer::bind(server_config, server_backend).await?;
     let actual_addr = server.local_addr()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let observability = match config.observability_listen_addr {
         Some(address) => Some(
-            ObservabilityServer::start(
+            ObservabilityServer::start_with_binding_policy(
                 address,
+                config.observability_allow_non_loopback,
                 Arc::clone(&metrics),
                 config.storage.name(),
                 shutdown_rx.clone(),
@@ -188,6 +224,7 @@ async fn run_server(
         storage_backend = config.storage.name(),
         shard_count = config.storage.shards(),
         runtime_worker_threads = config.runtime_worker_threads,
+        max_connections = config.max_connections,
         backlog_worker_count = if matches!(config.storage, ResolvedStorage::PostgresRedis { .. }) {
             config.backlog_workers
         } else {

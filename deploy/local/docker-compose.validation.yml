@@ -1,0 +1,41 @@
+# Explicit local fault validation only. Keep the durable Redis separate from cache.
+services:
+  redis:
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${DBPROXY_REDIS_PASSWORD:?DBPROXY_REDIS_PASSWORD is required}
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+  cache:
+    image: redis:8.8.1-trixie
+    container_name: tiangz-dbproxy-cache
+    restart: "no"
+    mem_limit: 192m
+    environment:
+      REDIS_PASSWORD: ${DBPROXY_REDIS_PASSWORD:?DBPROXY_REDIS_PASSWORD is required}
+    command:
+      - redis-server
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      - --requirepass
+      - ${DBPROXY_REDIS_PASSWORD:?DBPROXY_REDIS_PASSWORD is required}
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "127.0.0.1:6380:6379"
+    tmpfs:
+      - /data:size=32m
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12

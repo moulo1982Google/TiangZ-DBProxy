@@ -20,7 +20,8 @@ use tiangz_dbproxy_core::{
     TransactionStore, TransactionalRecordWrite, TransactionalWrite, TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_protocol::{
-    DEFAULT_MAX_FRAME_BYTES, PROTOCOL_FINGERPRINT, read_message, wire, write_message,
+    DEFAULT_MAX_FRAME_BYTES, LEGACY_PROTOCOL_FINGERPRINT_V2, PROTOCOL_FINGERPRINT,
+    PROTOCOL_VERSION, read_message, wire, write_message,
 };
 use tiangz_dbproxy_server::{BackendError, DbProxyBackend, DbProxyServer, ServerConfig};
 use tokio::{net::TcpStream, sync::Mutex, sync::watch, task::JoinHandle};
@@ -433,6 +434,299 @@ async fn protocol_fingerprint_mismatch_is_rejected_before_rpc() {
         wire::ErrorCode::try_from(hello.error.unwrap().code).unwrap(),
         wire::ErrorCode::ProtocolMismatch
     );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn legacy_line_ending_fingerprint_is_accepted_and_echoed() {
+    const TOKEN: &str = "network-test-token-1234";
+    let server = TestServer::start(TOKEN).await;
+    for fingerprint in [
+        LEGACY_PROTOCOL_FINGERPRINT_V2,
+        tiangz_dbproxy_protocol::PRE_COMMIT_PROTOCOL_FINGERPRINT_V2,
+        tiangz_dbproxy_protocol::PRE_RELAY_PROTOCOL_FINGERPRINT_V2,
+    ] {
+        let mut stream = TcpStream::connect(&server.endpoint).await.unwrap();
+        write_message(
+            &mut stream,
+            &wire::ClientFrame {
+                body: Some(wire::client_frame::Body::Hello(wire::ClientHello {
+                    protocol_version: PROTOCOL_VERSION,
+                    protocol_fingerprint: fingerprint.to_string(),
+                    auth_token: TOKEN.to_string(),
+                    client_name: "legacy-line-ending-client".to_string(),
+                })),
+            },
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        let response = read_message::<_, wire::ServerFrame>(&mut stream, DEFAULT_MAX_FRAME_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(wire::server_frame::Body::Hello(hello)) = response.body else {
+            panic!("expected handshake response");
+        };
+        assert!(hello.accepted);
+        assert_eq!(hello.protocol_fingerprint, fingerprint);
+        // Exercise an unchanged RPC after the handshake, as pinned SDKs do.
+        write_message(
+            &mut stream,
+            &wire::ClientFrame {
+                body: Some(wire::client_frame::Body::Request(wire::RequestEnvelope {
+                    rpc_id: 1,
+                    body: Some(wire::request_envelope::Body::LoadSnapshot(
+                        wire::LoadSnapshotRequest {
+                            record: Some(wire::RecordKey {
+                                namespace: "document".into(),
+                                key: "legacy".into(),
+                            }),
+                        },
+                    )),
+                })),
+            },
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        let frame = read_message::<_, wire::ServerFrame>(&mut stream, DEFAULT_MAX_FRAME_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(wire::server_frame::Body::Response(response)) = frame.body else {
+            panic!("expected RPC response")
+        };
+        assert!(response.error.is_none());
+        assert!(matches!(
+            response.body,
+            Some(wire::response_envelope::Body::LoadSnapshot(_))
+        ));
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn generic_commit_is_atomic_idempotent_and_preserves_newer_snapshots() {
+    use tiangz_dbproxy_core::{AppendRecord, CommitEffects};
+    const TOKEN: &str = "generic-commit-test-token";
+    let server = TestServer::start_with_backend(
+        TOKEN,
+        Arc::new(tiangz_dbproxy_server::MemoryBackend::new(4).unwrap()),
+    )
+    .await;
+    let client =
+        DbProxyClient::connect(ClientConfig::new(&server.endpoint, TOKEN, "generic-commit"))
+            .await
+            .unwrap();
+    let writes = ["left", "right"]
+        .into_iter()
+        .map(|key| TransactionalRecordWrite {
+            record: RecordKey::new("document", key).unwrap(),
+            schema: "document.v1".into(),
+            schema_version: 1,
+            expected_revision: Revision::ZERO,
+            payload: b"new".to_vec(),
+            updated_at_unix_ms: 1,
+        })
+        .collect::<Vec<_>>();
+    let request = MultiRecordTransactionalWrite {
+        operation_id: "commit-1".into(),
+        writes,
+        result: b"receipt".to_vec(),
+    };
+    let effects = CommitEffects {
+        appends: vec![AppendRecord {
+            record: RecordKey::new("audit", "fact-1").unwrap(),
+            schema: "opaque".into(),
+            schema_version: 1,
+            payload: b"fact".to_vec(),
+            occurred_at_unix_ms: 1,
+        }],
+        outbox_events: vec![OutboxEvent {
+            event_id: "event-1".into(),
+            topic: "document.changed".into(),
+            partition_key: "left".into(),
+            payload: b"event".to_vec(),
+            occurred_at_unix_ms: 1,
+        }],
+    };
+    let mut stale = request.clone();
+    stale.writes[1].expected_revision = Revision(9);
+    assert!(client.commit_records(stale, effects.clone()).await.is_err());
+    assert!(
+        client
+            .load(&request.writes[0].record)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        client
+            .commit_records(request.clone(), effects.clone())
+            .await
+            .unwrap(),
+        MultiRecordTransactionalWriteOutcome::Applied { .. }
+    ));
+    let mut tampered = effects.clone();
+    tampered.appends[0].payload.push(9);
+    assert!(
+        client
+            .commit_records(request.clone(), tampered)
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .apply_multi_transaction(request.clone())
+            .await
+            .is_err()
+    );
+    let mut colliding = request.clone();
+    colliding.operation_id = "commit-2".into();
+    for write in &mut colliding.writes {
+        write.expected_revision = Revision(1);
+    }
+    assert!(
+        client
+            .commit_records(colliding.clone(), effects.clone())
+            .await
+            .is_err()
+    );
+    let event_only = CommitEffects {
+        appends: vec![],
+        outbox_events: effects.outbox_events.clone(),
+    };
+    assert!(client.commit_records(colliding, event_only).await.is_err());
+    assert_eq!(
+        client
+            .load(&request.writes[0].record)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        Revision(1)
+    );
+    client
+        .save(SnapshotWrite {
+            request_id: "later".into(),
+            record: request.writes[0].record.clone(),
+            schema: "document.v1".into(),
+            schema_version: 1,
+            expected_revision: Some(Revision(1)),
+            payload: b"later".to_vec(),
+            updated_at_unix_ms: 2,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        client
+            .commit_records(request.clone(), effects)
+            .await
+            .unwrap(),
+        MultiRecordTransactionalWriteOutcome::Duplicate { .. }
+    ));
+    assert_eq!(
+        client
+            .load(&request.writes[0].record)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"later"
+    );
+    assert_eq!(
+        client
+            .load_multi_transaction(
+                &request.operation_id,
+                &request
+                    .writes
+                    .iter()
+                    .map(|w| w.record.clone())
+                    .collect::<Vec<_>>()
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .result,
+        b"receipt"
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn generic_envelope_crosses_the_real_wire_without_changing_snapshot_semantics() {
+    use tiangz_dbproxy_core::{CommitEffects, EventEnvelope};
+    let server = TestServer::start_with_backend(
+        "relay-test-token",
+        Arc::new(tiangz_dbproxy_server::MemoryBackend::new(2).unwrap()),
+    )
+    .await;
+    let client = DbProxyClient::connect(ClientConfig::new(
+        &server.endpoint,
+        "relay-test-token",
+        "relay-test",
+    ))
+    .await
+    .unwrap();
+    let event = EventEnvelope {
+        event_id: "document-event".into(),
+        producer: "game".into(),
+        event_type: "DocumentChanged".into(),
+        aggregate_type: "document".into(),
+        aggregate_id: "document-1".into(),
+        partition_key: "document-1".into(),
+        schema_version: 1,
+        content_type: "application/octet-stream".into(),
+        payload: vec![0, 255],
+        occurred_at_unix_ms: 1,
+        route_version: 1,
+    }
+    .into_outbox()
+    .unwrap();
+    let request = MultiRecordTransactionalWrite {
+        operation_id: "relay-operation".into(),
+        writes: vec![TransactionalRecordWrite {
+            record: RecordKey::new("document", "1").unwrap(),
+            schema: "document".into(),
+            schema_version: 1,
+            expected_revision: Revision::ZERO,
+            payload: vec![9],
+            updated_at_unix_ms: 1,
+        }],
+        result: vec![8],
+    };
+    let effects = CommitEffects {
+        appends: vec![],
+        outbox_events: vec![event],
+    };
+    assert!(matches!(
+        client
+            .commit_records(request.clone(), effects.clone())
+            .await
+            .unwrap(),
+        MultiRecordTransactionalWriteOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        client
+            .commit_records(request.clone(), effects.clone())
+            .await
+            .unwrap(),
+        MultiRecordTransactionalWriteOutcome::Duplicate { .. }
+    ));
+    let mut bad = effects;
+    bad.outbox_events[0].payload = vec![0];
+    assert!(client.commit_records(request.clone(), bad).await.is_err());
+    assert_eq!(
+        client
+            .load(&request.writes[0].record)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        Revision(1)
+    );
+    drop(client);
     server.stop().await;
 }
 

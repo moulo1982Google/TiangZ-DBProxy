@@ -9,20 +9,24 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod commit;
 mod flush;
 mod multi_transaction;
+mod relay;
 mod trade;
 mod transaction;
 
+pub use commit::{AppendRecord, CommitEffects, OutboxEvent};
 pub use flush::{SnapshotFlushError, SnapshotFlushQueue, SnapshotFlushReport};
 pub use multi_transaction::{
     AsyncMultiRecordTransactionStore, InMemoryMultiRecordTransactionStore,
     MultiRecordTransactionReceipt, MultiRecordTransactionalWrite,
     MultiRecordTransactionalWriteOutcome, TransactionRecordReceipt, TransactionalRecordWrite,
 };
+pub use relay::{EventEnvelope, RELAY_TOPIC_PREFIX};
 pub use trade::{
-    AsyncTradeStore, LedgerPosting, OutboxEvent, TradeEnvelope, TradeReceipt, TradeState,
-    TradeTransaction, TradeTransactionOutcome, TradeTransition, normalize_trade_transaction,
+    AsyncTradeStore, LedgerPosting, TradeEnvelope, TradeReceipt, TradeState, TradeTransaction,
+    TradeTransactionOutcome, TradeTransition, normalize_trade_transaction,
 };
 pub use transaction::{
     AsyncTransactionalStore, InMemoryTransactionalStore, TransactionReceipt, TransactionStore,
@@ -103,6 +107,8 @@ pub enum SnapshotWriteOutcome {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum StoreError {
+    #[error("append record already exists: {record:?}")]
+    AppendRecordConflict { record: RecordKey },
     #[error("invalid record key: {0}")]
     InvalidKey(&'static str),
     #[error("idempotency request is empty")]

@@ -17,7 +17,9 @@ use tiangz_dbproxy_storage::{
     DEFAULT_CACHE_FALLBACK_CONCURRENCY, DEFAULT_CACHE_FALLBACK_LOCK_LEASE_MS,
     DEFAULT_CACHE_FALLBACK_LOCK_POLL_MS, DEFAULT_CACHE_FALLBACK_LOCK_WAIT_MS,
     DEFAULT_CACHE_FALLBACK_TIMEOUT_MS, DEFAULT_CACHE_NEGATIVE_TTL_MS,
-    DEFAULT_CACHE_STALE_WHILE_REVALIDATE_MS, DEFAULT_CACHE_TTL_JITTER_MS, DEFAULT_CACHE_TTL_MS,
+    DEFAULT_CACHE_OPERATION_TIMEOUT_MS, DEFAULT_CACHE_STALE_WHILE_REVALIDATE_MS,
+    DEFAULT_CACHE_TTL_JITTER_MS, DEFAULT_CACHE_TTL_MS, DEFAULT_POSTGRES_CONNECTION_WAIT_TIMEOUT_MS,
+    DEFAULT_POSTGRES_RECONNECT_COOLDOWN_MS,
 };
 
 const DEFAULT_CONFIG_PATH: &str = "configs/local.json";
@@ -38,6 +40,8 @@ pub struct DbProxyConfig {
     pub cache_repair: RetryQueueSection,
     #[serde(default)]
     pub outbox: RetryQueueSection,
+    #[serde(default)]
+    pub outbox_relay: crate::relay_config::OutboxRelaySection,
     #[serde(default)]
     pub logging: LoggingSection,
     #[serde(default)]
@@ -68,6 +72,8 @@ pub struct ServerSection {
     pub max_frame_bytes: usize,
     #[serde(default = "default_max_payload_bytes")]
     pub max_payload_bytes: usize,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
     #[serde(default = "default_handshake_timeout_ms")]
     pub handshake_timeout_ms: u64,
     #[serde(default = "default_shutdown_grace_ms")]
@@ -82,6 +88,8 @@ pub enum StorageSection {
         postgres_url_env: String,
         #[serde(rename = "redisUrlEnv")]
         redis_url_env: String,
+        #[serde(rename = "cacheRedisUrlEnv")]
+        cache_redis_url_env: Option<String>,
         #[serde(default = "default_storage_shards")]
         shards: usize,
         #[serde(
@@ -94,6 +102,21 @@ pub enum StorageSection {
             default = "default_cache_fallback_timeout_ms"
         )]
         cache_fallback_timeout_ms: u64,
+        #[serde(
+            rename = "cacheOperationTimeoutMs",
+            default = "default_cache_operation_timeout_ms"
+        )]
+        cache_operation_timeout_ms: u64,
+        #[serde(
+            rename = "postgresConnectionWaitTimeoutMs",
+            default = "default_postgres_connection_wait_timeout_ms"
+        )]
+        postgres_connection_wait_timeout_ms: u64,
+        #[serde(
+            rename = "postgresReconnectCooldownMs",
+            default = "default_postgres_reconnect_cooldown_ms"
+        )]
+        postgres_reconnect_cooldown_ms: u64,
         #[serde(
             rename = "cacheFallbackCircuitFailureThreshold",
             default = "default_cache_fallback_circuit_failure_threshold"
@@ -210,6 +233,9 @@ pub struct ObservabilitySection {
     /// Omission disables HTTP probes; production deployments must bind an internal address explicitly.
     #[serde(default)]
     pub listen_addr: Option<SocketAddr>,
+    /// Explicit opt-in for a protected management interface or container scrape binding.
+    #[serde(default)]
+    pub allow_non_loopback: bool,
 }
 
 impl Default for LoggingSection {
@@ -230,6 +256,7 @@ pub struct ResolvedDbProxyConfig {
     pub auth_token: String,
     pub max_frame_bytes: usize,
     pub max_payload_bytes: usize,
+    pub max_connections: usize,
     pub handshake_timeout: Duration,
     pub shutdown_grace: Duration,
     pub runtime_worker_threads: usize,
@@ -240,8 +267,10 @@ pub struct ResolvedDbProxyConfig {
     pub backlog_failure_delay: Duration,
     pub cache_repair: ResolvedRetryQueue,
     pub outbox: ResolvedRetryQueue,
+    pub outbox_relay: crate::relay_config::ResolvedOutboxRelay,
     pub log_filter: String,
     pub observability_listen_addr: Option<SocketAddr>,
+    pub observability_allow_non_loopback: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -259,9 +288,13 @@ pub enum ResolvedStorage {
     PostgresRedis {
         postgres_url: String,
         redis_url: String,
+        cache_redis_url: String,
         shards: usize,
         cache_fallback_concurrency: usize,
         cache_fallback_timeout_ms: u64,
+        cache_operation_timeout_ms: u64,
+        postgres_connection_wait_timeout_ms: u64,
+        postgres_reconnect_cooldown_ms: u64,
         cache_fallback_circuit_failure_threshold: u32,
         cache_fallback_circuit_cooldown_ms: u64,
         cache_fallback_lock_lease_ms: u64,
@@ -301,6 +334,7 @@ impl fmt::Debug for ResolvedDbProxyConfig {
             .field("auth_token", &"[REDACTED]")
             .field("max_frame_bytes", &self.max_frame_bytes)
             .field("max_payload_bytes", &self.max_payload_bytes)
+            .field("max_connections", &self.max_connections)
             .field("runtime_worker_threads", &self.runtime_worker_threads)
             .field("storage_backend", &self.storage.name())
             .field("storage_shards", &self.storage.shards())
@@ -313,7 +347,7 @@ impl fmt::Debug for ResolvedDbProxyConfig {
 }
 
 #[derive(Debug)]
-pub struct ConfigError(String);
+pub struct ConfigError(pub(crate) String);
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -352,6 +386,25 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<ResolvedDbProxyConfig, Conf
     load_config_with(path, |name| env::var(name).ok())
 }
 
+/// 离线预检不读取环境密钥或联网；实际密钥可用性仍由正式启动检查。
+/// Offline preflight uses placeholders without reading secrets or networking.
+pub fn check_config(path: impl AsRef<Path>) -> Result<(), ConfigError> {
+    let path = path.as_ref();
+    let text =
+        fs::read_to_string(path).map_err(|_| ConfigError("cannot read configuration".into()))?;
+    let config: DbProxyConfig =
+        serde_json::from_str(&text).map_err(|e| ConfigError(format!("invalid config: {e}")))?;
+    let filter = config.logging.filter_env.clone();
+    config.resolve(path, |name| {
+        if name == filter {
+            None
+        } else {
+            Some("redis://config-check.invalid/0".into())
+        }
+    })?;
+    Ok(())
+}
+
 fn load_config_with(
     path: impl AsRef<Path>,
     environment: impl Fn(&str) -> Option<String>,
@@ -381,6 +434,15 @@ impl DbProxyConfig {
             )));
         }
         require_positive("server.maxFrameBytes", self.server.max_frame_bytes)?;
+        if let Some(address) = self.observability.listen_addr {
+            crate::observability::validate_binding(address, self.observability.allow_non_loopback)
+                .map_err(|error| ConfigError(error.to_string()))?;
+        }
+        if !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.server.max_connections) {
+            return Err(ConfigError(
+                "server.maxConnections is outside the supported range".into(),
+            ));
+        }
         require_positive("server.maxPayloadBytes", self.server.max_payload_bytes)?;
         if self.server.max_payload_bytes > self.server.max_frame_bytes {
             return Err(ConfigError(
@@ -399,15 +461,20 @@ impl DbProxyConfig {
         require_positive("backlog.failureDelayMs", self.backlog.failure_delay_ms)?;
         let cache_repair = resolve_retry_queue("cacheRepair", self.cache_repair)?;
         let outbox = resolve_retry_queue("outbox", self.outbox)?;
+        let outbox_relay = self.outbox_relay.resolve(outbox.lease_ms, &environment)?;
 
         let auth_token = required_environment(&environment, &self.server.auth_token_env)?;
         let storage = match self.storage {
             StorageSection::PostgresRedis {
                 postgres_url_env,
                 redis_url_env,
+                cache_redis_url_env,
                 shards,
                 cache_fallback_concurrency,
                 cache_fallback_timeout_ms,
+                cache_operation_timeout_ms,
+                postgres_connection_wait_timeout_ms,
+                postgres_reconnect_cooldown_ms,
                 cache_fallback_circuit_failure_threshold,
                 cache_fallback_circuit_cooldown_ms,
                 cache_fallback_lock_lease_ms,
@@ -424,6 +491,18 @@ impl DbProxyConfig {
                     cache_fallback_concurrency,
                 )?;
                 require_positive("storage.cacheFallbackTimeoutMs", cache_fallback_timeout_ms)?;
+                require_positive(
+                    "storage.postgresConnectionWaitTimeoutMs",
+                    postgres_connection_wait_timeout_ms,
+                )?;
+                require_positive(
+                    "storage.postgresReconnectCooldownMs",
+                    postgres_reconnect_cooldown_ms,
+                )?;
+                require_positive(
+                    "storage.cacheOperationTimeoutMs",
+                    cache_operation_timeout_ms,
+                )?;
                 require_positive(
                     "storage.cacheFallbackCircuitFailureThreshold",
                     cache_fallback_circuit_failure_threshold,
@@ -445,12 +524,21 @@ impl DbProxyConfig {
                     cache_fallback_lock_poll_ms,
                 )?;
                 require_positive("storage.cacheTtlMs", cache_ttl_ms)?;
+                let redis_url = required_environment(&environment, &redis_url_env)?;
+                let cache_redis_url = match cache_redis_url_env {
+                    Some(name) => required_environment(&environment, &name)?,
+                    None => redis_url.clone(),
+                };
                 ResolvedStorage::PostgresRedis {
                     postgres_url: required_environment(&environment, &postgres_url_env)?,
-                    redis_url: required_environment(&environment, &redis_url_env)?,
+                    redis_url,
+                    cache_redis_url,
                     shards,
                     cache_fallback_concurrency,
                     cache_fallback_timeout_ms,
+                    cache_operation_timeout_ms,
+                    postgres_connection_wait_timeout_ms,
+                    postgres_reconnect_cooldown_ms,
                     cache_fallback_circuit_failure_threshold,
                     cache_fallback_circuit_cooldown_ms,
                     cache_fallback_lock_lease_ms,
@@ -468,6 +556,13 @@ impl DbProxyConfig {
             }
         };
         validate_environment_name(&self.logging.filter_env)?;
+        if matches!(storage, ResolvedStorage::Memory { .. })
+            && (!outbox_relay.routes.is_empty() || !outbox_relay.publishers.is_empty())
+        {
+            return Err(ConfigError(
+                "memory backend cannot activate outbox publishers or sources".into(),
+            ));
+        }
         let log_filter = environment(&self.logging.filter_env)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(self.logging.default_filter);
@@ -483,6 +578,7 @@ impl DbProxyConfig {
             auth_token,
             max_frame_bytes: self.server.max_frame_bytes,
             max_payload_bytes: self.server.max_payload_bytes,
+            max_connections: self.server.max_connections,
             handshake_timeout: Duration::from_millis(self.server.handshake_timeout_ms),
             shutdown_grace: Duration::from_millis(self.server.shutdown_grace_ms),
             runtime_worker_threads: self.runtime.worker_threads,
@@ -493,13 +589,19 @@ impl DbProxyConfig {
             backlog_failure_delay: Duration::from_millis(self.backlog.failure_delay_ms),
             cache_repair,
             outbox,
+            outbox_relay,
             log_filter,
             observability_listen_addr: self.observability.listen_addr,
+            observability_allow_non_loopback: self.observability.allow_non_loopback,
         })
     }
 }
 
-fn required_environment(
+fn default_max_connections() -> usize {
+    crate::DEFAULT_MAX_CONNECTIONS
+}
+
+pub(crate) fn required_environment(
     environment: &impl Fn(&str) -> Option<String>,
     name: &str,
 ) -> Result<String, ConfigError> {
@@ -513,7 +615,7 @@ fn required_environment(
         })
 }
 
-fn validate_environment_name(name: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_environment_name(name: &str) -> Result<(), ConfigError> {
     let mut characters = name.chars();
     let valid_first = characters
         .next()
@@ -554,6 +656,15 @@ const fn default_storage_shards() -> usize {
 }
 const fn default_cache_fallback_concurrency() -> usize {
     DEFAULT_CACHE_FALLBACK_CONCURRENCY
+}
+const fn default_postgres_connection_wait_timeout_ms() -> u64 {
+    DEFAULT_POSTGRES_CONNECTION_WAIT_TIMEOUT_MS
+}
+const fn default_postgres_reconnect_cooldown_ms() -> u64 {
+    DEFAULT_POSTGRES_RECONNECT_COOLDOWN_MS
+}
+const fn default_cache_operation_timeout_ms() -> u64 {
+    DEFAULT_CACHE_OPERATION_TIMEOUT_MS
 }
 const fn default_cache_fallback_timeout_ms() -> u64 {
     DEFAULT_CACHE_FALLBACK_TIMEOUT_MS
@@ -664,13 +775,82 @@ mod tests {
     };
 
     fn write_config(content: &str) -> PathBuf {
+        // Windows 时钟可能让并行测试取得相同时间戳，不能单独用时间作为文件身份。
+        // Parallel tests can observe identical Windows timestamps; add process-local identity.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = env::temp_dir().join(format!("tiangz-dbproxy-config-{suffix}.json"));
+        let path = env::temp_dir().join(format!(
+            "tiangz-dbproxy-config-{}-{suffix}-{sequence}.json",
+            std::process::id()
+        ));
         fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn connection_limit_defaults_and_rejects_invalid_values_before_secrets() {
+        for (limit, expected) in [
+            (None, Some(crate::DEFAULT_MAX_CONNECTIONS)),
+            (Some(7), Some(7)),
+            (Some(0), None),
+            (Some(usize::MAX), None),
+        ] {
+            let mut value = serde_json::json!({"configVersion":1,"server":{"listenAddr":"127.0.0.1:0","authTokenEnv":"AUTH"},"storage":{"backend":"memory","shards":1}});
+            if let Some(limit) = limit {
+                value["server"]["maxConnections"] = limit.into();
+            }
+            let path = write_config(&value.to_string());
+            let result = load_config_with(&path, |_| {
+                assert!(
+                    expected.is_some(),
+                    "invalid limit must fail before reading secrets"
+                );
+                Some("0123456789abcdef".into())
+            });
+            fs::remove_file(path).unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(result.unwrap().max_connections, expected);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("maxConnections"));
+            }
+        }
+    }
+
+    #[test]
+    fn observability_binding_policy_is_checked_before_secrets_or_connections() {
+        for (address, opt_in, allowed) in [
+            ("127.0.0.1:9090", false, true),
+            ("[::1]:9090", false, true),
+            ("[::ffff:127.0.0.1]:9090", false, true),
+            ("0.0.0.0:9090", false, false),
+            ("[::]:9090", false, false),
+            ("10.1.2.3:9090", false, false),
+            ("0.0.0.0:9090", true, true),
+            ("[::]:9090", true, true),
+            ("10.1.2.3:9090", true, true),
+            ("[fd00::1]:9090", true, true),
+            ("8.8.8.8:9090", true, false),
+            ("224.0.0.1:9090", true, false),
+            ("[::ffff:8.8.8.8]:9090", true, false),
+            ("[2606:4700::1111]:9090", true, false),
+        ] {
+            let value = serde_json::json!({"configVersion":1,"server":{"listenAddr":"127.0.0.1:0","authTokenEnv":"AUTH"},"storage":{"backend":"memory","shards":1},"observability":{"listenAddr":address,"allowNonLoopback":opt_in}});
+            let path = write_config(&value.to_string());
+            let result = load_config_with(&path, |_| {
+                assert!(allowed, "unsafe binding must fail before reading secrets");
+                Some("0123456789abcdef".into())
+            });
+            fs::remove_file(path).unwrap();
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "{address}, opt_in={opt_in}: {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -703,8 +883,11 @@ mod tests {
         assert_eq!(config.log_filter, "info");
         match &config.storage {
             ResolvedStorage::PostgresRedis {
+                redis_url,
+                cache_redis_url,
                 cache_fallback_concurrency,
                 cache_fallback_timeout_ms,
+                cache_operation_timeout_ms,
                 cache_fallback_circuit_failure_threshold,
                 cache_fallback_circuit_cooldown_ms,
                 cache_fallback_lock_lease_ms,
@@ -716,6 +899,11 @@ mod tests {
                 cache_stale_while_revalidate_ms,
                 ..
             } => {
+                assert_eq!(cache_redis_url, redis_url);
+                assert_eq!(
+                    *cache_operation_timeout_ms,
+                    DEFAULT_CACHE_OPERATION_TIMEOUT_MS
+                );
                 assert_eq!(
                     *cache_fallback_concurrency,
                     DEFAULT_CACHE_FALLBACK_CONCURRENCY
@@ -757,6 +945,43 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("postgres://secret"));
         assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn resolves_an_independent_snapshot_cache_redis() {
+        let path = write_config(
+            r#"{
+          "configVersion": 1,
+          "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" },
+          "storage": {
+            "backend": "postgresRedis",
+            "postgresUrlEnv": "PG",
+            "redisUrlEnv": "REDIS",
+            "cacheRedisUrlEnv": "CACHE_REDIS"
+          }
+        }"#,
+        );
+        let values = HashMap::from([
+            ("AUTH", "0123456789abcdef"),
+            ("PG", "postgres://secret"),
+            ("REDIS", "redis://durable"),
+            ("CACHE_REDIS", "redis://cache"),
+        ]);
+        let config =
+            load_config_with(&path, |name| values.get(name).map(ToString::to_string)).unwrap();
+        fs::remove_file(path).unwrap();
+
+        match config.storage {
+            ResolvedStorage::PostgresRedis {
+                redis_url,
+                cache_redis_url,
+                ..
+            } => {
+                assert_eq!(redis_url, "redis://durable");
+                assert_eq!(cache_redis_url, "redis://cache");
+            }
+            ResolvedStorage::Memory { .. } => panic!("expected postgresRedis storage"),
+        }
     }
 
     #[test]
@@ -1048,6 +1273,93 @@ mod tests {
                 assert_eq!(cache_stale_while_revalidate_ms, 0);
             }
             ResolvedStorage::Memory { .. } => panic!("expected postgresRedis storage"),
+        }
+    }
+
+    #[test]
+    fn cache_operation_budget_is_independent_and_rejects_zero() {
+        for millis in [0, 75] {
+            let path = write_config(&format!(
+                r#"{{
+                "configVersion":1,
+                "server":{{"listenAddr":"127.0.0.1:7800","authTokenEnv":"AUTH"}},
+                "storage":{{"backend":"postgresRedis","postgresUrlEnv":"PG","redisUrlEnv":"REDIS",
+                    "cacheOperationTimeoutMs":{millis},"cacheFallbackTimeoutMs":4321}}
+            }}"#
+            ));
+            let result = load_config_with(&path, |_| Some("0123456789abcdef".into()));
+            fs::remove_file(path).unwrap();
+            if millis == 0 {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("storage.cacheOperationTimeoutMs must be greater than zero")
+                );
+            } else {
+                let ResolvedStorage::PostgresRedis {
+                    cache_operation_timeout_ms,
+                    cache_fallback_timeout_ms,
+                    ..
+                } = result.unwrap().storage
+                else {
+                    panic!("wrong backend")
+                };
+                assert_eq!(cache_operation_timeout_ms, 75);
+                assert_eq!(cache_fallback_timeout_ms, 4321);
+            }
+        }
+    }
+
+    #[test]
+    fn postgres_request_budgets_have_defaults_and_validate_independent_overrides() {
+        for (extra, expected) in [
+            ("", Some((2000, 500))),
+            (
+                ",\"postgresConnectionWaitTimeoutMs\":75,\"postgresReconnectCooldownMs\":125",
+                Some((75, 125)),
+            ),
+            (",\"postgresConnectionWaitTimeoutMs\":0", None),
+            (",\"postgresReconnectCooldownMs\":0", None),
+        ] {
+            let path = write_config(&format!(
+                r#"{{"configVersion":1,
+                "server":{{"listenAddr":"127.0.0.1:7800","authTokenEnv":"AUTH"}},
+                "storage":{{"backend":"postgresRedis","postgresUrlEnv":"PG","redisUrlEnv":"REDIS",
+                    "cacheOperationTimeoutMs":20,"cacheFallbackTimeoutMs":4321{extra}}}}}"#
+            ));
+            let result = load_config_with(&path, |_| Some("0123456789abcdef".into()));
+            fs::remove_file(path).unwrap();
+            if let Some((queue, cooldown)) = expected {
+                let ResolvedStorage::PostgresRedis {
+                    postgres_connection_wait_timeout_ms,
+                    postgres_reconnect_cooldown_ms,
+                    cache_operation_timeout_ms,
+                    cache_fallback_timeout_ms,
+                    ..
+                } = result.unwrap().storage
+                else {
+                    panic!("wrong backend")
+                };
+                assert_eq!(
+                    (
+                        postgres_connection_wait_timeout_ms,
+                        postgres_reconnect_cooldown_ms
+                    ),
+                    (queue, cooldown)
+                );
+                assert_eq!(
+                    (cache_operation_timeout_ms, cache_fallback_timeout_ms),
+                    (20, 4321)
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("storage.postgres")
+                        && error.contains("must be greater than zero"),
+                    "{error}"
+                );
+            }
         }
     }
 

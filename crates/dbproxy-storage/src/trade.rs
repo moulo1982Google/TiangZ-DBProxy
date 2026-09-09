@@ -221,7 +221,8 @@ impl AsyncTradeStore for PostgresSnapshotStore {
         if trade_id.trim().is_empty() {
             return Err(StoreError::EmptyTradeId.into());
         }
-        let mut client = self.client.lock().await;
+        let mut client = self.request_client().await?;
+        let _postgres_timer = self.metrics.latency.start(super::Stage::PostgresOperation);
         client.ensure_connected().await?;
         let row = client
             .query_opt(
@@ -255,7 +256,8 @@ impl AsyncTradeStore for PostgresSnapshotStore {
         if trade_id.trim().is_empty() {
             return Err(StoreError::EmptyTradeId.into());
         }
-        let mut client = self.client.lock().await;
+        let mut client = self.request_client().await?;
+        let _postgres_timer = self.metrics.latency.start(super::Stage::PostgresOperation);
         client.ensure_connected().await?;
         let Some((header, records, ledger, outbox)) =
             load_receipt_parts(client.as_client(), operation_id).await?
@@ -302,7 +304,8 @@ impl AsyncTradeStore for PostgresSnapshotStore {
         let updated_at = i64::try_from(request.transition.updated_at_unix_ms)
             .map_err(|_| StorageError::TradeProtocol("trade timestamp is too large".to_string()))?;
 
-        let mut client = self.client.lock().await;
+        let mut client = self.request_client().await?;
+        let _postgres_timer = self.metrics.latency.start(super::Stage::PostgresOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         claim_operation(&transaction, &operation_id, "trade").await?;

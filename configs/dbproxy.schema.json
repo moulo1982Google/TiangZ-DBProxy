@@ -38,6 +38,7 @@
         "authTokenEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "认证令牌所在的环境变量名。" },
         "maxFrameBytes": { "type": "integer", "minimum": 1, "default": 8388608 },
         "maxPayloadBytes": { "type": "integer", "minimum": 1, "default": 1048576 },
+        "maxConnections": { "type": "integer", "minimum": 1, "default": 256, "description": "每个实例的 TCP 连接上限，包含尚未完成握手的连接；超限立即关闭。" },
         "handshakeTimeoutMs": { "type": "integer", "minimum": 1, "default": 5000 },
         "shutdownGraceMs": { "type": "integer", "minimum": 1, "default": 5000 }
       }
@@ -51,10 +52,14 @@
           "properties": {
             "backend": { "const": "postgresRedis" },
             "postgresUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-            "redisUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+            "redisUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "Redis URL for the AOF-backed snapshot backlog and Outbox stream." },
+            "cacheRedisUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "Optional independent snapshot-cache Redis URL. When omitted, redisUrlEnv is reused for backward compatibility." },
             "shards": { "type": "integer", "minimum": 1, "default": 4 },
             "cacheFallbackConcurrency": { "type": "integer", "minimum": 1, "default": 16 },
             "cacheFallbackTimeoutMs": { "type": "integer", "minimum": 1, "default": 2000 },
+            "cacheOperationTimeoutMs": { "type": "integer", "minimum": 1, "default": 200 },
+            "postgresConnectionWaitTimeoutMs": { "type": "integer", "minimum": 1, "default": 2000 },
+            "postgresReconnectCooldownMs": { "type": "integer", "minimum": 1, "default": 500 },
             "cacheFallbackCircuitFailureThreshold": { "type": "integer", "minimum": 1, "default": 5 },
             "cacheFallbackCircuitCooldownMs": { "type": "integer", "minimum": 1, "default": 5000 },
             "cacheFallbackLockLeaseMs": { "type": "integer", "minimum": 1, "default": 3000 },
@@ -95,6 +100,39 @@
       "$ref": "#/$defs/retryQueue",
       "description": "PostgreSQL事务Outbox worker；事件至少一次发布到Redis Streams。"
     },
+    "outboxRelay": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "publishTimeoutMs": { "type": "integer", "minimum": 3000, "maximum": 60000, "default": 5000, "description": "必须比 outbox.leaseMs 至少少 1000ms。" },
+        "defaultPublisher": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+        "publishers": {
+          "type": "array", "maxItems": 32,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["id", "backend", "connectionEnv"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$", "description": "legacy 为保留 ID；更换目标集群必须更换 ID。" },
+              "backend": { "enum": ["redisStream", "kafka", "rabbitMq"] },
+              "connectionEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+              "enabled": { "type": "boolean", "default": true }
+            },
+            "allOf": [{ "if": { "properties": { "backend": { "enum": ["kafka", "rabbitMq"] } } }, "then": { "required": ["enabled"], "properties": { "enabled": { "const": false } } } }]
+          }
+        },
+        "sources": {
+          "type": "array", "maxItems": 64,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["producer", "version", "destination"],
+            "properties": {
+              "producer": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+              "enabled": { "type": "boolean", "default": true, "description": "未来 MQ 的来源可以先声明为 false，不注册路由、不启用投递。" },
+              "version": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+              "publisher": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+              "destination": { "type": "string", "minLength": 1, "maxLength": 256, "description": "完整 Stream 地址；dbproxy:outbox: 前缀保留给旧消息。" }
+            }
+          }
+        }
+      }
+    },
     "logging": {
       "type": "object",
       "additionalProperties": false,
@@ -107,7 +145,8 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "listenAddr": { "type": "string", "description": "Prometheus与健康探针HTTP监听地址；必须仅暴露在本机或运维内网。" }
+        "listenAddr": { "type": "string", "description": "Prometheus与健康探针HTTP监听地址；默认仅允许 loopback，必须仅暴露在本机或运维内网。" },
+        "allowNonLoopback": { "type": "boolean", "default": false, "description": "显式允许私网或通配绑定；须通过防火墙/容器网络限制运维访问，不允许直接公网地址。" }
       }
     }
   }

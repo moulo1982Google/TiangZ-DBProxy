@@ -10,7 +10,9 @@ use std::{
 };
 
 use tiangz_dbproxy_protocol::wire;
-use tiangz_dbproxy_storage::StorageMetricsSnapshot;
+use tiangz_dbproxy_storage::{
+    STORAGE_LATENCY_BOUNDS_MS, StorageMetricsSnapshot, StorageStageSnapshot,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -20,8 +22,10 @@ use tokio::{
 };
 
 const MAX_HTTP_REQUEST_BYTES: usize = 8 * 1024;
-const DURATION_BUCKETS_SECONDS: [f64; 10] = [
-    0.0005, 0.001, 0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 1.0,
+// 故障恢复可能超过一秒；保留原桶并扩展尾部，避免秒级样本全部进入 +Inf。
+// Keep existing buckets and distinguish multi-second recovery latency before +Inf.
+const DURATION_BUCKETS_SECONDS: [f64; 14] = [
+    0.0005, 0.001, 0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 1.0, 2.0, 5.0, 15.0, 30.0,
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -39,11 +43,12 @@ pub(crate) enum RpcOperation {
     ApplyTradeTransaction,
     LoadTrade,
     LoadTradeTransaction,
+    CommitRecords,
     Invalid,
 }
 
 impl RpcOperation {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::LoadSnapshot,
         Self::LoadMultiSnapshot,
         Self::SaveSnapshot,
@@ -57,6 +62,7 @@ impl RpcOperation {
         Self::ApplyTradeTransaction,
         Self::LoadTrade,
         Self::LoadTradeTransaction,
+        Self::CommitRecords,
         Self::Invalid,
     ];
 
@@ -79,12 +85,14 @@ impl RpcOperation {
             Self::ApplyTradeTransaction => "apply_trade_transaction",
             Self::LoadTrade => "load_trade",
             Self::LoadTradeTransaction => "load_trade_transaction",
+            Self::CommitRecords => "commit_records",
             Self::Invalid => "invalid",
         }
     }
 
     pub(crate) fn from_body(body: Option<&wire::request_envelope::Body>) -> Self {
         match body {
+            Some(wire::request_envelope::Body::CommitRecords(_)) => Self::CommitRecords,
             Some(wire::request_envelope::Body::LoadSnapshot(_)) => Self::LoadSnapshot,
             Some(wire::request_envelope::Body::LoadMultiSnapshot(_)) => Self::LoadMultiSnapshot,
             Some(wire::request_envelope::Body::SaveSnapshot(_)) => Self::SaveSnapshot,
@@ -114,6 +122,9 @@ impl RpcOperation {
 
     pub(crate) fn record_count(body: Option<&wire::request_envelope::Body>) -> u64 {
         match body {
+            Some(wire::request_envelope::Body::CommitRecords(r)) => {
+                (r.writes.len() + r.appends.len()) as u64
+            }
             Some(wire::request_envelope::Body::LoadMultiSnapshot(request)) => {
                 request.records.len() as u64
             }
@@ -163,6 +174,13 @@ impl RpcOperation {
             Some(wire::request_envelope::Body::ApplyTransaction(request)) => {
                 bytes(request.payload.len().saturating_add(request.result.len()))
             }
+            Some(wire::request_envelope::Body::CommitRecords(r)) => r
+                .writes
+                .iter()
+                .map(|w| bytes(w.payload.len()))
+                .chain(r.appends.iter().map(|a| bytes(a.payload.len())))
+                .chain(r.outbox_events.iter().map(|e| bytes(e.payload.len())))
+                .fold(bytes(r.result.len()), u64::saturating_add),
             Some(wire::request_envelope::Body::ApplyMultiTransaction(request)) => request
                 .writes
                 .iter()
@@ -221,6 +239,8 @@ pub struct DbProxyMetrics {
     redis_dependency_up: AtomicBool,
     accepted_connections: AtomicU64,
     active_connections: AtomicU64,
+    rejected_connections: AtomicU64,
+    connection_limit: AtomicU64,
     connection_errors: AtomicU64,
     handshake_rejections: [AtomicU64; 3],
     requests_in_flight: AtomicU64,
@@ -262,6 +282,8 @@ pub struct DbProxyMetrics {
     outbox_processing: AtomicU64,
     outbox_dead_lettered: AtomicU64,
     outbox_oldest_age_ms: AtomicU64,
+    pub outbox_relay: std::sync::Mutex<Option<Arc<crate::relay_metrics::RelayMetrics>>>,
+    storage_latencies: std::sync::Mutex<Vec<StorageStageSnapshot>>,
 }
 
 impl Default for DbProxyMetrics {
@@ -275,6 +297,8 @@ impl Default for DbProxyMetrics {
             redis_dependency_up: AtomicBool::new(true),
             accepted_connections: AtomicU64::new(0),
             active_connections: AtomicU64::new(0),
+            rejected_connections: AtomicU64::new(0),
+            connection_limit: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
             handshake_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             requests_in_flight: AtomicU64::new(0),
@@ -316,6 +340,8 @@ impl Default for DbProxyMetrics {
             outbox_processing: AtomicU64::new(0),
             outbox_dead_lettered: AtomicU64::new(0),
             outbox_oldest_age_ms: AtomicU64::new(0),
+            outbox_relay: std::sync::Mutex::new(None),
+            storage_latencies: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -362,6 +388,14 @@ impl DbProxyMetrics {
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn connection_rejected(&self) {
+        self.rejected_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn connection_limit_updated(&self, limit: usize) {
+        self.connection_limit.store(limit as u64, Ordering::Relaxed);
+    }
+
     pub(crate) fn connection_failed(&self) {
         self.connection_errors.fetch_add(1, Ordering::Relaxed);
     }
@@ -372,6 +406,10 @@ impl DbProxyMetrics {
 
     pub(crate) fn request_started(&self) {
         self.requests_in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn request_abandoned(&self) {
+        self.requests_in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub(crate) fn request_finished(
@@ -458,6 +496,59 @@ impl DbProxyMetrics {
             snapshot.cache_fallback_lock_release_errors,
             Ordering::Relaxed,
         );
+    }
+
+    pub(crate) fn storage_latencies_updated(&self, snapshot: Vec<StorageStageSnapshot>) {
+        *self
+            .storage_latencies
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = snapshot;
+    }
+
+    fn append_storage_latencies(&self, output: &mut String) {
+        writeln!(output, "# HELP dbproxy_storage_stage_seconds Elapsed storage scopes including errors and cancellation, not successful SQL execution").unwrap();
+        writeln!(output, "# TYPE dbproxy_storage_stage_seconds histogram").unwrap();
+        writeln!(
+            output,
+            "# HELP dbproxy_storage_stage_in_flight Active storage scopes at the last storage poll"
+        )
+        .unwrap();
+        writeln!(output, "# TYPE dbproxy_storage_stage_in_flight gauge").unwrap();
+        let snapshot = self
+            .storage_latencies
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for sample in snapshot.iter() {
+            let stage = sample.stage;
+            let mut cumulative = 0_u64;
+            for (bound, count) in STORAGE_LATENCY_BOUNDS_MS.iter().zip(sample.buckets) {
+                cumulative += count;
+                writeln!(output, "dbproxy_storage_stage_seconds_bucket{{stage=\"{stage}\",le=\"{}\"}} {cumulative}", *bound as f64 / 1_000.0).unwrap();
+            }
+            let count = sample.buckets.iter().sum::<u64>();
+            writeln!(
+                output,
+                "dbproxy_storage_stage_seconds_bucket{{stage=\"{stage}\",le=\"+Inf\"}} {count}"
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "dbproxy_storage_stage_seconds_count{{stage=\"{stage}\"}} {count}"
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "dbproxy_storage_stage_seconds_sum{{stage=\"{stage}\"}} {:.6}",
+                sample.sum_micros as f64 / 1_000_000.0
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "dbproxy_storage_stage_in_flight{{stage=\"{stage}\"}} {}",
+                sample.in_flight
+            )
+            .unwrap();
+        }
     }
 
     pub(crate) fn backlog_depth_updated(
@@ -553,6 +644,7 @@ impl DbProxyMetrics {
 
     pub(crate) fn prometheus(&self, storage_backend: &str) -> String {
         let mut output = String::with_capacity(16 * 1024);
+        self.append_storage_latencies(&mut output);
         metric_header(
             &mut output,
             "dbproxy_live",
@@ -610,7 +702,7 @@ impl DbProxyMetrics {
         write_atomic_metric(
             &mut output,
             "dbproxy_connections_total",
-            "Accepted DBProxy TCP connections",
+            "Admitted DBProxy TCP connections including handshakes",
             "counter",
             &self.accepted_connections,
         );
@@ -627,6 +719,20 @@ impl DbProxyMetrics {
             "DBProxy TCP connections closed with an error",
             "counter",
             &self.connection_errors,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_connections_rejected_total",
+            "Connections closed before handshake because all slots are occupied",
+            "counter",
+            &self.rejected_connections,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_connections_limit",
+            "Configured maximum admitted TCP connections including handshakes",
+            "gauge",
+            &self.connection_limit,
         );
         metric_header(
             &mut output,
@@ -966,6 +1072,14 @@ impl DbProxyMetrics {
                 oldest_age_ms: &self.outbox_oldest_age_ms,
             },
         );
+        if let Some(relay) = self
+            .outbox_relay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            output.push_str(&relay.render());
+        }
         output
     }
 }
@@ -1143,13 +1257,56 @@ pub struct ObservabilityServer {
     task: JoinHandle<()>,
 }
 
+pub(crate) fn validate_binding(address: SocketAddr, allow_non_loopback: bool) -> io::Result<()> {
+    let ip = match address.ip() {
+        std::net::IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(ip), std::net::IpAddr::V4),
+        ip => ip,
+    };
+    if ip.is_loopback() {
+        return Ok(());
+    }
+    if !allow_non_loopback {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "observability.listenAddr requires allowNonLoopback=true for a protected non-loopback binding",
+        ));
+    }
+    let allowed = match ip {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_link_local() || ip.is_unspecified(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_unique_local() || ip.is_unicast_link_local() || ip.is_unspecified()
+        }
+    };
+    if !allowed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "observability.listenAddr must be loopback, a private management address, or an explicitly protected wildcard binding",
+        ));
+    }
+    Ok(())
+}
+
 impl ObservabilityServer {
     pub async fn start(
         listen_addr: SocketAddr,
         metrics: Arc<DbProxyMetrics>,
         storage_backend: &'static str,
+        shutdown: watch::Receiver<bool>,
+    ) -> io::Result<Self> {
+        Self::start_with_binding_policy(listen_addr, false, metrics, storage_backend, shutdown)
+            .await
+    }
+
+    pub async fn start_with_binding_policy(
+        listen_addr: SocketAddr,
+        allow_non_loopback: bool,
+        metrics: Arc<DbProxyMetrics>,
+        storage_backend: &'static str,
         mut shutdown: watch::Receiver<bool>,
     ) -> io::Result<Self> {
+        validate_binding(listen_addr, allow_non_loopback)?;
         let listener = TcpListener::bind(listen_addr).await?;
         let local_addr = listener.local_addr()?;
         let task = tokio::spawn(async move {
@@ -1358,6 +1515,88 @@ mod tests {
         assert!(output.contains("dbproxy_outbox_dead_lettered 1"));
         assert!(output.contains("dbproxy_outbox_oldest_age_seconds 4.500"));
         assert!(!output.contains("hot-key"));
+    }
+
+    #[tokio::test]
+    async fn direct_observability_api_rejects_wildcard_without_opt_in() {
+        let (_shutdown, receiver) = watch::channel(false);
+        let result = ObservabilityServer::start(
+            "0.0.0.0:0".parse().unwrap(),
+            Arc::new(DbProxyMetrics::default()),
+            "memory",
+            receiver,
+        )
+        .await;
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn rpc_tail_buckets_distinguish_slow_failures_and_keep_overflow() {
+        let metrics = DbProxyMetrics::default();
+        for seconds in [1, 2, 3, 5, 15, 30, 31] {
+            metrics.request_started();
+            metrics.request_finished(
+                RpcOperation::SaveSnapshot,
+                1,
+                0,
+                Duration::from_secs(seconds),
+                Some(wire::ErrorCode::StorageUnavailable),
+            );
+        }
+        let output = metrics.prometheus("memory");
+        for (bound, count) in [
+            ("1", 1),
+            ("2", 2),
+            ("5", 4),
+            ("15", 5),
+            ("30", 6),
+            ("+Inf", 7),
+        ] {
+            assert!(output.contains(&format!("dbproxy_rpc_duration_seconds_bucket{{operation=\"save_snapshot\",le=\"{bound}\"}} {count}")));
+        }
+        assert!(
+            output.contains("dbproxy_rpc_duration_seconds_count{operation=\"save_snapshot\"} 7")
+        );
+        assert!(output.contains(
+            "dbproxy_rpc_errors_total{operation=\"save_snapshot\",code=\"storage_unavailable\"} 7"
+        ));
+    }
+
+    #[test]
+    fn storage_latency_poll_replaces_cumulative_samples_and_exports_overflow() {
+        let metrics = DbProxyMetrics::default();
+        let mut sample = StorageStageSnapshot {
+            stage: "postgres_operation",
+            buckets: [0; STORAGE_LATENCY_BOUNDS_MS.len() + 1],
+            sum_micros: 31_002_000,
+            in_flight: 2,
+        };
+        sample.buckets[0] = 2;
+        sample.buckets[STORAGE_LATENCY_BOUNDS_MS.len()] = 1;
+        metrics.storage_latencies_updated(vec![sample.clone()]);
+        metrics.storage_latencies_updated(vec![sample]);
+        let output = metrics.prometheus("memory");
+        assert!(output.contains(
+            "dbproxy_storage_stage_seconds_bucket{stage=\"postgres_operation\",le=\"0.001\"} 2"
+        ));
+        assert!(output.contains(
+            "dbproxy_storage_stage_seconds_bucket{stage=\"postgres_operation\",le=\"+Inf\"} 3"
+        ));
+        assert!(
+            output.contains("dbproxy_storage_stage_seconds_count{stage=\"postgres_operation\"} 3")
+        );
+        assert!(
+            output.contains(
+                "dbproxy_storage_stage_seconds_sum{stage=\"postgres_operation\"} 31.002000"
+            )
+        );
+        assert!(output.contains("dbproxy_storage_stage_in_flight{stage=\"postgres_operation\"} 2"));
+        metrics.storage_latencies_updated(Vec::new());
+        assert!(
+            !metrics
+                .prometheus("memory")
+                .contains("stage=\"postgres_operation\"")
+        );
     }
 
     #[test]

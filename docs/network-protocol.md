@@ -18,7 +18,9 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 - 交易 Posting 最多 512 条，Outbox 事件最多 64 条；
 - 所有 ID、Schema、topic 等文本都有 UTF-8 字节上限，topic 仅允许字母、数字、`.`、`_`、`-`。
 
-第一帧必须是 `ClientHello(protocol_version, protocol_fingerprint, auth_token, client_name)`。当前握手版本是 2，fingerprint 是权威 proto 文件的 SHA-256。任一不匹配都不会进入 RPC 调度。proto 的 package 名保留 `tiangz.dbproxy.v1` 只是生成代码命名空间；兼容性由握手版本和指纹共同决定。
+第一帧必须是 `ClientHello(protocol_version, protocol_fingerprint, auth_token, client_name)`。当前握手版本是 2，fingerprint 是权威 proto 先统一为 LF 后的 SHA-256。server 精确接受当前指纹及 `LEGACY_PROTOCOL_FINGERPRINT_V2`、`PRE_COMMIT_PROTOCOL_FINGERPRINT_V2`、`PRE_RELAY_PROTOCOL_FINGERPRINT_V2` 三个已知旧指纹，并向连接回显客户端原值；具体清单以 `dbproxy-protocol/src/lib.rs` 为准。未列出的指纹或不匹配的版本不进入 RPC 调度。proto 的 package 名保留 `tiangz.dbproxy.v1` 只是生成代码命名空间；兼容性由握手版本和指纹共同决定。
+
+升级方向是服务端先行：先完成服务端及其数据库迁移的受控切换，再更新客户端。新客户端要求精确的版本/指纹和 `supports_outbox_relay`，不会主动降级到旧服务端。A3 的候选跳过只保证继续寻找兼容服务端，不代表旧服务端可以处理新请求，也不保证混版本的存储/队列语义。所有候选均不兼容时应保留明确拒绝原因并修正部署版本，不能放宽握手检查来掩盖问题。
 
 ## 十三类 RPC
 
@@ -70,9 +72,11 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 
 ## 连接、并发和 Endpoint
 
+`server.maxConnections` 默认 256，必须为正数；每个实例独立限制 TCP 连接总数，包含尚未认证的握手。accept 后先尝试取得名额，满额直接关闭连接，不读取帧、不创建连接任务，也不发送握手成功。正常断开、握手失败/超时、任务 panic 或取消均释放名额。`dbproxy_connections_rejected_total` 记录容量拒绝，`dbproxy_connections_limit` 给出上限；认证失败仍使用握手拒绝指标。根据客户端池总连接数及 `maxFrameBytes` 的内存预算设置上限，不能把玩家数直接当作连接数。观测 HTTP 端口不占业务连接名额。
+
 一个 `DbProxyClient` 连接内只有一个在途请求。请求写出后超时会废弃连接，防止后续 RPC 读取旧响应。`DbProxyClientPool::connect` 按 RecordKey 在一组共享读写连接中稳定路由，保持原有连接数和顺序语义；`connect_split(read_size, write_size)` 使用两组物理连接，读查询进入 read pool，写入、事务和 enqueue 进入 write pool，避免慢写造成跨用途队头阻塞。它不替代业务锁或 revision/CAS。服务端再按记录或 operation ID 路由到独立存储 shard。
 
-Rust 客户端接收有序 Endpoint 列表。连接建立失败、超时或断开才切换；Revision/Operation/Trade 等确定性远程错误不会触发切换。所有候选都必须共享同一 PostgreSQL/Redis，否则幂等和 Revision 契约不成立。
+Rust 客户端接收有序 Endpoint 列表。初次连接和故障重连都跳过不可达候选，以及握手阶段的认证拒绝、协议拒绝、指纹或 Relay 能力不匹配；仍严格验证每个候选，不降低协议或认证要求。候选握手拒绝继续记录为 `Rejected`，不会改记为 `Unavailable`；全部候选失败时优先返回拒绝原因，避免被后续网络错误覆盖。端点无关的本地配置错误立即失败。业务 RPC 阶段的 Remote 错误（包括 Unauthorized、Revision/Operation/Trade 冲突）不触发切换。所有候选都必须共享同一 PostgreSQL/Redis，否则幂等和 Revision 契约不成立。
 
 PostgreSQL 已断连接在下一次操作前做 2 秒有界重连；当前失败写不在底层自动重放。Redis 使用 connection manager 自动重连。调用方仍是唯一有权根据业务语义决定是否以原 ID 重试的一方。
 

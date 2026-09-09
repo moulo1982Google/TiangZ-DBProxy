@@ -45,6 +45,8 @@ jobs:
     timeout-minutes: 20
     env:
       DBPROXY_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz
+      DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz
+      DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION: "1"
       DBPROXY_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6379/0
       DBPROXY_RUN_DOCKER_FAULTS: "1"
     steps:
@@ -77,7 +79,15 @@ jobs:
       - name: 启动 PostgreSQL 与 Redis
         run: docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml up -d --wait
       - name: 真实存储测试
+        env:
+          DBPROXY_CACHE_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6379/0
         run: cargo test -p tiangz-dbproxy-storage --test postgres_redis --locked -- --ignored --nocapture --test-threads=1
+      - name: 缓存修复租约与并发回归
+        env:
+          DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/repair_regression
+        run: |
+          docker exec tiangz-dbproxy-postgres createdb -U tiangz repair_regression
+          cargo test -p tiangz-dbproxy-storage --test cache_repair_concurrency --locked -- --ignored --nocapture --test-threads=1
       - name: 真实网络闭环测试
         run: cargo test -p tiangz-dbproxy-server --test postgres_redis_network --locked -- --ignored --nocapture --test-threads=1
       - name: Redis 与 PostgreSQL 故障矩阵

@@ -1,5 +1,7 @@
 # TiangZ DBProxy
 
+本地集成分支新增 `CommitRecords`：多记录 CAS、不可变追加事实和 Outbox 同一事务提交，不要求交易状态或账本规则。旧接口保持兼容，旧 Trade API 暂留兼容入口。实施状态与发布前验证见[通用持久化计划](docs/generic-persistence-plan.md)；当前远程七天演练不使用这些修改。
+
 TiangZ DBProxy 是独立的 Rust 持久化服务项目。
 
 它负责通用的：
@@ -49,13 +51,19 @@ TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transpor
 
 ## 启动配置
 
+缓存与 PG 回源的等待预算现分离：`storage.cacheOperationTimeoutMs` 默认 200 ms，`cacheFallbackTimeoutMs` 仍默认 2,000 ms。升级兼容、正确性边界与测试见[缓存操作预算](docs/cache-operation-budget.md)。可靠 Redis AOF/MQ 确认不使用该缓存预算。
+
+PG 请求分片现使用独立的连接排队预算与重连失败冷却：`storage.postgresConnectionWaitTimeoutMs` 默认 2,000 ms，`storage.postgresReconnectCooldownMs` 默认 500 ms。只限制取得连接前的等待，不缩短已发送 SQL/事务的执行时间；提交后修复 ACK 排队失败保留修复目标。范围、兼容和验证见[PG 请求预算](docs/postgres-request-budget.md)，后续演练安排见[交接记录](docs/handoff-2026-09-07.md)。
+
+通用 Outbox Relay 的 Redis 路由、禁用的未来 MQ 声明、离线检查和审计管理命令见[Outbox Relay](docs/outbox-relay.md)与[配置示例](configs/outbox-relay.example.json)。旧配置及旧 Stream 地址保持兼容；新来源不能在所有 worker 升级前启用。
+
 DBProxy使用带`configVersion: 1`的严格JSON保存普通启动参数，默认读取`configs/local.json`，并由`configs/dbproxy.schema.json`提供编辑器提示。`runtime.workerThreads`可以固定Tokio Runtime工作线程数，省略时沿用Tokio按逻辑CPU选择的行为；它与只负责Redis积压消费的`backlog.workers`不是同一个参数。连接串和认证令牌不能写进JSON；配置文件只记录环境变量名，由部署环境注入实际密钥：
 
 ```powershell
 cargo run -p tiangz-dbproxy-server -- --config configs/local.json
 ```
 
-未知字段、零worker、零lease、空密钥变量会在建立网络连接前直接报错。每个 DBProxy 实例只配置一个监听地址；部署两个实例时使用两份 JSON，二者共享同一 PostgreSQL 和 Redis。多 Endpoint 写在业务客户端配置中，而不是 DBProxy 服务端配置中：第一个地址是首选，后续地址是故障切换候选。
+未知字段、零worker、零lease、空密钥变量会在建立网络连接前直接报错。每个 DBProxy 实例只配置一个监听地址；部署两个实例时使用两份 JSON，二者共享同一 PostgreSQL 和 Redis 服务。`redisUrlEnv`承载必须保留 AOF 的 backlog/Outbox；可选的`cacheRedisUrlEnv`把快照缓存放到独立、无持久化的 Redis。省略后者时继续复用`redisUrlEnv`，兼容单 Redis 开发环境。多 Endpoint 写在业务客户端配置中，而不是 DBProxy 服务端配置中：第一个地址是首选，后续地址是故障切换候选。
 
 存储后端必须显式选择。正式和恢复测试使用`postgresRedis`；`memory`只用于本地开发与性能隔离，进程退出后数据全部丢失，并且`EnqueueSnapshot`会直接写入内存权威快照，不模拟Redis AOF与异步刷盘：
 
@@ -67,14 +75,14 @@ cargo run -p tiangz-dbproxy-server -- --config configs/local.json
 }
 ```
 
-配置`observability.listenAddr`后，DBProxy在独立HTTP端口提供`/live`、`/ready`、`/dependencies`和Prometheus格式的`/metrics`。真实存储模式只有在 PostgreSQL 与 Redis 都可达时才 Ready；`/dependencies` 会分别报告两者状态。本地Compose会启动Prometheus与Grafana并自动加载Dashboard；指标、告警和部署边界见[可观测性指南](OBSERVABILITY.md)。观测端口不要求业务认证，因此只能绑定本机或运维内网，禁止经Nginx暴露公网。
+配置`observability.listenAddr`后，DBProxy在独立HTTP端口提供`/live`、`/ready`、`/dependencies`和Prometheus格式的`/metrics`。真实存储模式只有在 PostgreSQL 与可靠队列 Redis 都可达时才 Ready；独立快照缓存不可达时安全回源 PostgreSQL，并由缓存读写错误与回源指标告警，不把可降级缓存误判为持久依赖。本地Compose会启动Prometheus与Grafana并自动加载Dashboard；指标、告警和部署边界见[可观测性指南](OBSERVABILITY.md)。观测端口不要求业务认证，默认只允许loopback；私网或通配绑定必须显式设置`observability.allowNonLoopback=true`并限制网络来源，直接公网或多播地址被拒绝。禁止经Nginx暴露公网。容器抓取所需设置见[本地部署说明](deploy/local/README.md)。
 
 仓库提供`configs/perf-memory-4.json`，固定使用4个Runtime工作线程和MemoryStub。该配置只测DBProxy自身的网络、协议、调度、分片锁和事务语义，不把PostgreSQL或Redis性能混入结果。
 
 ```text
 DBProxy-1: 127.0.0.1:7800 ─┐
-                           ├─ 同一 PostgreSQL + 同一 Redis
-DBProxy-2: 127.0.0.1:7801 ─┘
+                           ├─ 同一 PostgreSQL + 可靠队列 Redis
+DBProxy-2: 127.0.0.1:7801 ─┘                    + 可选易失缓存 Redis
 客户端: [7800, 7801]
 ```
 
@@ -99,10 +107,21 @@ GitHub Actions 的普通分支和 Pull Request 只运行开发门禁；推送 `v
 docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml up -d
 $env:DBPROXY_POSTGRES_URL = "postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz"
 $env:DBPROXY_REDIS_URL = "redis://:tiangz_dev@127.0.0.1:6379/15"
+$env:DBPROXY_TEST_POSTGRES_URL = $env:DBPROXY_POSTGRES_URL
+$env:DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION = "1"
+$env:DBPROXY_CACHE_REDIS_URL = $env:DBPROXY_REDIS_URL
 cargo test -p tiangz-dbproxy-storage --test postgres_redis -- --ignored --nocapture --test-threads=1
 ```
 
 运行这组直接存储集成测试前先停止本机 DBProxy。测试会主动认领 backlog、缓存修复和 outbox 任务；若业务 worker 同时运行，会消费测试刚写入的任务并造成竞争性假失败。database 15 用于隔离测试数据，执行前仍应确认其中没有需要保留的数据。
+
+缓存修复并发回归使用独立、可丢弃且无业务 worker 的 PostgreSQL 数据库，设置 `DBPROXY_TEST_POSTGRES_URL` 和 `DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION=1` 后执行：
+
+```powershell
+cargo test -p tiangz-dbproxy-storage --test cache_repair_concurrency -- --ignored --nocapture --test-threads=1
+```
+
+该组验证目标合并、实际修复 revision/缺失记录的 ACK、排队顺序、退避/死信保留、过期租约、同名 worker 和删除后重新入队隔离。它不在默认 `cargo test --workspace` 的通过数量中；真实 Redis 缓存读写还需执行上面的 `postgres_redis` 测试。迁移 010 的受控切换要求见[恢复手册](docs/durability-recovery-runbook.md)。
 
 运行故障矩阵。该命令会短暂停止并恢复本机 PostgreSQL/Redis 容器，但不会删除数据卷：
 

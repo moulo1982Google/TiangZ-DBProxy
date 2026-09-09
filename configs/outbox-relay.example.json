@@ -1,0 +1,22 @@
+{
+  "$schema": "./dbproxy.schema.json",
+  "configVersion": 1,
+  "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "DBPROXY_AUTH_TOKEN" },
+  "runtime": { "workerThreads": 2 },
+  "storage": { "backend": "postgresRedis", "postgresUrlEnv": "DBPROXY_POSTGRES_URL", "redisUrlEnv": "DBPROXY_REDIS_URL", "shards": 4 },
+  "outbox": { "workers": 1, "leaseMs": 30000, "maxAttempts": 20 },
+  "outboxRelay": {
+    "publishTimeoutMs": 5000,
+    "defaultPublisher": "events-redis-v1",
+    "publishers": [
+      { "id": "events-redis-v1", "backend": "redisStream", "connectionEnv": "DBPROXY_EVENTS_REDIS_URL" },
+      { "id": "future-kafka-v1", "backend": "kafka", "connectionEnv": "DBPROXY_KAFKA_CONFIG", "enabled": false },
+      { "id": "future-rabbit-v1", "backend": "rabbitMq", "connectionEnv": "DBPROXY_RABBITMQ_URL", "enabled": false }
+    ],
+    "sources": [
+      { "producer": "game", "version": 1, "destination": "game.events" },
+      { "producer": "achievement", "version": 1, "destination": "achievement.events" },
+      { "producer": "futurePayment", "version": 1, "publisher": "future-kafka-v1", "destination": "payment.events", "enabled": false }
+    ]
+  }
+}

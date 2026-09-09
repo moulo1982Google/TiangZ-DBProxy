@@ -19,6 +19,9 @@
     "shards": 4,
     "cacheFallbackConcurrency": 16,
     "cacheFallbackTimeoutMs": 2000,
+    "cacheOperationTimeoutMs": 200,
+    "postgresConnectionWaitTimeoutMs": 2000,
+    "postgresReconnectCooldownMs": 500,
     "cacheFallbackCircuitFailureThreshold": 5,
     "cacheFallbackCircuitCooldownMs": 5000,
     "cacheFallbackLockLeaseMs": 3000,
@@ -56,6 +59,6 @@
     "defaultFilter": "info"
   },
   "observability": {
-    "listenAddr": "0.0.0.0:9091"
+    "listenAddr": "127.0.0.1:9091"
   }
 }
