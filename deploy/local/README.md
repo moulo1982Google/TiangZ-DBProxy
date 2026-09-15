@@ -45,7 +45,9 @@ powershell -ExecutionPolicy Bypass -File tools/local_laptop.ps1 up -Aof
 
 Redis 使用 `noeviction`，因为当前同一实例同时承载缓存和普通快照 backlog；内存耗尽时应明确失败，不能驱逐 backlog 键。`down` 保留命名卷，不需要本机依赖时可以退出 Docker Desktop，并在确认没有其他 WSL 任务后执行 `wsl --shutdown` 释放 WSL 内存。
 
-启动DBProxy后打开`http://127.0.0.1:3000`，使用`.env`中的Grafana管理员账号登录；`TiangZ / TiangZ DBProxy Overview`会自动出现。Prometheus本机入口为`http://127.0.0.1:9095`。本地DBProxy观测端口使用`0.0.0.0:9090/9091`，只为Docker Desktop或本机Linux容器抓取开放，不能照搬到公网部署。
+启动DBProxy后打开`http://127.0.0.1:3000`，使用`.env`中的Grafana管理员账号登录；`TiangZ / TiangZ DBProxy Overview`会自动出现。Prometheus本机入口为`http://127.0.0.1:9095`。默认本地DBProxy观测端口现在只绑定`127.0.0.1:9090/9091`。
+
+容器中的Prometheus使用`host.docker.internal`抓取，默认loopback绑定在部分主机上不可达。需要容器抓取时，在运行配置的`observability`中显式设置可达的私网地址和`"allowNonLoopback": true`；若确实需要`0.0.0.0:9090/9091`，也必须开启该选项，并用主机防火墙限制为本机容器/运维来源。不能照搬到公网部署。直接公网地址和多播地址即使开启该选项也会被拒绝；通配绑定是否被公网路由或反代暴露仍由部署网络控制。
 
 依赖就绪后启动 DBProxy 网络服务：
 

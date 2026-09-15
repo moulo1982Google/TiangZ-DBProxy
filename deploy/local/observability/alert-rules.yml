@@ -161,7 +161,7 @@ groups:
           severity: critical
         annotations:
           summary: "DBProxy outbox has dead letters"
-          description: "{{ $labels.instance }} exhausted event publication retries. Inspect the event and consumer contract before requeueing its event_id."
+          description: "{{ $labels.instance }} has a dead-lettered event. Its (publisher_id, destination, partition_key) ordering group remains blocked, including other producers sharing that exact group; other partitions are unaffected. Fix the original event's cause, then retry its event_id through the audited admin tool."
 
       - alert: TiangZDbProxyOutboxStalled
         expr: dbproxy_outbox_oldest_age_seconds > 60

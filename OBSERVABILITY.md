@@ -75,6 +75,7 @@ Grafana会自动配置Prometheus数据源并加载`TiangZ DBProxy Overview`，�
 | `dbproxy_outbox_worker_polls_total` | Outbox worker outcomes using the same fixed result labels |
 | `dbproxy_live` / `dbproxy_ready` | 实例存活与接流量状态；真实存储 Ready 还要求 PostgreSQL/Redis 都 up |
 | `dbproxy_connections_total` / `dbproxy_connections_active` | TCP连接累计值与当前值 |
+| `dbproxy_connections_limit` / `dbproxy_connections_rejected_total` | 实例连接上限 / 满额后握手前关闭的连接累计数；不使用远端地址标签 |
 | `dbproxy_handshake_rejections_total` | 按协议、令牌或客户端名称分类的握手拒绝 |
 | `dbproxy_requests_in_flight` | 当前执行中的RPC数量 |
 | `dbproxy_rpc_requests_total` | 按固定操作名统计的RPC请求 |

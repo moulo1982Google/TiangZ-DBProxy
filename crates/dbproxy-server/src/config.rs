@@ -72,6 +72,8 @@ pub struct ServerSection {
     pub max_frame_bytes: usize,
     #[serde(default = "default_max_payload_bytes")]
     pub max_payload_bytes: usize,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
     #[serde(default = "default_handshake_timeout_ms")]
     pub handshake_timeout_ms: u64,
     #[serde(default = "default_shutdown_grace_ms")]
@@ -231,6 +233,9 @@ pub struct ObservabilitySection {
     /// Omission disables HTTP probes; production deployments must bind an internal address explicitly.
     #[serde(default)]
     pub listen_addr: Option<SocketAddr>,
+    /// Explicit opt-in for a protected management interface or container scrape binding.
+    #[serde(default)]
+    pub allow_non_loopback: bool,
 }
 
 impl Default for LoggingSection {
@@ -251,6 +256,7 @@ pub struct ResolvedDbProxyConfig {
     pub auth_token: String,
     pub max_frame_bytes: usize,
     pub max_payload_bytes: usize,
+    pub max_connections: usize,
     pub handshake_timeout: Duration,
     pub shutdown_grace: Duration,
     pub runtime_worker_threads: usize,
@@ -264,6 +270,7 @@ pub struct ResolvedDbProxyConfig {
     pub outbox_relay: crate::relay_config::ResolvedOutboxRelay,
     pub log_filter: String,
     pub observability_listen_addr: Option<SocketAddr>,
+    pub observability_allow_non_loopback: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -327,6 +334,7 @@ impl fmt::Debug for ResolvedDbProxyConfig {
             .field("auth_token", &"[REDACTED]")
             .field("max_frame_bytes", &self.max_frame_bytes)
             .field("max_payload_bytes", &self.max_payload_bytes)
+            .field("max_connections", &self.max_connections)
             .field("runtime_worker_threads", &self.runtime_worker_threads)
             .field("storage_backend", &self.storage.name())
             .field("storage_shards", &self.storage.shards())
@@ -426,6 +434,15 @@ impl DbProxyConfig {
             )));
         }
         require_positive("server.maxFrameBytes", self.server.max_frame_bytes)?;
+        if let Some(address) = self.observability.listen_addr {
+            crate::observability::validate_binding(address, self.observability.allow_non_loopback)
+                .map_err(|error| ConfigError(error.to_string()))?;
+        }
+        if !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.server.max_connections) {
+            return Err(ConfigError(
+                "server.maxConnections is outside the supported range".into(),
+            ));
+        }
         require_positive("server.maxPayloadBytes", self.server.max_payload_bytes)?;
         if self.server.max_payload_bytes > self.server.max_frame_bytes {
             return Err(ConfigError(
@@ -561,6 +578,7 @@ impl DbProxyConfig {
             auth_token,
             max_frame_bytes: self.server.max_frame_bytes,
             max_payload_bytes: self.server.max_payload_bytes,
+            max_connections: self.server.max_connections,
             handshake_timeout: Duration::from_millis(self.server.handshake_timeout_ms),
             shutdown_grace: Duration::from_millis(self.server.shutdown_grace_ms),
             runtime_worker_threads: self.runtime.worker_threads,
@@ -574,8 +592,13 @@ impl DbProxyConfig {
             outbox_relay,
             log_filter,
             observability_listen_addr: self.observability.listen_addr,
+            observability_allow_non_loopback: self.observability.allow_non_loopback,
         })
     }
+}
+
+fn default_max_connections() -> usize {
+    crate::DEFAULT_MAX_CONNECTIONS
 }
 
 pub(crate) fn required_environment(
@@ -766,6 +789,68 @@ mod tests {
         ));
         fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn connection_limit_defaults_and_rejects_invalid_values_before_secrets() {
+        for (limit, expected) in [
+            (None, Some(crate::DEFAULT_MAX_CONNECTIONS)),
+            (Some(7), Some(7)),
+            (Some(0), None),
+            (Some(usize::MAX), None),
+        ] {
+            let mut value = serde_json::json!({"configVersion":1,"server":{"listenAddr":"127.0.0.1:0","authTokenEnv":"AUTH"},"storage":{"backend":"memory","shards":1}});
+            if let Some(limit) = limit {
+                value["server"]["maxConnections"] = limit.into();
+            }
+            let path = write_config(&value.to_string());
+            let result = load_config_with(&path, |_| {
+                assert!(
+                    expected.is_some(),
+                    "invalid limit must fail before reading secrets"
+                );
+                Some("0123456789abcdef".into())
+            });
+            fs::remove_file(path).unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(result.unwrap().max_connections, expected);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("maxConnections"));
+            }
+        }
+    }
+
+    #[test]
+    fn observability_binding_policy_is_checked_before_secrets_or_connections() {
+        for (address, opt_in, allowed) in [
+            ("127.0.0.1:9090", false, true),
+            ("[::1]:9090", false, true),
+            ("[::ffff:127.0.0.1]:9090", false, true),
+            ("0.0.0.0:9090", false, false),
+            ("[::]:9090", false, false),
+            ("10.1.2.3:9090", false, false),
+            ("0.0.0.0:9090", true, true),
+            ("[::]:9090", true, true),
+            ("10.1.2.3:9090", true, true),
+            ("[fd00::1]:9090", true, true),
+            ("8.8.8.8:9090", true, false),
+            ("224.0.0.1:9090", true, false),
+            ("[::ffff:8.8.8.8]:9090", true, false),
+            ("[2606:4700::1111]:9090", true, false),
+        ] {
+            let value = serde_json::json!({"configVersion":1,"server":{"listenAddr":"127.0.0.1:0","authTokenEnv":"AUTH"},"storage":{"backend":"memory","shards":1},"observability":{"listenAddr":address,"allowNonLoopback":opt_in}});
+            let path = write_config(&value.to_string());
+            let result = load_config_with(&path, |_| {
+                assert!(allowed, "unsafe binding must fail before reading secrets");
+                Some("0123456789abcdef".into())
+            });
+            fs::remove_file(path).unwrap();
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "{address}, opt_in={opt_in}: {result:?}"
+            );
+        }
     }
 
     #[test]
