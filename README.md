@@ -49,7 +49,11 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 
 TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transport适配；这些领域Payload与恢复逻辑不属于本仓库。交易 API 只提供通用状态/CAS/账本/Outbox 原子边界，所有权、价格、余额和风控仍由主工程的领域 Repository 决定。架构、演练、分区和审视结果分别见[架构说明](docs/architecture.md)、[恢复手册](docs/durability-recovery-runbook.md)、[两小时故障演练报告](docs/fault-soak-report-2026-08-27.md)、[PostgreSQL 快照分区](docs/postgresql-partitioning.md)、[交易安全说明](docs/trade-safety-and-outbox.md)和[代码审视记录](docs/dbproxy-code-review.md)。
 
+如果需要向外部介绍 DBProxy 的能力、接口选择和边界，见[DBProxy 能力清单](docs/capabilities.md)。
+
 ## 启动配置
+
+容器停止时，服务入口统一处理 SIGTERM/SIGINT，Windows 保留 Ctrl+C。关闭顺序、等待预算、镜像升级要求及回归方法见[优雅关闭说明](docs/graceful-shutdown.md)。
 
 缓存与 PG 回源的等待预算现分离：`storage.cacheOperationTimeoutMs` 默认 200 ms，`cacheFallbackTimeoutMs` 仍默认 2,000 ms。升级兼容、正确性边界与测试见[缓存操作预算](docs/cache-operation-budget.md)。可靠 Redis AOF/MQ 确认不使用该缓存预算。
 
@@ -199,7 +203,7 @@ const snapshot = await client.Load({ namespace: "player", key: "1001" });
 
 ## 网络边界
 
-当前 v2 协议提供十三类 RPC：
+当前 v2 协议提供十四类 RPC（包含通用 `CommitRecords`）：
 
 ```text
 LoadSnapshot       读取已提交权威快照
@@ -212,6 +216,7 @@ ApplyTransaction   提交单记录关键事务并保存原始业务结果
 LoadTransaction    按operationId与RecordKey读取已提交事务回执
 ApplyMultiTransaction  在一个 PostgreSQL 事务中原子提交多条记录
 LoadMultiTransaction   按operationId和记录集合读取跨记录事务回执
+CommitRecords          原子提交多记录快照、不可变追加事实、Outbox和业务回执
 ApplyTradeTransaction  原子提交交易状态、多记录、账本、Outbox和回执
 LoadTrade              读取交易当前版本、状态和不透明Payload
 LoadTradeTransaction   按operationId和tradeId读取已提交交易回执

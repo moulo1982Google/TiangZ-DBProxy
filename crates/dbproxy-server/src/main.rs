@@ -155,13 +155,9 @@ async fn run_server(
         None => None,
     };
 
-    let signal_tx = shutdown_tx.clone();
-    tokio::spawn(async move {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::error!(%error, "failed to install Ctrl+C handler");
-        }
-        let _ = signal_tx.send(true);
-    });
+    // 在发布就绪前注册 Unix 信号，避免 Docker PID 1 忽略默认 SIGTERM。
+    // Register Unix handlers before readiness so Docker PID 1 handles SIGTERM.
+    let signal_listener = shutdown_listener(shutdown_tx.clone(), Arc::clone(&metrics))?;
 
     let mut workers = JoinSet::new();
     if let Some(backend) = durable_backend {
@@ -216,6 +212,9 @@ async fn run_server(
         }
     }
     metrics.mark_ready();
+    // Ready 写入先于监听任务运行，早到的停止信号不会被后续 Ready 覆盖。
+    // Publish Ready before polling the listener so an early stop cannot be overwritten.
+    let signal_task = tokio::spawn(signal_listener);
     tracing::info!(
         %actual_addr,
         config = %config.source.display(),
@@ -241,6 +240,7 @@ async fn run_server(
         "TiangZ DBProxy started"
     );
     let serve_result = server.serve(shutdown_rx.clone()).await;
+    signal_task.abort();
     metrics.mark_stopping();
     let _ = shutdown_tx.send(true);
     if tokio::time::timeout(config.shutdown_grace, async {
@@ -266,6 +266,36 @@ async fn run_server(
     metrics.mark_stopped();
     tracing::info!("TiangZ DBProxy stopped");
     Ok(())
+}
+
+/// 两种 Unix 停止信号共用关闭通道；Windows 保留 Ctrl+C 行为。
+/// Route both Unix stop signals through the same shutdown channel; retain Ctrl+C on Windows.
+fn shutdown_listener(
+    shutdown_tx: watch::Sender<bool>,
+    metrics: Arc<DbProxyMetrics>,
+) -> std::io::Result<impl std::future::Future<Output = ()> + Send> {
+    #[cfg(unix)]
+    let (mut interrupt, mut terminate) = (
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+    );
+    Ok(async move {
+        #[cfg(unix)]
+        let signal = tokio::select! {
+            _ = interrupt.recv() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+        };
+        #[cfg(not(unix))]
+        let signal = {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                tracing::error!(%error, "failed to install Ctrl+C handler; stopping server");
+            }
+            "Ctrl+C"
+        };
+        metrics.mark_stopping();
+        tracing::info!(signal, "DBProxy shutdown requested");
+        let _ = shutdown_tx.send(true);
+    })
 }
 
 fn worker_instance_id() -> String {

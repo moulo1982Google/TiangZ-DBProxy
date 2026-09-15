@@ -20,7 +20,7 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 
 第一帧必须是 `ClientHello(protocol_version, protocol_fingerprint, auth_token, client_name)`。当前握手版本是 2，fingerprint 是权威 proto 先统一为 LF 后的 SHA-256。为滚动升级已在线的旧 v2 客户端，server 还精确接受换行规范化前的已知指纹`d20f…e4f1f`并向该连接原样回显；它不接受任意别名，新客户端也不会主动降级。版本或这两个明确指纹以外的值都不会进入 RPC 调度。下一次协议版本提升时旧别名因版本不匹配自然失效。proto 的 package 名保留 `tiangz.dbproxy.v1` 只是生成代码命名空间；兼容性由握手版本和指纹共同决定。
 
-## 十三类 RPC
+## 十四类 RPC
 
 | RPC | 语义 |
 | --- | --- |
@@ -34,6 +34,7 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 | `LoadTransaction` | 按 operation ID + RecordKey 读取单记录事务回执 |
 | `ApplyMultiTransaction` | 同一 PostgreSQL 内最多 256 条记录整组 CAS/提交/回滚 |
 | `LoadMultiTransaction` | 按 operation ID + 完整 RecordKey 集合读取多记录回执 |
+| `CommitRecords` | 同一 PostgreSQL 内原子提交多记录快照、只追加事实、Outbox 和业务回执 |
 | `ApplyTradeTransaction` | 原子提交交易状态、多记录 CAS、平衡账本、Outbox、修复目标和 Receipt |
 | `LoadTrade` | 按 trade ID 读取当前交易版本、状态和 Payload |
 | `LoadTradeTransaction` | 按 operation ID + trade ID 读取第一次交易 Receipt |
