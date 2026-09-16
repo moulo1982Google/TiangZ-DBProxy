@@ -1,0 +1,9 @@
+{
+  "configVersion": 1,
+  "listenAddr": "127.0.0.1:17800",
+  "maxConnections": 128,
+  "tenants": [
+    { "id": "slg.dev", "config": "tenants/slg.example.json" },
+    { "id": "mmorpg.dev", "config": "tenants/mmorpg.example.json" }
+  ]
+}

@@ -6,6 +6,11 @@
 //! game repositories, entity lifecycle, and business validation stay in TiangZ.
 
 pub mod config;
+pub mod tenancy;
+pub mod tenant_config;
+#[cfg(test)]
+mod tenant_config_tests;
+pub use tenancy::TenantBackend;
 #[cfg(test)]
 mod connection_limit_tests;
 mod memory_backend;
@@ -1140,6 +1145,7 @@ pub struct DbProxyServer {
     listener: TcpListener,
     config: Arc<ServerConfig>,
     backend: Arc<dyn DbProxyBackend>,
+    tenants: Arc<Vec<TenantBackend>>,
 }
 
 // Own the permit and gauge together, including panic, cancellation and unpolled task drop.
@@ -1168,7 +1174,21 @@ impl DbProxyServer {
             listener,
             config: Arc::new(config),
             backend,
+            tenants: Arc::new(Vec::new()),
         })
+    }
+
+    /// 多租户模式不存在默认凭据后门；后端必须由可信部署独立提供。
+    /// Multi-tenant mode has no default-token fallback; deployment owns backend isolation.
+    pub async fn bind_tenants(
+        mut config: ServerConfig,
+        tenants: Vec<TenantBackend>,
+    ) -> Result<Self, ServerError> {
+        tenancy::validate_tenants(&tenants)?;
+        config.auth_token = "unused-multi-tenant-placeholder".into();
+        let mut server = Self::bind(config, Arc::clone(&tenants[0].backend)).await?;
+        server.tenants = Arc::new(tenants);
+        Ok(server)
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, ServerError> {
@@ -1204,6 +1224,7 @@ impl DbProxyServer {
                     let slot = ConnectionSlot { _permit: permit, metrics: Arc::clone(&self.config.metrics) };
                     let config = Arc::clone(&self.config);
                     let backend = Arc::clone(&self.backend);
+                    let tenants = Arc::clone(&self.tenants);
                     let connection_shutdown = shutdown.clone();
                     connections.spawn(async move {
                         let _slot = slot;
@@ -1211,6 +1232,7 @@ impl DbProxyServer {
                             stream,
                             Arc::clone(&config),
                             backend,
+                            tenants,
                             connection_shutdown,
                         ).await;
                         if let Err(error) = result {
@@ -1257,6 +1279,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     config: Arc<ServerConfig>,
     backend: Arc<dyn DbProxyBackend>,
+    tenants: Arc<Vec<TenantBackend>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), ConnectionError> {
     stream.set_nodelay(true).map_err(ProtocolError::from)?;
@@ -1301,7 +1324,16 @@ async fn handle_connection(
         .await?;
         return Ok(());
     }
-    if !constant_time_token_eq(config.auth_token.as_bytes(), hello.auth_token.as_bytes()) {
+    let mut selected = None;
+    for tenant in tenants.iter() {
+        if constant_time_token_eq(tenant.token.as_bytes(), hello.auth_token.as_bytes()) {
+            selected = Some(tenant);
+        }
+    }
+    if (!tenants.is_empty() && selected.is_none())
+        || (tenants.is_empty()
+            && !constant_time_token_eq(config.auth_token.as_bytes(), hello.auth_token.as_bytes()))
+    {
         config
             .metrics
             .handshake_rejected(HandshakeRejection::Unauthorized);
@@ -1328,6 +1360,29 @@ async fn handle_connection(
         return Ok(());
     }
 
+    let mut tenant_slot = None;
+    let (backend, request_metrics) = if let Some(tenant) = selected {
+        let Ok(permit) = Arc::clone(&tenant.slots).try_acquire_owned() else {
+            tenant.metrics.connection_rejected();
+            write_hello_rejection(
+                &mut stream,
+                config.max_frame_bytes,
+                wire::ErrorCode::StorageUnavailable,
+                "Tenant connection capacity exhausted",
+            )
+            .await?;
+            return Ok(());
+        };
+        tenant.metrics.connection_opened();
+        tenant_slot = Some(ConnectionSlot {
+            _permit: permit,
+            metrics: Arc::clone(&tenant.metrics),
+        });
+        (Arc::clone(&tenant.backend), Arc::clone(&tenant.metrics))
+    } else {
+        (backend, Arc::clone(&config.metrics))
+    };
+    let _tenant_slot = tenant_slot;
     let accepted = wire::ServerFrame {
         body: Some(wire::server_frame::Body::Hello(wire::ServerHello {
             supports_outbox_relay: true,
@@ -1359,7 +1414,7 @@ async fn handle_connection(
         let response = dispatch(
             request,
             backend.as_ref(),
-            &config.metrics,
+            &request_metrics,
             config.max_payload_bytes,
         )
         .await;

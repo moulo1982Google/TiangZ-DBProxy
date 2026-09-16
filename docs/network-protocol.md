@@ -2,6 +2,8 @@
 
 ## 边界
 
+多租户启动模式 --tenants 不改变线协议：凭据在服务端绑定租户后端，client_name 不参与授权，连接内不得切换。原 --config 仍是单租户。隔离及部署约束见 [多租户说明](multitenancy.md)。
+
 TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storage crate。DBProxy 识别通用 RecordKey、Schema、Payload、Revision，以及交易状态/Posting/Outbox 持久化原语，不解释 Scene、Entity、道具或价格。
 
 网络失败不会改变幂等规则：重试必须携带原 `request_id` 或 `operation_id` 和完全相同的请求内容。SDK/Transport 禁止在重连或 Endpoint 切换时替换 ID。
@@ -83,7 +85,7 @@ PostgreSQL 已断连接在下一次操作前做 2 秒有界重连；当前失败
 
 ## 当前未覆盖
 
-- TLS/mTLS、令牌轮换、租户隔离和配额；
+- TLS/mTLS、令牌轮换、同表租户隔离和请求速率/CPU/内存配额；多后端租户绑定及连接额度已提供，真实存储多租户验收待补；
 - 协议双版本滚动窗口；
 - 跨 PostgreSQL database/cluster 的分布式事务；
 - Outbox 下游消费组和消费者实现；

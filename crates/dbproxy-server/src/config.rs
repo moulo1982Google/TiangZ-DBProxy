@@ -405,7 +405,7 @@ pub fn check_config(path: impl AsRef<Path>) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn load_config_with(
+pub(crate) fn load_config_with(
     path: impl AsRef<Path>,
     environment: impl Fn(&str) -> Option<String>,
 ) -> Result<ResolvedDbProxyConfig, ConfigError> {

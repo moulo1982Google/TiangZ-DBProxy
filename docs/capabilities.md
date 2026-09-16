@@ -27,6 +27,7 @@ DBProxy 是一个独立的 Rust 持久化服务：它把业务服务提供的**�
 | 分层缓存 | 缓存命中、负缓存、过期后 stale-while-revalidate、受限回源和缓存修复 | 缓存故障时继续从 PostgreSQL 读取，不把缓存当最终真相 |
 | Outbox Relay | 事务内记录事件意图，后台按租约、顺序、重试和死信投递到 Redis Stream | 状态提交后发布领域事件，避免“状态成功但事件意图丢失” |
 | 网络与客户端 | Protobuf/TCP v2、协议指纹握手、Rust 异步客户端、连接池、Endpoint 故障切换、TypeScript SDK | Rust、Node/Deno/浏览器宿主或其他业务框架接入 |
+| 多租户入口 v1 | 凭据绑定独立后端、租户连接预算及监控；不同 PostgreSQL database / Redis 逻辑 DB，真实存储隔离与恢复仍待验收 | 多游戏共享入口和物理实例；不承诺 CPU/内存或故障硬隔离，见[部署边界](multitenancy.md) |
 | 运行观测 | `/live`、`/ready`、`/dependencies`、Prometheus `/metrics`，覆盖 RPC、缓存、PG、队列和 Outbox | 健康检查、延迟归因、积压/死信告警和故障演练 |
 
 ## 整体数据流

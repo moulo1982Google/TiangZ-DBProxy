@@ -1,0 +1,8 @@
+{
+  "$schema": "../dbproxy.schema.json",
+  "configVersion": 1,
+  "server": { "listenAddr": "127.0.0.1:17800", "authTokenEnv": "MMORPG_TENANT_TOKEN", "maxConnections": 64 },
+  "runtime": { "workerThreads": 4 },
+  "storage": { "backend": "postgresRedis", "postgresUrlEnv": "MMORPG_TENANT_POSTGRES_URL", "redisUrlEnv": "MMORPG_TENANT_REDIS_URL", "shards": 4 },
+  "observability": { "listenAddr": "127.0.0.1:17902" }
+}

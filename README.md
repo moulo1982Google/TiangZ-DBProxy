@@ -1,5 +1,7 @@
 # TiangZ DBProxy
 
+本地新增多租户入口 `--tenants`：凭据绑定独立后端，可共用 PostgreSQL/Redis 实例但分别使用独立 database/逻辑 DB；连接配额与观测按租户区分。原 --config 不变。用法、约束及真实存储未验收范围见 [多租户 v1](docs/multitenancy.md)。
+
 本地集成分支新增 `CommitRecords`：多记录 CAS、不可变追加事实和 Outbox 同一事务提交，不要求交易状态或账本规则。旧接口保持兼容，旧 Trade API 暂留兼容入口。实施状态与发布前验证见[通用持久化计划](docs/generic-persistence-plan.md)；当前远程七天演练不使用这些修改。
 
 TiangZ DBProxy 是独立的 Rust 持久化服务项目。

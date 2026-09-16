@@ -27,6 +27,43 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         return Ok(());
     }
+    if args
+        .get(1)
+        .is_some_and(|a| a == "--check-tenants" || a == "--tenants")
+    {
+        if args.len() != 3 {
+            return Err("usage: --tenants PATH or --check-tenants PATH".into());
+        }
+        let path = std::path::Path::new(&args[2]);
+        if args[1] == "--check-tenants" {
+            tiangz_dbproxy_server::tenant_config::check_deployment(path)?;
+            println!(
+                "Tenant structure checked offline; credential and storage isolation checks run at startup."
+            );
+            return Ok(());
+        }
+        let (deployment, configs) = tiangz_dbproxy_server::tenant_config::load_deployment(path)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::try_new(&configs[0].log_filter)?)
+            .with_ansi(false)
+            .init();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(configs[0].runtime_worker_threads)
+            .enable_all()
+            .build()?;
+        return runtime.block_on(async move {
+            let mut tenants = Vec::new();
+            for (declaration, config) in deployment.tenants.into_iter().zip(configs) {
+                let (backend, durable) = prepare_backend(&config).await?;
+                tenants.push((Some(declaration.id), config, backend, durable));
+            }
+            run_servers(
+                tenants,
+                Some((deployment.listen_addr, deployment.max_connections)),
+            )
+            .await
+        });
+    }
     let config_path = config_path_from_args(env::args())?;
     let config = load_config(config_path)?;
     tracing_subscriber::fmt()
@@ -40,7 +77,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     runtime.block_on(run(config))
 }
 
+type BackendPair = (Arc<dyn DbProxyBackend>, Option<Arc<StorageBackend>>);
+type TenantRuntime = (
+    Option<String>,
+    ResolvedDbProxyConfig,
+    Arc<dyn DbProxyBackend>,
+    Option<Arc<StorageBackend>>,
+);
+
 async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
+    let (backend, durable) = prepare_backend(&config).await?;
+    run_servers(vec![(None, config, backend, durable)], None).await
+}
+
+async fn prepare_backend(config: &ResolvedDbProxyConfig) -> Result<BackendPair, Box<dyn Error>> {
     match config.storage.clone() {
         ResolvedStorage::PostgresRedis {
             postgres_url,
@@ -109,147 +159,172 @@ async fn run(config: ResolvedDbProxyConfig) -> Result<(), Box<dyn Error>> {
                 .await?,
             );
             let server_backend: Arc<dyn DbProxyBackend> = backend.clone();
-            run_server(config, server_backend, Some(backend)).await
+            Ok((server_backend, Some(backend)))
         }
         ResolvedStorage::Memory { shards } => {
             let backend: Arc<dyn DbProxyBackend> = Arc::new(MemoryBackend::new(shards)?);
-            run_server(config, backend, None).await
+            Ok((backend, None))
         }
     }
 }
 
-async fn run_server(
-    config: ResolvedDbProxyConfig,
-    server_backend: Arc<dyn DbProxyBackend>,
-    durable_backend: Option<Arc<StorageBackend>>,
+async fn run_servers(
+    tenants: Vec<TenantRuntime>,
+    shared: Option<(std::net::SocketAddr, usize)>,
 ) -> Result<(), Box<dyn Error>> {
+    let config = &tenants[0].1;
+    let grace = config.shutdown_grace;
     let mut server_config = ServerConfig::new(config.listen_addr, config.auth_token.clone());
     server_config.max_frame_bytes = config.max_frame_bytes;
-    server_config.max_connections = config.max_connections;
     server_config.max_payload_bytes = config.max_payload_bytes;
+    server_config.max_connections = shared.map_or(config.max_connections, |value| value.1);
+    server_config.listen_addr = shared.map_or(config.listen_addr, |value| value.0);
     server_config.handshake_timeout = config.handshake_timeout;
-    server_config.shutdown_grace = config.shutdown_grace;
-    let metrics = Arc::new(DbProxyMetrics::default());
-    if durable_backend.is_some() {
-        metrics.require_healthy_dependencies();
-    }
-    if let Some(backend) = &durable_backend {
-        *metrics
-            .outbox_relay
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&backend.outbox_relay_metrics));
-    }
-    server_config.metrics = Arc::clone(&metrics);
-    let server = DbProxyServer::bind(server_config, server_backend).await?;
-    let actual_addr = server.local_addr()?;
+    server_config.shutdown_grace = grace;
+    let admission_metrics = Arc::new(DbProxyMetrics::default());
+    server_config.metrics = Arc::clone(&admission_metrics);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let observability = match config.observability_listen_addr {
-        Some(address) => Some(
-            ObservabilityServer::start_with_binding_policy(
+    let mut workers = JoinSet::new();
+    let mut monitors = Vec::new();
+    let mut routes = Vec::new();
+    let mut tenant_metrics = Vec::new();
+    for (id, config, backend, durable_backend) in &tenants {
+        let metrics = if shared.is_some() {
+            Arc::new(DbProxyMetrics::default())
+        } else {
+            Arc::clone(&admission_metrics)
+        };
+        if durable_backend.is_some() {
+            metrics.require_healthy_dependencies();
+        }
+        if let Some(durable) = durable_backend {
+            *metrics
+                .outbox_relay
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                Some(Arc::clone(&durable.outbox_relay_metrics));
+        }
+        if let Some(id) = id {
+            routes.push(tiangz_dbproxy_server::TenantBackend::new(
+                id,
+                &config.auth_token,
+                Arc::clone(backend),
+                config.max_connections,
+                Arc::clone(&metrics),
+            )?);
+        }
+        tenant_metrics.push(metrics);
+    }
+    let signal_listener = shutdown_listener(
+        shutdown_tx.clone(),
+        std::iter::once(Arc::clone(&admission_metrics))
+            .chain(tenant_metrics.iter().cloned())
+            .collect(),
+    )?;
+    // 先绑定并校验所有监听端口；失败时尚未启动后台任务。
+    // Bind every listener before spawning background work.
+    let server = if shared.is_some() {
+        DbProxyServer::bind_tenants(server_config, routes).await?
+    } else {
+        DbProxyServer::bind(server_config, Arc::clone(&tenants[0].2)).await?
+    };
+    for ((_, config, _, _), metrics) in tenants.iter().zip(&tenant_metrics) {
+        if let Some(address) = config.observability_listen_addr {
+            match ObservabilityServer::start_with_binding_policy(
                 address,
                 config.observability_allow_non_loopback,
-                Arc::clone(&metrics),
+                Arc::clone(metrics),
                 config.storage.name(),
                 shutdown_rx.clone(),
             )
-            .await?,
-        ),
-        None => None,
-    };
-
-    // 在发布就绪前注册 Unix 信号，避免 Docker PID 1 忽略默认 SIGTERM。
-    // Register Unix handlers before readiness so Docker PID 1 handles SIGTERM.
-    let signal_listener = shutdown_listener(shutdown_tx.clone(), Arc::clone(&metrics))?;
-
-    let mut workers = JoinSet::new();
-    if let Some(backend) = durable_backend {
-        workers.spawn(run_storage_metrics_poller(
-            Arc::clone(&backend),
-            Arc::clone(&metrics),
-            Duration::from_secs(5),
-            shutdown_rx.clone(),
-        ));
-        for _ in 0..config.backlog_workers {
-            workers.spawn(run_backlog_worker_observed(
-                Arc::clone(&backend),
-                config.backlog_lease_ms,
-                config.backlog_idle_delay,
-                config.backlog_failure_delay,
-                shutdown_rx.clone(),
-                Some(Arc::clone(&metrics)),
-            ));
-        }
-        let instance = worker_instance_id();
-        let cache_repair_policy = RetryWorkerPolicy {
-            lease_ms: config.cache_repair.lease_ms,
-            base_retry_delay_ms: config.cache_repair.base_retry_delay_ms,
-            max_retry_delay_ms: config.cache_repair.max_retry_delay_ms,
-            max_attempts: config.cache_repair.max_attempts,
-        };
-        for index in 0..config.cache_repair.workers {
-            workers.spawn(run_cache_repair_worker_observed(
-                Arc::clone(&backend),
-                format!("cache-repair-{instance}-{index}"),
-                cache_repair_policy,
-                config.cache_repair.idle_delay,
-                shutdown_rx.clone(),
-                Some(Arc::clone(&metrics)),
-            ));
-        }
-        let outbox_policy = RetryWorkerPolicy {
-            lease_ms: config.outbox.lease_ms,
-            base_retry_delay_ms: config.outbox.base_retry_delay_ms,
-            max_retry_delay_ms: config.outbox.max_retry_delay_ms,
-            max_attempts: config.outbox.max_attempts,
-        };
-        for index in 0..config.outbox.workers {
-            workers.spawn(run_outbox_worker_observed(
-                Arc::clone(&backend),
-                format!("outbox-{instance}-{index}"),
-                outbox_policy,
-                config.outbox.idle_delay,
-                shutdown_rx.clone(),
-                Some(Arc::clone(&metrics)),
-            ));
+            .await
+            {
+                Ok(monitor) => monitors.push(monitor),
+                Err(error) => {
+                    let _ = shutdown_tx.send(true);
+                    for monitor in monitors {
+                        monitor.stop().await;
+                    }
+                    return Err(error.into());
+                }
+            }
         }
     }
-    metrics.mark_ready();
-    // Ready 写入先于监听任务运行，早到的停止信号不会被后续 Ready 覆盖。
-    // Publish Ready before polling the listener so an early stop cannot be overwritten.
+    for ((id, config, _, durable_backend), metrics) in tenants.iter().zip(&tenant_metrics) {
+        let durable_backend = durable_backend.clone();
+        if let Some(backend) = durable_backend {
+            workers.spawn(run_storage_metrics_poller(
+                Arc::clone(&backend),
+                Arc::clone(metrics),
+                Duration::from_secs(5),
+                shutdown_rx.clone(),
+            ));
+            for _ in 0..config.backlog_workers {
+                workers.spawn(run_backlog_worker_observed(
+                    Arc::clone(&backend),
+                    config.backlog_lease_ms,
+                    config.backlog_idle_delay,
+                    config.backlog_failure_delay,
+                    shutdown_rx.clone(),
+                    Some(Arc::clone(metrics)),
+                ));
+            }
+            let instance = worker_instance_id();
+            let cache_repair_policy = RetryWorkerPolicy {
+                lease_ms: config.cache_repair.lease_ms,
+                base_retry_delay_ms: config.cache_repair.base_retry_delay_ms,
+                max_retry_delay_ms: config.cache_repair.max_retry_delay_ms,
+                max_attempts: config.cache_repair.max_attempts,
+            };
+            for index in 0..config.cache_repair.workers {
+                workers.spawn(run_cache_repair_worker_observed(
+                    Arc::clone(&backend),
+                    format!("cache-repair-{instance}-{index}"),
+                    cache_repair_policy,
+                    config.cache_repair.idle_delay,
+                    shutdown_rx.clone(),
+                    Some(Arc::clone(metrics)),
+                ));
+            }
+            let outbox_policy = RetryWorkerPolicy {
+                lease_ms: config.outbox.lease_ms,
+                base_retry_delay_ms: config.outbox.base_retry_delay_ms,
+                max_retry_delay_ms: config.outbox.max_retry_delay_ms,
+                max_attempts: config.outbox.max_attempts,
+            };
+            for index in 0..config.outbox.workers {
+                workers.spawn(run_outbox_worker_observed(
+                    Arc::clone(&backend),
+                    format!("outbox-{instance}-{index}"),
+                    outbox_policy,
+                    config.outbox.idle_delay,
+                    shutdown_rx.clone(),
+                    Some(Arc::clone(metrics)),
+                ));
+            }
+        }
+
+        metrics.mark_ready();
+        tracing::info!(
+            tenant = id.as_deref().unwrap_or("legacy"),
+            storage_backend = config.storage.name(),
+            "tenant backend ready"
+        );
+    }
+    admission_metrics.mark_ready();
     let signal_task = tokio::spawn(signal_listener);
-    tracing::info!(
-        %actual_addr,
-        config = %config.source.display(),
-        storage_backend = config.storage.name(),
-        shard_count = config.storage.shards(),
-        runtime_worker_threads = config.runtime_worker_threads,
-        max_connections = config.max_connections,
-        backlog_worker_count = if matches!(config.storage, ResolvedStorage::PostgresRedis { .. }) {
-            config.backlog_workers
-        } else {
-            0
-        },
-        cache_repair_worker_count = if matches!(config.storage, ResolvedStorage::PostgresRedis { .. }) {
-            config.cache_repair.workers
-        } else {
-            0
-        },
-        outbox_worker_count = if matches!(config.storage, ResolvedStorage::PostgresRedis { .. }) {
-            config.outbox.workers
-        } else {
-            0
-        },
-        observability_addr = observability.as_ref().map(ObservabilityServer::local_addr).map(|value| value.to_string()),
-        "TiangZ DBProxy started"
-    );
+    tracing::info!(actual_addr = %server.local_addr()?, tenant_count = tenants.len(), "TiangZ DBProxy started");
     let serve_result = server.serve(shutdown_rx.clone()).await;
     signal_task.abort();
-    metrics.mark_stopping();
+    admission_metrics.mark_stopping();
+    for metrics in &tenant_metrics {
+        metrics.mark_stopping();
+    }
     let _ = shutdown_tx.send(true);
-    if tokio::time::timeout(config.shutdown_grace, async {
+    if tokio::time::timeout(grace, async {
         while let Some(joined) = workers.join_next().await {
             if let Err(error) = joined {
-                tracing::error!(%error, "DBProxy background worker stopped unexpectedly");
+                tracing::error!(%error, "DBProxy worker stopped unexpectedly");
             }
         }
     })
@@ -257,17 +332,17 @@ async fn run_server(
     .is_err()
     {
         workers.abort_all();
-        tracing::warn!(
-            shutdown_grace_ms = config.shutdown_grace.as_millis(),
-            "DBProxy background worker shutdown grace expired; durable leases will recover unfinished work"
-        );
+        while workers.join_next().await.is_some() {}
+        tracing::warn!("DBProxy worker shutdown grace expired; durable leases remain recoverable");
     }
-    if let Some(observability) = observability {
-        observability.stop().await;
+    for monitor in monitors {
+        monitor.stop().await;
     }
     serve_result?;
-    metrics.mark_stopped();
-    tracing::info!("TiangZ DBProxy stopped");
+    for metrics in &tenant_metrics {
+        metrics.mark_stopped();
+    }
+    admission_metrics.mark_stopped();
     Ok(())
 }
 
@@ -275,7 +350,7 @@ async fn run_server(
 /// Route both Unix stop signals through the same shutdown channel; retain Ctrl+C on Windows.
 fn shutdown_listener(
     shutdown_tx: watch::Sender<bool>,
-    metrics: Arc<DbProxyMetrics>,
+    metrics: Vec<Arc<DbProxyMetrics>>,
 ) -> std::io::Result<impl std::future::Future<Output = ()> + Send> {
     #[cfg(unix)]
     let (mut interrupt, mut terminate) = (
@@ -295,7 +370,9 @@ fn shutdown_listener(
             }
             "Ctrl+C"
         };
-        metrics.mark_stopping();
+        for tenant in metrics {
+            tenant.mark_stopping();
+        }
         tracing::info!(signal, "DBProxy shutdown requested");
         let _ = shutdown_tx.send(true);
     })
