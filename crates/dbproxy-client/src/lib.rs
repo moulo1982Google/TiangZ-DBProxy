@@ -340,6 +340,29 @@ impl DbProxyClientPool {
         self.read_client(first).load_multi(records).await
     }
 
+    /// 显式缓存读取路由到同一读连接池；下限随请求传递。
+    /// Route explicit cached reads through the read pool, carrying the fence.
+    pub async fn load_cached(
+        &self,
+        record: &RecordKey,
+        minimum: Option<Revision>,
+    ) -> Result<Option<SnapshotEnvelope>, ClientError> {
+        self.read_client(record).load_cached(record, minimum).await
+    }
+
+    pub async fn load_cached_multi(
+        &self,
+        records: &[RecordKey],
+        minima: &[Revision],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, ClientError> {
+        let first = records
+            .first()
+            .ok_or(ClientError::InvalidConfig("batch load records are empty"))?;
+        self.read_client(first)
+            .load_cached_multi(records, minima)
+            .await
+    }
+
     pub async fn save(&self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, ClientError> {
         self.write_client(&request.record).save(request).await
     }
@@ -716,11 +739,34 @@ impl DbProxyClient {
             .unwrap_or(ClientError::ConnectionClosed))
     }
 
+    /// 默认读取主库已提交状态，失败不回退旧缓存。
+    /// Read committed primary state by default; never fall back to stale cache.
     pub async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, ClientError> {
+        self.load_with_options(record, false, None).await
+    }
+
+    /// 显式允许旧缓存；可选版本下限不满足时回源主库。
+    /// Opt into stale cache, falling back to the primary when the fence is unmet.
+    pub async fn load_cached(
+        &self,
+        record: &RecordKey,
+        min_revision: Option<Revision>,
+    ) -> Result<Option<SnapshotEnvelope>, ClientError> {
+        self.load_with_options(record, true, min_revision).await
+    }
+
+    async fn load_with_options(
+        &self,
+        record: &RecordKey,
+        allow_stale: bool,
+        min_revision: Option<Revision>,
+    ) -> Result<Option<SnapshotEnvelope>, ClientError> {
         let response = self
             .call(wire::request_envelope::Body::LoadSnapshot(
                 wire::LoadSnapshotRequest {
                     record: Some(record.into()),
+                    allow_stale,
+                    min_revision: min_revision.map(|r| r.0),
                 },
             ))
             .await?;
@@ -740,6 +786,31 @@ impl DbProxyClient {
         &self,
         records: &[RecordKey],
     ) -> Result<Vec<Option<SnapshotEnvelope>>, ClientError> {
+        self.load_multi_with_options(records, false, &[]).await
+    }
+
+    /// 批量缓存读取；下限为空或逐项对应，零表示无下限。
+    /// Batch cache read; fences are empty or aligned, with zero meaning no fence.
+    pub async fn load_cached_multi(
+        &self,
+        records: &[RecordKey],
+        min_revisions: &[Revision],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, ClientError> {
+        self.load_multi_with_options(records, true, min_revisions)
+            .await
+    }
+
+    async fn load_multi_with_options(
+        &self,
+        records: &[RecordKey],
+        allow_stale: bool,
+        min_revisions: &[Revision],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, ClientError> {
+        if !min_revisions.is_empty() && min_revisions.len() != records.len() {
+            return Err(ClientError::InvalidConfig(
+                "revision fences must match records",
+            ));
+        }
         if records.is_empty() || records.len() > MAX_BATCH_LOAD_RECORDS {
             return Err(ClientError::InvalidConfig(
                 "batch load size is outside the protocol limit",
@@ -754,6 +825,8 @@ impl DbProxyClient {
             .call(wire::request_envelope::Body::LoadMultiSnapshot(
                 wire::LoadMultiSnapshotRequest {
                     records: records.iter().map(Into::into).collect(),
+                    allow_stale,
+                    min_revisions: min_revisions.iter().map(|r| r.0).collect(),
                 },
             ))
             .await?;

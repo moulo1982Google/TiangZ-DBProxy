@@ -97,6 +97,8 @@ async fn fixture(
 
 fn request() -> wire::request_envelope::Body {
     wire::request_envelope::Body::LoadSnapshot(wire::LoadSnapshotRequest {
+        allow_stale: false,
+        min_revision: None,
         record: Some((&RecordKey::new("timing", "one").unwrap()).into()),
     })
 }

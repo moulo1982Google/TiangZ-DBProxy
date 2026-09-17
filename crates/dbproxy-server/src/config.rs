@@ -90,6 +90,8 @@ pub enum StorageSection {
         redis_url_env: String,
         #[serde(rename = "cacheRedisUrlEnv")]
         cache_redis_url_env: Option<String>,
+        #[serde(rename = "authoritativeReadNamespaces", default)]
+        authoritative_read_namespaces: Box<[String]>,
         #[serde(default = "default_storage_shards")]
         shards: usize,
         #[serde(
@@ -289,6 +291,7 @@ pub enum ResolvedStorage {
         postgres_url: String,
         redis_url: String,
         cache_redis_url: String,
+        authoritative_read_namespaces: Box<[String]>,
         shards: usize,
         cache_fallback_concurrency: usize,
         cache_fallback_timeout_ms: u64,
@@ -469,6 +472,7 @@ impl DbProxyConfig {
                 postgres_url_env,
                 redis_url_env,
                 cache_redis_url_env,
+                authoritative_read_namespaces,
                 shards,
                 cache_fallback_concurrency,
                 cache_fallback_timeout_ms,
@@ -485,6 +489,13 @@ impl DbProxyConfig {
                 cache_negative_ttl_ms,
                 cache_stale_while_revalidate_ms,
             } => {
+                if authoritative_read_namespaces.len() > 64
+                    || authoritative_read_namespaces
+                        .iter()
+                        .any(|n| n.is_empty() || n.trim() != n || n.len() > 256)
+                {
+                    return Err(ConfigError("storage.authoritativeReadNamespaces requires at most 64 nonempty exact namespaces of at most 256 bytes without surrounding whitespace".into()));
+                }
                 require_positive("storage.shards", shards)?;
                 require_positive(
                     "storage.cacheFallbackConcurrency",
@@ -533,6 +544,7 @@ impl DbProxyConfig {
                     postgres_url: required_environment(&environment, &postgres_url_env)?,
                     redis_url,
                     cache_redis_url,
+                    authoritative_read_namespaces,
                     shards,
                     cache_fallback_concurrency,
                     cache_fallback_timeout_ms,
@@ -945,6 +957,44 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("postgres://secret"));
         assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn cache_denial_namespaces_are_optional_and_validated() {
+        for (names, valid) in [
+            (serde_json::json!([]), true),
+            (serde_json::json!(["player", "slg.demo.player.v1"]), true),
+            (serde_json::json!([""]), false),
+            (serde_json::json!([" player"]), false),
+            (serde_json::json!(["x".repeat(257)]), false),
+            (serde_json::json!(vec!["x"; 65]), false),
+        ] {
+            let value = serde_json::json!({"configVersion":1,"server":{"listenAddr":"127.0.0.1:0","authTokenEnv":"AUTH"},
+                "storage":{"backend":"postgresRedis","postgresUrlEnv":"PG","redisUrlEnv":"REDIS","authoritativeReadNamespaces":names}});
+            let path = write_config(&value.to_string());
+            let result = load_config_with(&path, |name| {
+                Some(
+                    match name {
+                        "PG" => "postgres://local",
+                        "REDIS" => "redis://local",
+                        _ => "0123456789abcdef",
+                    }
+                    .to_string(),
+                )
+            });
+            fs::remove_file(path).unwrap();
+            assert_eq!(result.is_ok(), valid);
+            if valid {
+                let ResolvedStorage::PostgresRedis {
+                    authoritative_read_namespaces,
+                    ..
+                } = result.unwrap().storage
+                else {
+                    panic!("wrong backend")
+                };
+                assert_eq!(serde_json::json!(authoritative_read_namespaces), names);
+            }
+        }
     }
 
     #[test]

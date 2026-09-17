@@ -516,7 +516,7 @@ async fn shorter_cache_budget_does_not_cancel_pg_fallback() {
             .unwrap()
             .cache_operation_timeout = Duration::from_millis(20);
         let record = snapshot().record;
-        let mut load = Box::pin(store.load(&record));
+        let mut load = Box::pin(store.load_cached(&record));
         tokio::select! {
             result = &mut load => panic!("PG fixture must stall: {result:?}"),
             arrival = arrived => arrival.unwrap(),

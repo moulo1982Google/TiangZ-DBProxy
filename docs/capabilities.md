@@ -42,7 +42,7 @@ Rust Client / TypeScript SDK
 DBProxy Server
    ┌────┼─────────────────────────────────────────────┐
    │    │                                             │
-   │    ├─ 读快照：Redis cache ── miss/stale ──► PostgreSQL 权威库
+   │    ├─ 默认读快照：PostgreSQL 主库；显式旧读：Redis cache + PG回源
    │    │
    │    ├─ 直接写：PostgreSQL 事务 ──► durable cache repair ──► Redis cache
    │    │
@@ -53,6 +53,8 @@ DBProxy Server
 ```
 
 正式的 `postgresRedis` 模式下，PostgreSQL 保存权威数据；Redis 可以分别配置为可靠队列 Redis 和易失快照缓存 Redis。`memory` 模式只用于本地开发、协议测试和性能隔离，进程退出后数据全部丢失。
+
+默认Load/LoadMulti不依赖缓存新鲜度；批量一次SQL快照，PG失败不降级缓存。缓存只在显式允许旧数据的读取中使用，版本下限不能代替登录恢复的默认权威读取。详见[默认读取契约](default-read-contract.md)。
 
 ## 核心能力详解
 

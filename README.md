@@ -55,6 +55,8 @@ TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transpor
 
 ## 启动配置
 
+默认`load/load_multi`读取PG主库已提交状态，失败返回错误，不退回缓存；批量使用同一数据库语句快照。允许旧数据须显式调用`load_cached/load_cached_multi`（TypeScript：`LoadCached/LoadCachedMulti`），可携带版本下限。保留配置`authoritativeReadNamespaces`作为额外禁止缓存读取的保护，而非默认正确性的前提。见[默认读取契约与升级](docs/default-read-contract.md)。
+
 容器停止时，服务入口统一处理 SIGTERM/SIGINT，Windows 保留 Ctrl+C。关闭顺序、等待预算、镜像升级要求及回归方法见[优雅关闭说明](docs/graceful-shutdown.md)。
 
 缓存与 PG 回源的等待预算现分离：`storage.cacheOperationTimeoutMs` 默认 200 ms，`cacheFallbackTimeoutMs` 仍默认 2,000 ms。升级兼容、正确性边界与测试见[缓存操作预算](docs/cache-operation-budget.md)。可靠 Redis AOF/MQ 确认不使用该缓存预算。
@@ -158,6 +160,8 @@ powershell -ExecutionPolicy Bypass -File tools/network_smoke.ps1
 
 ## 业务持久化性能
 
+登录相关测量须区分保活Actor复用与离线快照加载。先结合PG配置做并发阶梯，不以过载档位作为正常性能；本地工具、复测方法及完整登录尚未覆盖的部分见[登录容量测量](docs/login-capacity-method.md)与[存储阶段对比](docs/login-storage-comparison-20260917.md)。
+
 当前4-worker MemoryBackend基线中，100并发拾取事务达到约3.53万次/秒，NPC商店事务约3.84万次/秒；30个领域使用`LoadMultiSnapshot`后，玩家恢复吞吐相对逐条读取提高约12.23倍。完整环境、延迟、并发曲线、结果边界和复现命令见[性能基线](PERFORMANCE.md)。
 
 `dbproxy_business_load`直接经过Rust客户端、TCP协议和DBProxy后端，使用Starter当前的持久化形状：
@@ -244,3 +248,5 @@ LoadTradeTransaction   按operationId和tradeId读取已提交交易回执
 ## 许可证
 
 Apache-2.0，Copyright 2025-2026 郑昕。
+
+SLG联合验收的辅助程序为`cargo build --bin dbproxy_acceptance_probe`：正式protobuf解码、显式缓存/版本栅栏与原子批量读探针，仅供隔离控制器使用，要求`DBPROXY_ACCEPTANCE_ISOLATED=1`。通过stdin/stdout JSON-lines传输，不输出Hello令牌；缓存修改限SLG/acceptance命名空间，连接目标由隔离控制器分配。它不是运维修复命令，不对业务数据运行。编排、覆盖范围及尚未执行项见[SLG权威读取验收](../TiangZ-Examples/packages/slg/docs/authoritative-read-acceptance.md)。

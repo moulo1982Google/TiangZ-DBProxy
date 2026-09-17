@@ -1,0 +1,15 @@
+{
+  "$schema": "./dbproxy.schema.json",
+  "configVersion": 1,
+  "server": { "listenAddr": "127.0.0.1:7800", "authTokenEnv": "DBPROXY_AUTH_TOKEN" },
+  "runtime": { "workerThreads": 2 },
+  "storage": {
+    "backend": "postgresRedis",
+    "postgresUrlEnv": "DBPROXY_POSTGRES_URL",
+    "redisUrlEnv": "DBPROXY_REDIS_URL",
+    "authoritativeReadNamespaces": ["player"],
+    "shards": 2,
+    "postgresConnectionWaitTimeoutMs": 2000,
+    "cacheFallbackTimeoutMs": 2000
+  }
+}

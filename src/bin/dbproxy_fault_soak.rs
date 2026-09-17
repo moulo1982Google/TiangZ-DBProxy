@@ -261,8 +261,11 @@ async fn main() -> Result<(), DynError> {
     )
     .await;
     let total = counters.snapshot();
+    let final_state_passed = validation.is_ok();
+    let observed_consistency = validate_observed_consistency(total);
+    let observed_consistency_passed = observed_consistency.is_ok();
     if validation.is_ok() {
-        validation = validate_observed_consistency(total);
+        validation = observed_consistency;
     }
     emit(
         "SOAK_FINAL",
@@ -270,6 +273,11 @@ async fn main() -> Result<(), DynError> {
             "runId": run_id.to_string(),
             "elapsedSeconds": started.elapsed().as_secs_f64(),
             "totals": total.json(),
+            "checks": {
+                "finalClientVisibleStatePassed": final_state_passed,
+                "observedConsistencyPassed": observed_consistency_passed,
+                "scope": "client-visible revision/queued sequence/latest trade; not full SQL asset reconciliation",
+            },
             "validation": {
                 "passed": validation.is_ok(),
                 "message": validation.as_ref().err().map(ToString::to_string),
@@ -424,6 +432,11 @@ async fn observe_direct_snapshot(
     state: &PlayerState,
     counters: &Counters,
 ) {
+    let read_started_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let read_started = Instant::now();
     match pool.load(&state.direct_record).await {
         Ok(Some(snapshot)) => {
             counters.load_ok.fetch_add(1, Ordering::Relaxed);
@@ -435,6 +448,13 @@ async fn observe_direct_snapshot(
                     emit(
                         "SOAK_OLD_READ",
                         json!({
+                            "readStartedUnixMs": read_started_unix_ms,
+                            "readFinishedUnixMs": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+                            "readElapsedMicros": read_started.elapsed().as_micros(),
+                            "playerIndex": state.index,
+                            "acknowledgedTransactionSequence": state.transaction_sequence,
+                            "endpoint": null,
+                            "readSource": "not exposed by client SDK",
                             "record": {"namespace":state.direct_record.namespace,"key":state.direct_record.key},
                             "acknowledgedRevision":state.direct_revision.0,
                             "observedRevision":snapshot.revision.0,

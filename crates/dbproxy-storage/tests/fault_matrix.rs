@@ -74,7 +74,7 @@ async fn ephemeral_cache_restart_cannot_restore_an_acknowledged_old_revision() {
         .await
         .unwrap();
     for snapshot in [
-        reader.load(&key).await.unwrap().unwrap(),
+        reader.load_cached(&key).await.unwrap().unwrap(),
         reader.load_multi(&[key]).await.unwrap().remove(0).unwrap(),
     ] {
         assert_eq!(
@@ -259,7 +259,7 @@ async fn redis_outage_falls_back_and_retry_repairs_cache() {
     ));
 
     let mut redis = RestartGuard::stop(REDIS_CONTAINER);
-    let fallback = tokio::time::timeout(Duration::from_secs(5), store.load(&key))
+    let fallback = tokio::time::timeout(Duration::from_secs(5), store.load_cached(&key))
         .await
         .expect("PostgreSQL fallback must not hang when Redis is down")
         .unwrap()
@@ -286,7 +286,7 @@ async fn redis_outage_falls_back_and_retry_repairs_cache() {
         "a durable cache repair row lets DBProxy report the authoritative commit"
     );
 
-    let durable = store.load(&key).await.unwrap().unwrap();
+    let durable = store.load_cached(&key).await.unwrap().unwrap();
     assert_eq!(durable.revision, Revision(2));
     redis.restart();
 
@@ -350,7 +350,15 @@ async fn postgres_outage_never_reports_a_successful_write() {
     store.apply(first).await.unwrap();
 
     let mut postgres = RestartGuard::stop(POSTGRES_CONTAINER);
-    let cached = tokio::time::timeout(Duration::from_secs(5), store.load(&key))
+    // 默认读取不能在主库故障时返回缓存成功。
+    // Default reads must fail when the primary is unavailable.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), store.load(&key))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    let cached = tokio::time::timeout(Duration::from_secs(5), store.load_cached(&key))
         .await
         .expect("Redis cache read must not hang when PostgreSQL is down")
         .unwrap()

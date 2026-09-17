@@ -53,6 +53,9 @@ message SnapshotEnvelope {
 
 message LoadSnapshotRequest {
   RecordKey record = 1;
+  // 默认读取PG；只有显式选择才允许旧缓存。 / PG by default; stale cache is opt-in.
+  bool allow_stale = 2;
+  optional uint64 min_revision = 3;
 }
 
 message LoadSnapshotResponse {
@@ -61,6 +64,10 @@ message LoadSnapshotResponse {
 
 message LoadMultiSnapshotRequest {
   repeated RecordKey records = 1;
+  bool allow_stale = 2;
+  // 空列表表示无下限；否则与records逐项对应，0表示无下限。
+  // Empty means no fences; otherwise align with records, with zero meaning no fence.
+  repeated uint64 min_revisions = 3;
 }
 
 // Entries preserve request order. A missing snapshot represents an absent record.

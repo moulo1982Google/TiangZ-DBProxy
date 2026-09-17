@@ -29,6 +29,99 @@ fn test_suffix() -> String {
     format!("{}-{}", std::process::id(), nanos)
 }
 
+/// 写缓存暂停但旧缓存仍可读：成功ACK后从独立读取连接不得返回旧版本。
+/// A successful durable write must not expose the previous cached revision to a subsequent reader.
+#[tokio::test]
+#[ignore = "需要独立PG/Redis且无业务worker；暂停Redis写入，串行执行；权威读取回归"]
+async fn acknowledged_write_timeout_must_not_expose_old_cache() {
+    let pg = std::env::var("DBPROXY_POSTGRES_URL").unwrap();
+    let redis_url = std::env::var("DBPROXY_CACHE_REDIS_URL")
+        .or_else(|_| std::env::var("DBPROXY_REDIS_URL"))
+        .unwrap();
+    let config = || TieredSnapshotStoreConfig {
+        cache_operation_timeout: Duration::from_millis(40),
+        ..Default::default()
+    };
+    let mut writer = TieredSnapshotStore::connect_with_config(
+        &pg,
+        &redis_url,
+        config(),
+        Arc::new(StorageMetrics::default()),
+    )
+    .await
+    .unwrap();
+    let reader = TieredSnapshotStore::connect_with_config(
+        &pg,
+        &redis_url,
+        config(),
+        Arc::new(StorageMetrics::default()),
+    )
+    .await
+    .unwrap();
+    let record = RecordKey::new("ack-old-cache-regression", test_suffix()).unwrap();
+    writer
+        .save(SnapshotWrite {
+            request_id: format!("seed:{}", record.key),
+            record: record.clone(),
+            schema: "regression".into(),
+            schema_version: 1,
+            payload: vec![1],
+            expected_revision: Some(Revision::ZERO),
+            updated_at_unix_ms: 1,
+        })
+        .await
+        .unwrap();
+    let before = reader.load(&record).await.unwrap().unwrap();
+    let mut admin = redis::Client::open(redis_url)
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(10000)
+        .arg("WRITE")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    // 在恢复依赖前捕获所有Result；外层超时和Redis自动恢复限制异常退出的影响。
+    let observed = tokio::time::timeout(Duration::from_secs(2), async {
+        let ack = writer
+            .apply(TransactionalWrite {
+                operation_id: format!("commit:{}", record.key),
+                record: record.clone(),
+                schema: "regression".into(),
+                schema_version: 1,
+                payload: vec![2],
+                expected_revision: before.revision,
+                result: vec![2],
+                updated_at_unix_ms: 2,
+            })
+            .await?;
+        let snapshot = reader.load(&record).await?;
+        Ok::<_, StorageError>((ack, snapshot))
+    })
+    .await;
+    let unpause: redis::RedisResult<()> = redis::cmd("CLIENT")
+        .arg("UNPAUSE")
+        .query_async(&mut admin)
+        .await;
+    unpause.unwrap();
+    let (ack, snapshot) = observed
+        .expect("bounded regression timed out")
+        .expect("regression request failed");
+    let revision = match ack {
+        TransactionalWriteOutcome::Applied { new_revision, .. }
+        | TransactionalWriteOutcome::Duplicate { new_revision, .. } => new_revision,
+    };
+    let snapshot = snapshot.expect("acknowledged record missing");
+    assert_eq!(
+        snapshot.revision, revision,
+        "successful ACK followed by stale cache read"
+    );
+    assert_eq!(snapshot.payload, vec![2]);
+}
+
 #[tokio::test]
 #[ignore = "需要独立 PostgreSQL/Redis；会暂停缓存写入，必须串行运行"]
 async fn cache_write_timeout_preserves_committed_batch_and_durable_repair() {
@@ -477,7 +570,7 @@ async fn postgres_and_redis_preserve_snapshot_semantics() {
     let cache = RedisSnapshotCache::connect(&redis_url).await.unwrap();
     cache.delete(&key).await.unwrap();
     let loaded = store
-        .load_multi(&[missing.clone(), key.clone()])
+        .load_cached_multi(&[missing.clone(), key.clone()])
         .await
         .unwrap();
     assert_eq!(loaded.len(), 2);
@@ -784,7 +877,7 @@ async fn distributed_fallback_lock_rechecks_cache_before_postgres() {
             .unwrap();
     });
 
-    let loaded = tokio::time::timeout(Duration::from_secs(2), store.load(&key))
+    let loaded = tokio::time::timeout(Duration::from_secs(2), store.load_cached(&key))
         .await
         .expect("distributed lock wait must not hang")
         .unwrap()
@@ -803,7 +896,7 @@ async fn distributed_fallback_lock_rechecks_cache_before_postgres() {
         .unwrap();
     cache.delete(&key).await.unwrap();
 
-    let loaded = store.load(&key).await.unwrap().unwrap();
+    let loaded = store.load_cached(&key).await.unwrap().unwrap();
     assert_eq!(loaded.payload, b"durable");
     let snapshot = metrics.snapshot();
     assert!(snapshot.cache_fallback_lock_acquired >= 1);
@@ -895,7 +988,7 @@ async fn cache_lifecycle_renews_serves_stale_and_negative_caches() {
 
     tokio::time::sleep(Duration::from_millis(220)).await;
     let refreshes_before = metrics.snapshot().cache_refresh_completed;
-    let stale = tokio::time::timeout(Duration::from_millis(500), store.load(&key))
+    let stale = tokio::time::timeout(Duration::from_millis(500), store.load_cached(&key))
         .await
         .expect("stale reads must return without waiting for PostgreSQL")
         .unwrap()
@@ -923,13 +1016,13 @@ async fn cache_lifecycle_renews_serves_stale_and_negative_caches() {
     let missing = RecordKey::new("cache-lifecycle", format!("missing-{}", test_suffix())).unwrap();
     cache.delete(&missing).await.unwrap();
     let fallbacks_before = metrics.snapshot().postgres_fallbacks;
-    assert!(store.load(&missing).await.unwrap().is_none());
+    assert!(store.load_cached(&missing).await.unwrap().is_none());
     let fallbacks_after_first = metrics.snapshot().postgres_fallbacks;
     assert_eq!(fallbacks_after_first, fallbacks_before + 1);
-    assert!(store.load(&missing).await.unwrap().is_none());
+    assert!(store.load_cached(&missing).await.unwrap().is_none());
     assert!(
         store
-            .load_multi(std::slice::from_ref(&missing))
+            .load_cached_multi(std::slice::from_ref(&missing))
             .await
             .unwrap()[0]
             .is_none()
@@ -970,7 +1063,7 @@ async fn cache_lifecycle_renews_serves_stale_and_negative_caches() {
         "a committed write must clear negative cache"
     );
     assert_eq!(
-        store.load(&missing).await.unwrap().unwrap().payload,
+        store.load_cached(&missing).await.unwrap().unwrap().payload,
         b"created"
     );
 

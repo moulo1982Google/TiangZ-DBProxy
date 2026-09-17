@@ -279,6 +279,9 @@ export interface DbProxyTransport {
   loadMulti(
     records: readonly DbProxyRecordKey[],
   ): Promise<readonly (DbProxySnapshotEnvelope | undefined)[]>;
+  /** 显式旧读；宿主必须传递版本下限，不能静默忽略。 / Explicit stale reads; hosts must honor fences. */
+  loadCached?(record: DbProxyRecordKey, minRevision?: bigint): Promise<DbProxySnapshotEnvelope | undefined>;
+  loadCachedMulti?(records: readonly DbProxyRecordKey[], minRevisions: readonly bigint[]): Promise<readonly (DbProxySnapshotEnvelope | undefined)[]>;
   save(write: DbProxySnapshotWrite): Promise<DbProxySnapshotWriteResult>;
   saveMulti(
     writes: readonly DbProxySnapshotWrite[],
@@ -374,6 +377,40 @@ export class DbProxyClient {
           throw new TypeError("batch load snapshot identity does not match its request");
         }
         return cloned;
+      });
+    });
+  }
+
+  /** 显式允许旧数据；新登录恢复应使用Load。 / Opt into stale data; use Load for login recovery. */
+  LoadCached(record: DbProxyRecordKey, minRevision?: bigint): Promise<DbProxySnapshotEnvelope | undefined> {
+    const stable = cloneRecordKey(record);
+    const minimum = minRevision === undefined ? undefined : requireUint64(minRevision, "minRevision");
+    if (!this.transport.loadCached) throw new Error("DBProxy transport does not support cached reads");
+    return this.transport.loadCached(stable, minimum).then(snapshot => {
+      const result = snapshot ? cloneSnapshot(snapshot) : undefined;
+      if (result && (result.record.namespace !== stable.namespace || result.record.key !== stable.key)) {
+        throw new TypeError("cached load snapshot identity does not match its request");
+      }
+      checkReadFence(result, minimum ?? 0n);
+      return result;
+    });
+  }
+
+  /** 下限为空或逐项对应；任一不满足须整批回源。 / Empty or aligned fences; fall back as a whole batch. */
+  LoadCachedMulti(records: readonly DbProxyRecordKey[], minRevisions: readonly bigint[] = []): Promise<readonly (DbProxySnapshotEnvelope | undefined)[]> {
+    const stable = cloneBatchLoadRecords(records);
+    const minima = minRevisions.map(r => requireUint64(r, "minRevisions"));
+    if (minima.length !== 0 && minima.length !== stable.length) throw new TypeError("revision fences must match records");
+    if (!this.transport.loadCachedMulti) throw new Error("DBProxy transport does not support cached batch reads");
+    return this.transport.loadCachedMulti(stable, minima).then(snapshots => {
+      if (!Array.isArray(snapshots) || snapshots.length !== stable.length) throw new TypeError("batch load result count does not match its request");
+      return snapshots.map((snapshot, i) => {
+        const result = snapshot ? cloneSnapshot(snapshot) : undefined;
+        if (result && (result.record.namespace !== stable[i].namespace || result.record.key !== stable[i].key)) {
+          throw new TypeError("cached batch snapshot identity does not match its request");
+        }
+        checkReadFence(result, minima[i] ?? 0n);
+        return result;
       });
     });
   }
@@ -1096,4 +1133,11 @@ function copyBytes(value: Uint8Array): Uint8Array {
     throw new TypeError("DBProxy payload must be Uint8Array");
   }
   return value.slice();
+}
+
+/** 下限不满足时返回可重试错误，不将缺失伪装为成功。 / Unmet fences return a retryable error, including absence. */
+function checkReadFence(snapshot: DbProxySnapshotEnvelope | undefined, minimum: bigint): void {
+  if (minimum > 0n && (!snapshot || snapshot.revision < minimum)) {
+    throw new DbProxyRemoteError(DbProxyErrorCode.StorageUnavailable, "read revision fence was not satisfied", snapshot?.revision);
+  }
 }

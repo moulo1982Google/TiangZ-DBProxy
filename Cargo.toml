@@ -50,4 +50,6 @@ tiangz-dbproxy-client = { path = "crates/dbproxy-client" }
 tiangz-dbproxy-protocol = { path = "crates/dbproxy-protocol" }
 tiangz-dbproxy-storage = { path = "crates/dbproxy-storage" }
 serde_json.workspace = true
+prost.workspace = true
 tokio.workspace = true
+tokio-postgres.workspace = true

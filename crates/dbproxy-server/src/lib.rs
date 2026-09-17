@@ -103,6 +103,20 @@ pub trait DbProxyBackend: Send + Sync + 'static {
         }
         Ok(snapshots)
     }
+    /// 显式缓存读取允许旧数据；没有缓存的后端仍可返回权威状态。
+    /// Explicit cache reads allow stale data; uncached backends may return authority.
+    async fn load_cached(
+        &self,
+        record: &RecordKey,
+    ) -> Result<Option<SnapshotEnvelope>, BackendError> {
+        self.load(record).await
+    }
+    async fn load_cached_multi(
+        &self,
+        records: &[RecordKey],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, BackendError> {
+        self.load_multi(records).await
+    }
     async fn save(&self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, BackendError>;
     async fn save_multi(
         &self,
@@ -185,6 +199,7 @@ pub trait DbProxyBackend: Send + Sync + 'static {
 /// Real PostgreSQL/Redis backend. Stable record sharding avoids one global client lock.
 pub struct StorageBackend {
     shards: Vec<TieredSnapshotStore>,
+    authoritative_read_namespaces: Vec<String>,
     backlog: RedisSnapshotBacklog,
     cache_repairs: PostgresCacheRepairQueue,
     cache_acknowledgements: CacheRepairAcknowledgements,
@@ -316,6 +331,7 @@ impl StorageBackend {
         }
         Ok(Self {
             shards,
+            authoritative_read_namespaces: Vec::new(),
             backlog: RedisSnapshotBacklog::connect(redis_url).await?,
             cache_repairs,
             cache_acknowledgements,
@@ -325,6 +341,25 @@ impl StorageBackend {
             outbox_relay_metrics: Arc::new(relay_metrics::RelayMetrics::new(&relay.routes)),
             metrics,
         })
+    }
+
+    /// 启动前配置精确命名空间匹配；不使用通配符，也不运行时切换。
+    /// Configure exact namespace matches before serving; no wildcard or live switching.
+    pub fn with_authoritative_read_namespaces(
+        mut self,
+        namespaces: Vec<String>,
+    ) -> Result<Self, BackendError> {
+        if namespaces.len() > 64
+            || namespaces
+                .iter()
+                .any(|n| n.is_empty() || n.trim() != n || n.len() > 256)
+        {
+            return Err(BackendError::InvalidConfig(
+                "invalid authoritative read namespaces",
+            ));
+        }
+        self.authoritative_read_namespaces = namespaces;
+        Ok(self)
     }
 
     pub fn metrics(&self) -> &StorageMetrics {
@@ -589,40 +624,41 @@ impl DbProxyBackend for StorageBackend {
         &self,
         records: &[RecordKey],
     ) -> Result<Vec<Option<SnapshotEnvelope>>, BackendError> {
-        let mut groups = vec![Vec::new(); self.shards.len()];
-        for (request_index, record) in records.iter().enumerate() {
-            groups[self.shard_index(record)].push((request_index, record.clone()));
-        }
+        let Some(first) = records.first() else {
+            return Ok(Vec::new());
+        };
+        // 所有分片连接同一主库；整批只执行一次查询以保证同一快照。
+        // Shards connect to one primary; one query preserves a single batch snapshot.
+        Ok(self.shard(first).load_multi(records).await?)
+    }
 
-        let mut workers = JoinSet::new();
-        for (shard_index, group) in groups.into_iter().enumerate() {
-            if group.is_empty() {
-                continue;
-            }
-            let shard = self.shards[shard_index].clone();
-            workers.spawn(async move {
-                let records = group
-                    .iter()
-                    .map(|(_, record)| record.clone())
-                    .collect::<Vec<_>>();
-                let snapshots = shard.load_multi(&records).await?;
-                let loaded = group
-                    .into_iter()
-                    .zip(snapshots)
-                    .map(|((request_index, _), snapshot)| (request_index, snapshot))
-                    .collect::<Vec<_>>();
-                Ok::<_, StorageError>(loaded)
-            });
+    async fn load_cached(
+        &self,
+        record: &RecordKey,
+    ) -> Result<Option<SnapshotEnvelope>, BackendError> {
+        if self
+            .authoritative_read_namespaces
+            .contains(&record.namespace)
+        {
+            return self.load(record).await;
         }
+        Ok(self.shard(record).load_cached(record).await?)
+    }
 
-        let mut snapshots = vec![None; records.len()];
-        while let Some(result) = workers.join_next().await {
-            let loaded = result.map_err(|error| BackendError::Worker(error.to_string()))??;
-            for (request_index, snapshot) in loaded {
-                snapshots[request_index] = snapshot;
-            }
+    async fn load_cached_multi(
+        &self,
+        records: &[RecordKey],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, BackendError> {
+        let Some(first) = records.first() else {
+            return Ok(Vec::new());
+        };
+        if records
+            .iter()
+            .any(|r| self.authoritative_read_namespaces.contains(&r.namespace))
+        {
+            return self.load_multi(records).await;
         }
-        Ok(snapshots)
+        Ok(self.shard(first).load_cached_multi(records).await?)
     }
 
     async fn save(&self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, BackendError> {
@@ -1505,6 +1541,24 @@ async fn dispatch(
     }
 }
 
+// 零下限允许缺失；正下限要求实际记录达到该版本。
+// Zero allows absence; a positive fence requires an existing sufficiently new record.
+fn meets_read_fence(snapshot: &Option<SnapshotEnvelope>, minimum: u64) -> bool {
+    minimum == 0 || snapshot.as_ref().is_some_and(|s| s.revision.0 >= minimum)
+}
+
+fn require_read_fence(snapshot: &Option<SnapshotEnvelope>, minimum: u64) -> Result<(), RpcFailure> {
+    if meets_read_fence(snapshot, minimum) {
+        return Ok(());
+    }
+    Err(RpcFailure {
+        code: wire::ErrorCode::StorageUnavailable,
+        public_message: "committed snapshot has not reached the requested revision; retry the read"
+            .into(),
+        actual_revision: snapshot.as_ref().map(|s| s.revision.0),
+    })
+}
+
 async fn dispatch_body(
     body: Option<wire::request_envelope::Body>,
     backend: &dyn DbProxyBackend,
@@ -1517,10 +1571,20 @@ async fn dispatch_body(
                 .ok_or_else(|| RpcFailure::invalid("load_snapshot.record is missing"))?
                 .try_into()
                 .map_err(RpcFailure::from_protocol)?;
-            let snapshot = backend
-                .load(&record)
-                .await
-                .map_err(RpcFailure::from_backend)?;
+            let mut snapshot = if request.allow_stale {
+                backend.load_cached(&record).await
+            } else {
+                backend.load(&record).await
+            }
+            .map_err(RpcFailure::from_backend)?;
+            let minimum = request.min_revision.unwrap_or(0);
+            if request.allow_stale && !meets_read_fence(&snapshot, minimum) {
+                snapshot = backend
+                    .load(&record)
+                    .await
+                    .map_err(RpcFailure::from_backend)?;
+            }
+            require_read_fence(&snapshot, minimum)?;
             Ok(wire::response_envelope::Body::LoadSnapshot(
                 wire::LoadSnapshotResponse {
                     snapshot: snapshot.as_ref().map(Into::into),
@@ -1547,10 +1611,38 @@ async fn dispatch_body(
                     "load_multi_snapshot.records contains duplicates",
                 ));
             }
-            let snapshots = backend
-                .load_multi(&records)
-                .await
-                .map_err(RpcFailure::from_backend)?;
+            if !request.min_revisions.is_empty() && request.min_revisions.len() != records.len() {
+                return Err(RpcFailure::invalid(
+                    "min_revisions must be empty or match records",
+                ));
+            }
+            let minima = if request.min_revisions.is_empty() {
+                vec![0; records.len()]
+            } else {
+                request.min_revisions
+            };
+            let mut snapshots = if request.allow_stale {
+                backend.load_cached_multi(&records).await
+            } else {
+                backend.load_multi(&records).await
+            }
+            .map_err(RpcFailure::from_backend)?;
+            if request.allow_stale
+                && snapshots
+                    .iter()
+                    .zip(&minima)
+                    .any(|(s, m)| !meets_read_fence(s, *m))
+            {
+                // 任一栅栏不满足时整批回源，不能混合两次读取的结果。
+                // Fall back as a whole batch rather than merging snapshots from two reads.
+                snapshots = backend
+                    .load_multi(&records)
+                    .await
+                    .map_err(RpcFailure::from_backend)?;
+            }
+            for (snapshot, minimum) in snapshots.iter().zip(minima) {
+                require_read_fence(snapshot, minimum)?;
+            }
             if snapshots.len() != records.len() {
                 return Err(RpcFailure::internal(
                     "backend returned a mismatched batch load result",

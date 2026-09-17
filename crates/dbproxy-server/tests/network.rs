@@ -29,6 +29,7 @@ use tokio::{net::TcpStream, sync::Mutex, sync::watch, task::JoinHandle};
 #[derive(Default)]
 struct MemoryBackend {
     snapshots: Mutex<InMemorySnapshotStore>,
+    cached_snapshots: Mutex<InMemorySnapshotStore>,
     transactions: Mutex<InMemoryTransactionalStore>,
     multi_transactions: Mutex<InMemoryMultiRecordTransactionStore>,
     queued: Mutex<Vec<SnapshotWrite>>,
@@ -38,6 +39,24 @@ struct MemoryBackend {
 impl DbProxyBackend for MemoryBackend {
     async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, BackendError> {
         Ok(self.snapshots.lock().await.load(record)?)
+    }
+
+    async fn load_cached(
+        &self,
+        record: &RecordKey,
+    ) -> Result<Option<SnapshotEnvelope>, BackendError> {
+        Ok(self.cached_snapshots.lock().await.load(record)?)
+    }
+
+    async fn load_cached_multi(
+        &self,
+        records: &[RecordKey],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, BackendError> {
+        let cache = self.cached_snapshots.lock().await;
+        records
+            .iter()
+            .map(|r| cache.load(r).map_err(Into::into))
+            .collect()
     }
 
     async fn save(&self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, BackendError> {
@@ -478,6 +497,8 @@ async fn legacy_line_ending_fingerprint_is_accepted_and_echoed() {
                     rpc_id: 1,
                     body: Some(wire::request_envelope::Body::LoadSnapshot(
                         wire::LoadSnapshotRequest {
+                            allow_stale: false,
+                            min_revision: None,
                             record: Some(wire::RecordKey {
                                 namespace: "document".into(),
                                 key: "legacy".into(),
@@ -959,5 +980,74 @@ async fn trade_transaction_round_trip_preserves_state_ledger_and_receipt() {
     assert_eq!(receipt.records.len(), 2);
     assert_eq!(receipt.ledger_posting_ids.len(), 2);
     assert_eq!(receipt.outbox_event_ids, ["network-trade-event"]);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn wire_reads_default_to_authority_and_cache_fences_fail_closed() {
+    let backend = Arc::new(MemoryBackend::default());
+    let first = snapshot("cache-seed", Some(Revision::ZERO));
+    backend
+        .cached_snapshots
+        .lock()
+        .await
+        .save(first.clone())
+        .unwrap();
+    backend.save(first.clone()).await.unwrap();
+    let mut second = snapshot("new-commit", Some(Revision(1)));
+    second.payload = b"new".to_vec();
+    backend.save(second).await.unwrap();
+    let server = TestServer::start_with_backend("read-contract-token", backend).await;
+    let client = DbProxyClient::connect(ClientConfig::new(
+        &server.endpoint,
+        "read-contract-token",
+        "read-contract",
+    ))
+    .await
+    .unwrap();
+    let key = first.record;
+    let missing = RecordKey::new("player", "missing").unwrap();
+    assert_eq!(
+        client.load(&key).await.unwrap().unwrap().revision,
+        Revision(2)
+    );
+    assert_eq!(
+        client
+            .load_cached(&key, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        Revision(1)
+    );
+    assert_eq!(
+        client
+            .load_cached(&key, Some(Revision(2)))
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        Revision(2)
+    );
+    let fenced = client
+        .load_cached_multi(
+            &[missing.clone(), key.clone()],
+            &[Revision::ZERO, Revision(2)],
+        )
+        .await
+        .unwrap();
+    assert!(fenced[0].is_none());
+    assert_eq!(fenced[1].as_ref().unwrap().revision, Revision(2));
+    for (record, fence) in [(&key, Revision(3)), (&missing, Revision(1))] {
+        assert!(matches!(client.load_cached(record, Some(fence)).await,
+            Err(ClientError::Remote(e)) if e.code == wire::ErrorCode::StorageUnavailable));
+    }
+    // 普通入队只代表接收，不能使默认读取凭空出现未提交状态。
+    // Enqueue acceptance must not manufacture committed state for default reads.
+    let mut queued = snapshot("queued-only", None);
+    queued.record = missing.clone();
+    client.enqueue_snapshot(queued).await.unwrap();
+    assert!(client.load(&missing).await.unwrap().is_none());
+    drop(client);
     server.stop().await;
 }

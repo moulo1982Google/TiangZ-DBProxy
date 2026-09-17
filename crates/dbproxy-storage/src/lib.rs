@@ -3357,10 +3357,196 @@ impl TieredSnapshotStore {
         }
     }
 
+    /// 在一个PG语句快照中读取已提交记录，不查询/回填Redis，也不等待backlog。
+    /// Read committed records in one PG statement; never consult cache or drain backlog.
+    pub async fn load_authoritative_multi(
+        &self,
+        records: &[RecordKey],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, StorageError> {
+        // 复用请求分片的连接锁与排队预算；外层预算还覆盖重连和查询。
+        // Reuse the shard connection gate; the outer budget also covers reconnect/query.
+        match timeout(
+            self.read_coordinator.timeout(),
+            self.postgres.load_multi(records),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(self.read_coordinator.timeout_error()),
+        }
+    }
+
+    /// 显式允许旧缓存；需要权威状态的调用使用load。
+    /// Explicitly allow stale cache; use load for authoritative state.
+    pub async fn load_cached(
+        &self,
+        record: &RecordKey,
+    ) -> Result<Option<SnapshotEnvelope>, StorageError> {
+        // Redis是加速层；读取失败必须回源权威PostgreSQL，不能把缓存故障扩大成数据不可用。
+        // Redis is an acceleration layer; read failures must fall back to authoritative PostgreSQL.
+        let mut cache_available = true;
+        let cached = match self.lookup_cache(record, true).await {
+            Ok(lookup) => lookup,
+            Err(error) => {
+                cache_available = !Self::cache_connection_unavailable(&error);
+                tracing::warn!(%error, namespace = %record.namespace, key = %record.key, "snapshot cache read failed; falling back to postgres");
+                CacheLookup::Miss
+            }
+        };
+        match cached {
+            CacheLookup::Fresh(snapshot) => return Ok(Some(snapshot)),
+            CacheLookup::Stale(snapshot) => {
+                self.schedule_cache_refresh(record);
+                return Ok(Some(snapshot));
+            }
+            CacheLookup::Negative => return Ok(None),
+            CacheLookup::Miss => {}
+        }
+
+        // Serialize the fallback path for this record and cap unrelated misses globally.
+        let _fallback_slot = match self.read_coordinator.acquire_fallback().await {
+            Ok(slot) => slot,
+            Err(error) => {
+                self.metrics.postgres_fallback();
+                self.record_fallback_error(&error);
+                return Err(error);
+            }
+        };
+        let _key_guard = self.read_coordinator.acquire_key(record).await;
+        let cached = if cache_available {
+            match self.lookup_cache(record, false).await {
+                Ok(lookup) => lookup,
+                Err(error) => {
+                    cache_available &= !Self::cache_connection_unavailable(&error);
+                    tracing::warn!(%error, namespace = %record.namespace, key = %record.key, "snapshot cache recheck failed; falling back to postgres");
+                    CacheLookup::Miss
+                }
+            }
+        } else {
+            CacheLookup::Miss
+        };
+        match cached {
+            CacheLookup::Fresh(snapshot) => return Ok(Some(snapshot)),
+            CacheLookup::Stale(snapshot) => {
+                self.schedule_cache_refresh(record);
+                return Ok(Some(snapshot));
+            }
+            CacheLookup::Negative => return Ok(None),
+            CacheLookup::Miss => {}
+        }
+
+        let mut distributed_lock = if cache_available {
+            match self.acquire_fallback_lock(record).await {
+                CacheFallbackLockOutcome::Acquired(lock) => Some(lock),
+                CacheFallbackLockOutcome::CacheFilled(snapshot) => return Ok(Some(snapshot)),
+                CacheFallbackLockOutcome::NegativeFilled => return Ok(None),
+                CacheFallbackLockOutcome::Unavailable => None,
+            }
+        } else {
+            None
+        };
+        if distributed_lock.is_some() {
+            let cached = match self.lookup_cache(record, false).await {
+                Ok(lookup) => lookup,
+                Err(error) => {
+                    cache_available &= !Self::cache_connection_unavailable(&error);
+                    tracing::debug!(%error, namespace = %record.namespace, key = %record.key, "distributed-lock cache recheck failed; falling back to postgres");
+                    CacheLookup::Miss
+                }
+            };
+            match cached {
+                CacheLookup::Fresh(snapshot) => {
+                    if let Some(lock) = distributed_lock.take() {
+                        self.release_fallback_lock(lock).await;
+                    }
+                    return Ok(Some(snapshot));
+                }
+                CacheLookup::Stale(snapshot) => {
+                    if let Some(lock) = distributed_lock.take() {
+                        self.release_fallback_lock(lock).await;
+                    }
+                    self.schedule_cache_refresh(record);
+                    return Ok(Some(snapshot));
+                }
+                CacheLookup::Negative => {
+                    if let Some(lock) = distributed_lock.take() {
+                        self.release_fallback_lock(lock).await;
+                    }
+                    return Ok(None);
+                }
+                CacheLookup::Miss => {}
+            }
+        }
+
+        let circuit_permit = match self.read_coordinator.allow_fallback() {
+            Ok(permit) => permit,
+            Err(error) => {
+                if let Some(lock) = distributed_lock.take() {
+                    self.release_fallback_lock(lock).await;
+                }
+                self.metrics.postgres_fallback();
+                self.record_fallback_error(&error);
+                return Err(error);
+            }
+        };
+        self.metrics.postgres_fallback();
+        let fallback_result =
+            match timeout(self.read_coordinator.timeout(), self.postgres.load(record)).await {
+                Ok(Ok(snapshot)) => {
+                    self.read_coordinator.fallback_succeeded(circuit_permit);
+                    Ok(snapshot)
+                }
+                Ok(Err(error)) => {
+                    self.read_coordinator.fallback_failed(circuit_permit);
+                    self.record_fallback_error(&error);
+                    Err(error)
+                }
+                Err(_) => {
+                    self.read_coordinator.fallback_failed(circuit_permit);
+                    let error = self.read_coordinator.timeout_error();
+                    self.record_fallback_error(&error);
+                    Err(error)
+                }
+            };
+        let snapshot = match fallback_result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if let Some(lock) = distributed_lock.take() {
+                    self.release_fallback_lock(lock).await;
+                }
+                return Err(error);
+            }
+        };
+        if cache_available {
+            if let Some(snapshot) = &snapshot
+                && let Err(error) = self.put_cache(snapshot).await
+            {
+                tracing::warn!(%error, namespace = %record.namespace, key = %record.key, "snapshot cache warmup failed");
+            } else if snapshot.is_none()
+                && let Err(error) = self.put_negative_cache(record, None).await
+            {
+                tracing::warn!(%error, namespace = %record.namespace, key = %record.key, "negative snapshot cache warmup failed");
+            }
+        }
+        if let Some(lock) = distributed_lock.take() {
+            self.release_fallback_lock(lock).await;
+        }
+        Ok(snapshot)
+    }
+
+    /// 同一PG语句快照读取整批，失败不回退缓存。
+    /// Read the whole batch in one PG statement snapshot, without cache fallback.
+    pub async fn load_multi(
+        &self,
+        records: &[RecordKey],
+    ) -> Result<Vec<Option<SnapshotEnvelope>>, StorageError> {
+        self.load_authoritative_multi(records).await
+    }
+
     /// 批量读取缓存，并用一次PostgreSQL查询回源全部未命中记录。
     /// Batch-read cache entries and resolve all misses with one PostgreSQL query.
     /// Concurrent callers recheck under per-record gates so a hot miss is not fanned out to PostgreSQL.
-    pub async fn load_multi(
+    pub async fn load_cached_multi(
         &self,
         records: &[RecordKey],
     ) -> Result<Vec<Option<SnapshotEnvelope>>, StorageError> {
@@ -3609,156 +3795,11 @@ impl AsyncSnapshotStore for TieredSnapshotStore {
     type Error = StorageError;
 
     async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, Self::Error> {
-        // Redis是加速层；读取失败必须回源权威PostgreSQL，不能把缓存故障扩大成数据不可用。
-        // Redis is an acceleration layer; read failures must fall back to authoritative PostgreSQL.
-        let mut cache_available = true;
-        let cached = match self.lookup_cache(record, true).await {
-            Ok(lookup) => lookup,
-            Err(error) => {
-                cache_available = !Self::cache_connection_unavailable(&error);
-                tracing::warn!(%error, namespace = %record.namespace, key = %record.key, "snapshot cache read failed; falling back to postgres");
-                CacheLookup::Miss
-            }
-        };
-        match cached {
-            CacheLookup::Fresh(snapshot) => return Ok(Some(snapshot)),
-            CacheLookup::Stale(snapshot) => {
-                self.schedule_cache_refresh(record);
-                return Ok(Some(snapshot));
-            }
-            CacheLookup::Negative => return Ok(None),
-            CacheLookup::Miss => {}
-        }
-
-        // Serialize the fallback path for this record and cap unrelated misses globally.
-        let _fallback_slot = match self.read_coordinator.acquire_fallback().await {
-            Ok(slot) => slot,
-            Err(error) => {
-                self.metrics.postgres_fallback();
-                self.record_fallback_error(&error);
-                return Err(error);
-            }
-        };
-        let _key_guard = self.read_coordinator.acquire_key(record).await;
-        let cached = if cache_available {
-            match self.lookup_cache(record, false).await {
-                Ok(lookup) => lookup,
-                Err(error) => {
-                    cache_available &= !Self::cache_connection_unavailable(&error);
-                    tracing::warn!(%error, namespace = %record.namespace, key = %record.key, "snapshot cache recheck failed; falling back to postgres");
-                    CacheLookup::Miss
-                }
-            }
-        } else {
-            CacheLookup::Miss
-        };
-        match cached {
-            CacheLookup::Fresh(snapshot) => return Ok(Some(snapshot)),
-            CacheLookup::Stale(snapshot) => {
-                self.schedule_cache_refresh(record);
-                return Ok(Some(snapshot));
-            }
-            CacheLookup::Negative => return Ok(None),
-            CacheLookup::Miss => {}
-        }
-
-        let mut distributed_lock = if cache_available {
-            match self.acquire_fallback_lock(record).await {
-                CacheFallbackLockOutcome::Acquired(lock) => Some(lock),
-                CacheFallbackLockOutcome::CacheFilled(snapshot) => return Ok(Some(snapshot)),
-                CacheFallbackLockOutcome::NegativeFilled => return Ok(None),
-                CacheFallbackLockOutcome::Unavailable => None,
-            }
-        } else {
-            None
-        };
-        if distributed_lock.is_some() {
-            let cached = match self.lookup_cache(record, false).await {
-                Ok(lookup) => lookup,
-                Err(error) => {
-                    cache_available &= !Self::cache_connection_unavailable(&error);
-                    tracing::debug!(%error, namespace = %record.namespace, key = %record.key, "distributed-lock cache recheck failed; falling back to postgres");
-                    CacheLookup::Miss
-                }
-            };
-            match cached {
-                CacheLookup::Fresh(snapshot) => {
-                    if let Some(lock) = distributed_lock.take() {
-                        self.release_fallback_lock(lock).await;
-                    }
-                    return Ok(Some(snapshot));
-                }
-                CacheLookup::Stale(snapshot) => {
-                    if let Some(lock) = distributed_lock.take() {
-                        self.release_fallback_lock(lock).await;
-                    }
-                    self.schedule_cache_refresh(record);
-                    return Ok(Some(snapshot));
-                }
-                CacheLookup::Negative => {
-                    if let Some(lock) = distributed_lock.take() {
-                        self.release_fallback_lock(lock).await;
-                    }
-                    return Ok(None);
-                }
-                CacheLookup::Miss => {}
-            }
-        }
-
-        let circuit_permit = match self.read_coordinator.allow_fallback() {
-            Ok(permit) => permit,
-            Err(error) => {
-                if let Some(lock) = distributed_lock.take() {
-                    self.release_fallback_lock(lock).await;
-                }
-                self.metrics.postgres_fallback();
-                self.record_fallback_error(&error);
-                return Err(error);
-            }
-        };
-        self.metrics.postgres_fallback();
-        let fallback_result =
-            match timeout(self.read_coordinator.timeout(), self.postgres.load(record)).await {
-                Ok(Ok(snapshot)) => {
-                    self.read_coordinator.fallback_succeeded(circuit_permit);
-                    Ok(snapshot)
-                }
-                Ok(Err(error)) => {
-                    self.read_coordinator.fallback_failed(circuit_permit);
-                    self.record_fallback_error(&error);
-                    Err(error)
-                }
-                Err(_) => {
-                    self.read_coordinator.fallback_failed(circuit_permit);
-                    let error = self.read_coordinator.timeout_error();
-                    self.record_fallback_error(&error);
-                    Err(error)
-                }
-            };
-        let snapshot = match fallback_result {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                if let Some(lock) = distributed_lock.take() {
-                    self.release_fallback_lock(lock).await;
-                }
-                return Err(error);
-            }
-        };
-        if cache_available {
-            if let Some(snapshot) = &snapshot
-                && let Err(error) = self.put_cache(snapshot).await
-            {
-                tracing::warn!(%error, namespace = %record.namespace, key = %record.key, "snapshot cache warmup failed");
-            } else if snapshot.is_none()
-                && let Err(error) = self.put_negative_cache(record, None).await
-            {
-                tracing::warn!(%error, namespace = %record.namespace, key = %record.key, "negative snapshot cache warmup failed");
-            }
-        }
-        if let Some(lock) = distributed_lock.take() {
-            self.release_fallback_lock(lock).await;
-        }
-        Ok(snapshot)
+        Ok(self
+            .load_authoritative_multi(std::slice::from_ref(record))
+            .await?
+            .pop()
+            .flatten())
     }
 
     async fn save(&mut self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, Self::Error> {

@@ -74,11 +74,13 @@ Redis revision-aware fast-path refresh
 
 每次领取从全局 sequence 分配 `lease_token`，任务删除后重新入队也不会复用租约身份；ACK/fail 同时校验 owner、token 和有效期。ACK 在行锁事务内按实际修复 revision 判断：覆盖当前目标则删除，否则保留更高目标并释放有效租约；`repair_cache` 返回 `None` 时只覆盖领取时的精确目标。成功释放更高目标也算完成本轮处理，不记为 LeaseLost。失败按当前有效租约累积次数，不因目标提升失效。快路径仍只删除已被成功缓存 revision 覆盖的目标。
 
-缓存写入由 Lua 脚本比较 Revision，旧快照不能覆盖新快照。普通批量快照、multi transaction 和 trade 提交后的缓存刷新都使用一次批量 Lua 调用，再用一条 PostgreSQL `unnest` 删除已覆盖的修复目标；如果任一步失败，事务内预先写入的修复行仍然存在。读取失败、编码损坏或 miss 会回源 PostgreSQL；缓存预热失败不影响权威读取结果。
+缓存写入由 Lua 脚本比较 Revision，旧快照不能覆盖新快照。普通批量快照、multi transaction 和 trade 提交后的缓存刷新都使用一次批量 Lua 调用，再用一条 PostgreSQL `unnest` 删除已覆盖的修复目标；如果任一步失败，事务内预先写入的修复行仍然存在。默认Load/LoadMulti直接读取PG主库，批量在一条SQL快照中完成，PG错误不回退缓存。只有显式load_cached/load_cached_multi使用缓存；缓存读取失败、编码损坏、miss或版本下限不足时回源PG。
 
-严格 read-after-write 部署必须把快照缓存与 AOF backlog/Outbox 分开。可靠队列 Redis 会从 AOF 恢复；若它同时保存缓存，崩溃前尚未刷入 AOF 的新缓存可能在重启后被旧值和旧 freshness 标记替代，并在 repair worker 赶上前产生短暂旧读。`cacheRedisUrlEnv`因此指向关闭 AOF/RDB 的易失实例：重启后缓存为空，只能回源 PostgreSQL，再由读预热或持久 repair 重建。`redisUrlEnv`仍只负责必须保留的 backlog 和 Outbox。单 Redis 配置保留用于兼容和本地开发，但不能通过这一严格恢复边界。
+严格读取的正确性由PG主库承担，不再依赖Redis的持久化策略或修复速度。缓存仍建议与可靠backlog/Outbox分开：`cacheRedisUrlEnv`使用关闭AOF/RDB的易失实例，避免恢复陈旧缓存且隔离容量；`redisUrlEnv`保留可靠队列。独立易失缓存只消除旧缓存镜像复活的路径，不能独自保证read-after-write。默认读取与显式缓存读取边界见[读取契约](default-read-contract.md)。
 
 ## 缓存击穿与生命周期
+
+以下生命周期仅适用于显式允许旧数据的缓存读取；默认权威读取不受缓存命中、负缓存或熔断器影响。
 
 正缓存默认 fresh 5 分钟、稳定抖动最多 30 秒、stale-while-revalidate 30 秒；负缓存默认 5 秒。miss 回源受到以下保护：
 

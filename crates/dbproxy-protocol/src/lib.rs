@@ -45,11 +45,17 @@ pub const PRE_COMMIT_PROTOCOL_FINGERPRINT_V2: &str =
 pub const PRE_RELAY_PROTOCOL_FINGERPRINT_V2: &str =
     "63894bf08f30464ba807fbfe6507bbd74a0aa30de8da1913d7857904f52e3e17";
 
+/// 默认权威读取之前的协议；旧客户端连接新版服务端时也得到权威读取。
+/// Pre-authoritative-read clients receive authoritative reads on upgraded servers.
+pub const PRE_AUTHORITATIVE_PROTOCOL_FINGERPRINT_V2: &str =
+    "affd104ec61b48af713241daf11b2b7ba08577673054ee9aea0ef3653dab8c68";
+
 pub fn is_compatible_protocol_fingerprint(candidate: &str) -> bool {
     candidate == PROTOCOL_FINGERPRINT
         || candidate == LEGACY_PROTOCOL_FINGERPRINT_V2
         || candidate == PRE_COMMIT_PROTOCOL_FINGERPRINT_V2
         || candidate == PRE_RELAY_PROTOCOL_FINGERPRINT_V2
+        || candidate == PRE_AUTHORITATIVE_PROTOCOL_FINGERPRINT_V2
 }
 
 impl From<&tiangz_dbproxy_core::AppendRecord> for wire::AppendRecord {
@@ -750,6 +756,9 @@ mod tests {
         assert!(is_compatible_protocol_fingerprint(PROTOCOL_FINGERPRINT));
         assert!(is_compatible_protocol_fingerprint(
             LEGACY_PROTOCOL_FINGERPRINT_V2
+        ));
+        assert!(is_compatible_protocol_fingerprint(
+            PRE_AUTHORITATIVE_PROTOCOL_FINGERPRINT_V2
         ));
         assert!(!is_compatible_protocol_fingerprint("unknown"));
     }

@@ -54,6 +54,7 @@
             "postgresUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
             "redisUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "Redis URL for the AOF-backed snapshot backlog and Outbox stream." },
             "cacheRedisUrlEnv": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "Optional independent snapshot-cache Redis URL. When omitted, redisUrlEnv is reused for backward compatibility." },
+            "authoritativeReadNamespaces": { "type": "array", "maxItems": 64, "default": [], "items": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^\\S(?:.*\\S)?$" }, "description": "默认Load始终读PG；此列表额外禁止指定namespace的显式缓存读取，批量任一匹配则整批读PG。 Default Load always reads PG; listed namespaces also bypass explicitly requested cache reads." },
             "shards": { "type": "integer", "minimum": 1, "default": 4 },
             "cacheFallbackConcurrency": { "type": "integer", "minimum": 1, "default": 16 },
             "cacheFallbackTimeoutMs": { "type": "integer", "minimum": 1, "default": 2000 },

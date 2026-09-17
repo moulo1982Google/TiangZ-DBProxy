@@ -96,6 +96,7 @@ async fn prepare_backend(config: &ResolvedDbProxyConfig) -> Result<BackendPair, 
             postgres_url,
             redis_url,
             cache_redis_url,
+            authoritative_read_namespaces,
             shards,
             cache_fallback_concurrency,
             cache_fallback_timeout_ms,
@@ -156,7 +157,8 @@ async fn prepare_backend(config: &ResolvedDbProxyConfig) -> Result<BackendPair, 
                     },
                     &config.outbox_relay,
                 )
-                .await?,
+                .await?
+                .with_authoritative_read_namespaces(authoritative_read_namespaces.into_vec())?,
             );
             let server_backend: Arc<dyn DbProxyBackend> = backend.clone();
             Ok((server_backend, Some(backend)))

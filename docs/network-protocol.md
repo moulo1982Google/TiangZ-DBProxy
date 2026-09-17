@@ -20,7 +20,7 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 - 交易 Posting 最多 512 条，Outbox 事件最多 64 条；
 - 所有 ID、Schema、topic 等文本都有 UTF-8 字节上限，topic 仅允许字母、数字、`.`、`_`、`-`。
 
-第一帧必须是 `ClientHello(protocol_version, protocol_fingerprint, auth_token, client_name)`。当前握手版本是 2，fingerprint 是权威 proto 先统一为 LF 后的 SHA-256。server 精确接受当前指纹及 `LEGACY_PROTOCOL_FINGERPRINT_V2`、`PRE_COMMIT_PROTOCOL_FINGERPRINT_V2`、`PRE_RELAY_PROTOCOL_FINGERPRINT_V2` 三个已知旧指纹，并向连接回显客户端原值；具体清单以 `dbproxy-protocol/src/lib.rs` 为准。未列出的指纹或不匹配的版本不进入 RPC 调度。proto 的 package 名保留 `tiangz.dbproxy.v1` 只是生成代码命名空间；兼容性由握手版本和指纹共同决定。
+第一帧必须是 `ClientHello(protocol_version, protocol_fingerprint, auth_token, client_name)`。当前握手版本是 2，fingerprint 是权威 proto 先统一为 LF 后的 SHA-256。server 精确接受当前指纹及 `LEGACY_PROTOCOL_FINGERPRINT_V2`、`PRE_COMMIT_PROTOCOL_FINGERPRINT_V2`、`PRE_RELAY_PROTOCOL_FINGERPRINT_V2` 及 `PRE_AUTHORITATIVE_PROTOCOL_FINGERPRINT_V2` 四个已知旧指纹，并向连接回显客户端原值；具体清单以 `dbproxy-protocol/src/lib.rs` 为准。未列出的指纹或不匹配的版本不进入 RPC 调度。proto 的 package 名保留 `tiangz.dbproxy.v1` 只是生成代码命名空间；兼容性由握手版本和指纹共同决定。
 
 升级方向是服务端先行：先完成服务端及其数据库迁移的受控切换，再更新客户端。新客户端要求精确的版本/指纹和 `supports_outbox_relay`，不会主动降级到旧服务端。A3 的候选跳过只保证继续寻找兼容服务端，不代表旧服务端可以处理新请求，也不保证混版本的存储/队列语义。所有候选均不兼容时应保留明确拒绝原因并修正部署版本，不能放宽握手检查来掩盖问题。
 
@@ -28,8 +28,8 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 
 | RPC | 语义 |
 | --- | --- |
-| `LoadSnapshot` | Redis 优先，失败/miss 回源 PostgreSQL；缺失返回 None |
-| `LoadMultiSnapshot` | 1..64 个唯一 RecordKey，保持顺序和缺失位置；按 shard 并行、每 shard 批量访问后端 |
+| `LoadSnapshot` | 默认读取PG主库已提交状态；失败返回错误，缺失返回None |
+| `LoadMultiSnapshot` | 1..64 个唯一 RecordKey，保持顺序和缺失位置；默认整批一次PG查询，使用同一数据库快照 |
 | `SaveSnapshot` | 幂等 PostgreSQL 快照提交；缓存失败由 durable repair 修复 |
 | `SaveMultiSnapshot` | 1..64 条独立普通写，逐条结果、允许部分成功，不提供跨记录原子性 |
 | `EnqueueSnapshot` | 普通快照写入 Redis backlog 并取得本机 AOF ACK；尚未落 PostgreSQL |
@@ -44,6 +44,8 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 | `LoadTradeTransaction` | 按 operation ID + trade ID 读取第一次交易 Receipt |
 
 ### 直接写入和缓存
+
+`LoadSnapshotRequest`新增`allow_stale=false`及可选`min_revision`；`LoadMultiSnapshotRequest`新增`allow_stale=false`及`min_revisions`（空或与records等长，0为无下限）。默认不访问缓存。显式允许旧读时使用缓存；任一版本下限不满足则整批回源PG，不混合缓存与权威快照。PG仍低于下限或缺失时返回`STORAGE_UNAVAILABLE`，不无限等待。`storage.authoritativeReadNamespaces`额外禁止匹配namespace使用缓存，批量任一匹配则整批权威读取。完整边界及升级顺序见[默认读取契约](default-read-contract.md)。
 
 `Save*` 与 `Apply*` 成功表示 PostgreSQL 权威事务已提交。Redis 快速回写失败不会改写这个事实，因为 `dbproxy_cache_repairs` 已在同一事务保存目标；worker 稍后补齐。客户端不需要仅为缓存失败重放权威业务操作。
 
