@@ -54,8 +54,11 @@ use tiangz_dbproxy_storage::{
     TieredSnapshotStoreConfig,
 };
 use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore, watch},
+    net::{
+        TcpListener, TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::JoinSet,
     time::{sleep, timeout},
 };
@@ -1102,6 +1105,10 @@ pub async fn run_storage_metrics_poller(
 
 /// Per-instance TCP admission limit, including unauthenticated handshakes.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+/// 每条连接默认同时处理的请求数。 / Default concurrent requests per connection.
+pub const DEFAULT_MAX_IN_FLIGHT_PER_CONNECTION: usize = 64;
+/// 每条连接同时处理请求数的上限。 / Upper bound for concurrent requests per connection.
+pub const MAX_IN_FLIGHT_PER_CONNECTION: usize = 4_096;
 
 /// TCP 服务配置。认证令牌必须通过部署密钥注入，禁止使用仓库中的本地示例密码。
 /// TCP server settings. Inject the auth token as a deployment secret, never from sample credentials.
@@ -1112,6 +1119,8 @@ pub struct ServerConfig {
     pub max_frame_bytes: usize,
     pub max_payload_bytes: usize,
     pub max_connections: usize,
+    /// 每条连接同时处理的请求上限。 / Concurrent requests per connection.
+    pub max_in_flight_per_connection: usize,
     pub handshake_timeout: Duration,
     pub shutdown_grace: Duration,
     pub metrics: Arc<DbProxyMetrics>,
@@ -1126,6 +1135,10 @@ impl fmt::Debug for ServerConfig {
             .field("max_frame_bytes", &self.max_frame_bytes)
             .field("max_payload_bytes", &self.max_payload_bytes)
             .field("max_connections", &self.max_connections)
+            .field(
+                "max_in_flight_per_connection",
+                &self.max_in_flight_per_connection,
+            )
             .field("handshake_timeout", &self.handshake_timeout)
             .field("shutdown_grace", &self.shutdown_grace)
             .field("metrics", &"[PROMETHEUS]")
@@ -1141,6 +1154,7 @@ impl ServerConfig {
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_in_flight_per_connection: DEFAULT_MAX_IN_FLIGHT_PER_CONNECTION,
             handshake_timeout: Duration::from_secs(5),
             shutdown_grace: Duration::from_secs(5),
             metrics: Arc::new(DbProxyMetrics::default()),
@@ -1151,6 +1165,11 @@ impl ServerConfig {
         if !(1..=Semaphore::MAX_PERMITS).contains(&self.max_connections) {
             return Err(ServerError::InvalidConfig(
                 "max connections is outside the supported range",
+            ));
+        }
+        if !(1..=MAX_IN_FLIGHT_PER_CONNECTION).contains(&self.max_in_flight_per_connection) {
+            return Err(ServerError::InvalidConfig(
+                "max in-flight requests per connection is outside the supported range",
             ));
         }
         if !(16..=MAX_AUTH_TOKEN_BYTES).contains(&self.auth_token.len()) {
@@ -1320,7 +1339,7 @@ async fn handle_connection(
     config: Arc<ServerConfig>,
     backend: Arc<dyn DbProxyBackend>,
     tenants: Arc<Vec<TenantBackend>>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<(), ConnectionError> {
     stream.set_nodelay(true).map_err(ProtocolError::from)?;
     let first = timeout(
@@ -1435,30 +1454,283 @@ async fn handle_connection(
     write_message(&mut stream, &accepted, config.max_frame_bytes).await?;
     tracing::debug!(client_name = %hello.client_name, "DBProxy client authenticated");
 
-    loop {
-        let frame = tokio::select! {
+    let (reader, writer) = stream.into_split();
+    serve_requests(reader, writer, config, backend, request_metrics, shutdown).await
+}
+
+/// 一条连接上并发处理多个请求，响应按完成顺序返回并以 rpc_id 对应；
+/// 涉及同一记录、操作或交易的请求按到达顺序执行。
+/// Serve several requests of one connection concurrently. Responses return in completion order and are
+/// matched by rpc_id; requests sharing a record, operation or trade run in arrival order.
+async fn serve_requests(
+    mut reader: OwnedReadHalf,
+    writer: OwnedWriteHalf,
+    config: Arc<ServerConfig>,
+    backend: Arc<dyn DbProxyBackend>,
+    metrics: Arc<DbProxyMetrics>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), ConnectionError> {
+    let limit = config.max_in_flight_per_connection;
+    let permits = Arc::new(Semaphore::new(limit));
+    let (responses, outgoing) = mpsc::channel(limit);
+    let responder = tokio::spawn(write_responses(writer, outgoing, config.max_frame_bytes));
+    let mut requests = JoinSet::new();
+    let mut ordering = RequestOrdering::default();
+    let read_result = loop {
+        while let Some(joined) = requests.try_join_next() {
+            log_request_panic(joined);
+        }
+        let permit = tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
+                    break Ok(());
                 }
                 continue;
             }
-            frame = read_message::<_, wire::ClientFrame>(&mut stream, config.max_frame_bytes) => frame?,
+            permit = Arc::clone(&permits).acquire_owned() => {
+                permit.expect("the request semaphore is never closed")
+            }
         };
-        let Some(frame) = frame else {
-            return Ok(());
+        let frame = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break Ok(());
+                }
+                continue;
+            }
+            frame = read_message::<_, wire::ClientFrame>(&mut reader, config.max_frame_bytes) => frame,
+        };
+        let frame = match frame {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(ConnectionError::from(error)),
         };
         let Some(wire::client_frame::Body::Request(request)) = frame.body else {
-            return Err(ConnectionError::MissingHandshake);
+            break Err(ConnectionError::MissingHandshake);
         };
-        let response = dispatch(
-            request,
-            backend.as_ref(),
-            &request_metrics,
-            config.max_payload_bytes,
-        )
-        .await;
-        write_message(&mut stream, &response, config.max_frame_bytes).await?;
+        let (predecessors, completion) = ordering.admit(order_keys(request.body.as_ref()));
+        let backend = Arc::clone(&backend);
+        let metrics = Arc::clone(&metrics);
+        let responses = responses.clone();
+        let max_payload_bytes = config.max_payload_bytes;
+        requests.spawn(async move {
+            let _permit = permit;
+            for mut predecessor in predecessors {
+                // 前序请求结束时丢弃发送端，changed 随即返回错误。 / A finished predecessor drops its sender.
+                while predecessor.changed().await.is_ok() {}
+            }
+            let response =
+                dispatch_isolated(request, backend.as_ref(), &metrics, max_payload_bytes).await;
+            drop(completion);
+            // 写出任务已退出时连接已失效，丢弃响应。 / The writer has failed, so the connection is gone.
+            let _ = responses.send(response).await;
+        });
+    };
+    // 已接收的请求都执行完并尽量写回响应，与逐个处理时收尾一致。
+    // Finish every accepted request and try to write its response, as the sequential loop did.
+    while let Some(joined) = requests.join_next().await {
+        log_request_panic(joined);
+    }
+    drop(responses);
+    let write_result = match responder.await {
+        Ok(result) => result.map_err(ConnectionError::from),
+        Err(error) => {
+            tracing::error!(%error, "DBProxy response writer panicked");
+            Ok(())
+        }
+    };
+    read_result.and(write_result)
+}
+
+/// 后端panic只让这一个请求失败并收到明确错误，同连接其他请求不受影响。
+/// A backend panic fails only this request, with an explicit error; other requests of the connection continue.
+async fn dispatch_isolated(
+    request: wire::RequestEnvelope,
+    backend: &dyn DbProxyBackend,
+    metrics: &DbProxyMetrics,
+    max_payload_bytes: usize,
+) -> wire::ServerFrame {
+    let rpc_id = request.rpc_id;
+    let mut dispatched = std::pin::pin!(dispatch(request, backend, metrics, max_payload_bytes));
+    let outcome = std::future::poll_fn(|context| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatched.as_mut().poll(context)
+        })) {
+            Ok(std::task::Poll::Ready(response)) => std::task::Poll::Ready(Some(response)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(_) => std::task::Poll::Ready(None),
+        }
+    })
+    .await;
+    outcome.unwrap_or_else(|| {
+        tracing::error!(rpc_id, "DBProxy request handler panicked");
+        wire::ServerFrame {
+            body: Some(wire::server_frame::Body::Response(wire::ResponseEnvelope {
+                rpc_id,
+                error: Some(wire_error(
+                    wire::ErrorCode::Internal,
+                    "DBProxy request handler failed; the outcome is unknown, retry with the same idempotency key",
+                    None,
+                )),
+                body: None,
+            })),
+        }
+    })
+}
+
+async fn write_responses(
+    mut writer: OwnedWriteHalf,
+    mut outgoing: mpsc::Receiver<wire::ServerFrame>,
+    maximum: usize,
+) -> Result<(), ProtocolError> {
+    while let Some(response) = outgoing.recv().await {
+        write_message(&mut writer, &response, maximum).await?;
+    }
+    Ok(())
+}
+
+fn log_request_panic(joined: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = joined {
+        tracing::error!(%error, "DBProxy request task panicked");
+    }
+}
+
+/// 请求排序键：同一连接上共享任一键的请求按到达顺序执行。
+/// Ordering key: requests of one connection that share any key run in arrival order.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum OrderKey {
+    Record(String, String),
+    Operation(String),
+    Trade(String),
+}
+
+fn order_keys(body: Option<&wire::request_envelope::Body>) -> HashSet<OrderKey> {
+    use wire::request_envelope::Body;
+    fn record(keys: &mut HashSet<OrderKey>, record: Option<&wire::RecordKey>) {
+        if let Some(record) = record {
+            keys.insert(OrderKey::Record(
+                record.namespace.clone(),
+                record.key.clone(),
+            ));
+        }
+    }
+    fn operation(keys: &mut HashSet<OrderKey>, operation_id: &str) {
+        keys.insert(OrderKey::Operation(operation_id.to_string()));
+    }
+    let mut keys = HashSet::new();
+    match body {
+        None => {}
+        Some(Body::LoadSnapshot(request)) => record(&mut keys, request.record.as_ref()),
+        Some(Body::LoadMultiSnapshot(request)) => {
+            for item in &request.records {
+                record(&mut keys, Some(item));
+            }
+        }
+        Some(Body::SaveSnapshot(request)) => record(&mut keys, request.record.as_ref()),
+        Some(Body::SaveMultiSnapshot(request)) => {
+            for write in &request.writes {
+                record(&mut keys, write.record.as_ref());
+            }
+        }
+        Some(Body::EnqueueSnapshot(request)) => {
+            record(
+                &mut keys,
+                request
+                    .write
+                    .as_ref()
+                    .and_then(|write| write.record.as_ref()),
+            );
+        }
+        Some(Body::EnqueueMultiSnapshot(request)) => {
+            for write in &request.writes {
+                record(&mut keys, write.record.as_ref());
+            }
+        }
+        Some(Body::ApplyTransaction(request)) => {
+            operation(&mut keys, &request.operation_id);
+            record(&mut keys, request.record.as_ref());
+        }
+        Some(Body::LoadTransaction(request)) => {
+            operation(&mut keys, &request.operation_id);
+            record(&mut keys, request.record.as_ref());
+        }
+        Some(Body::ApplyMultiTransaction(request)) => {
+            operation(&mut keys, &request.operation_id);
+            for write in &request.writes {
+                record(&mut keys, write.record.as_ref());
+            }
+        }
+        Some(Body::CommitRecords(request)) => {
+            operation(&mut keys, &request.operation_id);
+            for write in &request.writes {
+                record(&mut keys, write.record.as_ref());
+            }
+        }
+        Some(Body::LoadMultiTransaction(request)) => {
+            operation(&mut keys, &request.operation_id);
+            for item in &request.records {
+                record(&mut keys, Some(item));
+            }
+        }
+        Some(Body::ApplyTradeTransaction(request)) => {
+            operation(&mut keys, &request.operation_id);
+            if let Some(transition) = &request.transition {
+                keys.insert(OrderKey::Trade(transition.trade_id.clone()));
+            }
+            for write in &request.writes {
+                record(&mut keys, write.record.as_ref());
+            }
+        }
+        Some(Body::LoadTrade(request)) => {
+            keys.insert(OrderKey::Trade(request.trade_id.clone()));
+        }
+        Some(Body::LoadTradeTransaction(request)) => {
+            operation(&mut keys, &request.operation_id);
+            keys.insert(OrderKey::Trade(request.trade_id.clone()));
+        }
+    }
+    keys
+}
+
+const ORDERING_PRUNE_FLOOR: usize = 1_024;
+
+/// 每个键只记住最后一个请求的完成信号；请求结束时丢弃发送端。
+/// Remembers only the completion signal of the latest request per key; a request drops its sender when done.
+struct RequestOrdering {
+    tails: HashMap<OrderKey, watch::Receiver<()>>,
+    prune_at: usize,
+}
+
+impl Default for RequestOrdering {
+    fn default() -> Self {
+        Self {
+            tails: HashMap::new(),
+            prune_at: ORDERING_PRUNE_FLOOR,
+        }
+    }
+}
+
+impl RequestOrdering {
+    /// 返回尚未结束的前序请求，以及本请求结束时要丢弃的完成信号。
+    /// Returns unfinished predecessors and this request's completion signal, dropped when it finishes.
+    fn admit(&mut self, keys: HashSet<OrderKey>) -> (Vec<watch::Receiver<()>>, watch::Sender<()>) {
+        let (completion, done) = watch::channel(());
+        let mut predecessors = Vec::new();
+        for key in keys {
+            if let Some(previous) = self.tails.insert(key, done.clone())
+                && previous.has_changed().is_ok()
+                && !predecessors
+                    .iter()
+                    .any(|known: &watch::Receiver<()>| known.same_channel(&previous))
+            {
+                predecessors.push(previous);
+            }
+        }
+        if self.tails.len() > self.prune_at {
+            self.tails.retain(|_, tail| tail.has_changed().is_ok());
+            self.prune_at = (self.tails.len() * 2).max(ORDERING_PRUNE_FLOOR);
+        }
+        (predecessors, completion)
     }
 }
 
@@ -2401,6 +2673,43 @@ impl Hasher for StableHasher {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use super::{OrderKey, RequestOrdering};
+
+    fn keys(items: &[&str]) -> HashSet<OrderKey> {
+        items
+            .iter()
+            .map(|key| OrderKey::Record("player".into(), (*key).into()))
+            .collect()
+    }
+
+    #[test]
+    fn a_multi_record_request_waits_for_every_unfinished_predecessor_once() {
+        let mut ordering = RequestOrdering::default();
+        let (none, first) = ordering.admit(keys(&["a"]));
+        assert!(none.is_empty());
+        let (_, second) = ordering.admit(keys(&["b"]));
+        let (both, third) = ordering.admit(keys(&["a", "b"]));
+        assert_eq!(both.len(), 2);
+        // 第四个请求的两个键都指向第三个请求，只等待一次。 / Both keys point at the third request; wait once.
+        let (latest, _) = ordering.admit(keys(&["a", "b"]));
+        assert_eq!(latest.len(), 1);
+        drop((first, second, third));
+        assert!(ordering.admit(keys(&["c"])).0.is_empty());
+    }
+
+    #[test]
+    fn finished_requests_are_not_predecessors_and_are_pruned() {
+        let mut ordering = RequestOrdering::default();
+        for index in 0..5_000 {
+            let (_, done) = ordering.admit(keys(&[&index.to_string()]));
+            drop(done);
+        }
+        assert!(ordering.tails.len() <= super::ORDERING_PRUNE_FLOOR + 1);
+        assert!(ordering.admit(keys(&["1"])).0.is_empty());
+    }
+
     #[test]
     fn postgres_admission_errors_are_retryable_without_claiming_transaction_outcome() {
         for error in [

@@ -239,7 +239,7 @@ LoadTrade              读取交易当前版本、状态和不透明Payload
 LoadTradeTransaction   按operationId和tradeId读取已提交交易回执
 ```
 
-每条连接先校验`protocol_version + protocol_fingerprint + auth_token`，之后才允许 RPC。帧使用大端四字节长度前缀，默认上限 8 MiB。客户端连接内按顺序执行请求；`DbProxyClientPool::connect`保持读写共享连接的兼容行为，`connect_split`可把读写分到独立连接组，避免慢写和 AOF ACK 阻塞读连接。两种模式都按`RecordKey`或 operation ID 稳定路由。服务端存储连接也按相同原则分片，避免所有玩家共享一个事务锁。
+每条连接先校验`protocol_version + protocol_fingerprint + auth_token`，之后才允许 RPC。帧使用大端四字节长度前缀，默认上限 8 MiB。一条连接可同时有多个在途请求（服务端`server.maxInFlightPerConnection`、客户端`max_in_flight`，默认均为64），同一连接上涉及同一记录、操作或交易的请求按到达顺序执行，其余并发，见[网络协议](docs/network-protocol.md#连接并发和-endpoint)；`DbProxyClientPool::connect`保持读写共享连接的兼容行为，`connect_split`可把读写分到独立连接组，避免慢写和 AOF ACK 阻塞读连接。两种模式都按`RecordKey`或 operation ID 稳定路由。服务端存储连接也按相同原则分片，避免所有玩家共享一个事务锁。
 
 详细错误码、ACK语义、Endpoint故障切换和跨记录限制见[网络协议说明](docs/network-protocol.md)。
 

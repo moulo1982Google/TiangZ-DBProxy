@@ -248,7 +248,7 @@ async fn candidate_loops_fail_immediately_on_local_configuration_errors() {
             1 => client.config.client_name.clear(),
             _ => client.config.max_frame_bytes = 0,
         }
-        client.connection.lock().await.usable = false;
+        client.current().shared.mark_unusable();
         assert!(matches!(
             client.reconnect_next().await,
             Err(ClientError::InvalidConfig(_))
@@ -277,9 +277,10 @@ async fn exhausted_candidates_preserve_the_handshake_rejection_in_both_loops() {
             .unwrap();
             client.config = config;
             {
-                let mut connection = client.connection.lock().await;
+                let mut slot = client.connection.write().unwrap();
+                let connection = Arc::get_mut(&mut slot).expect("no request holds the connection");
                 connection.endpoint_index = 2;
-                connection.usable = false;
+                connection.shared.mark_unusable();
             }
             client.reconnect_next().await.err().unwrap()
         } else {
@@ -378,7 +379,7 @@ async fn concurrent_recovery_reuses_the_repaired_connection_and_allows_later_fai
         for generation in 1..=2 {
             // All callers have observed the same unusable connection. Later callers must
             // not replace the successful repair made by the first one.
-            client.connection.lock().await.usable = false;
+            client.current().shared.mark_unusable();
             let mut callers = JoinSet::new();
             for _ in 0..8 {
                 let client = client.clone();

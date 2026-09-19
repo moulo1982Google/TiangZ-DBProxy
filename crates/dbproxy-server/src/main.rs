@@ -185,6 +185,7 @@ async fn run_servers(
     server_config.max_payload_bytes = config.max_payload_bytes;
     server_config.max_connections = shared.map_or(config.max_connections, |value| value.1);
     server_config.listen_addr = shared.map_or(config.listen_addr, |value| value.0);
+    server_config.max_in_flight_per_connection = config.max_in_flight_per_connection;
     server_config.handshake_timeout = config.handshake_timeout;
     server_config.shutdown_grace = grace;
     let admission_metrics = Arc::new(DbProxyMetrics::default());

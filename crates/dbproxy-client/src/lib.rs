@@ -1,15 +1,23 @@
 //! DBProxy 的异步 Rust 客户端。
 //! Async Rust client for DBProxy.
 //!
-//! 一个客户端连接内的请求按顺序执行；需要更高并发时应创建连接池，不能在 TiangZ
-//! 业务线程中等待同步数据库调用。Requests are serialized per connection. Higher concurrency
-//! should use a pool, and TiangZ business threads must never perform blocking database I/O.
+//! 一条连接可同时有多个请求在途（上限见 `ClientConfig::max_in_flight`），响应按 rpc_id 对应；
+//! 服务端保证同一连接上涉及同一记录、操作或交易的请求按发送顺序执行。连接池按记录稳定路由，
+//! 所以同一记录的请求始终走同一连接。不能在 TiangZ 业务线程中等待同步数据库调用。
+//! One connection carries several in-flight requests (bounded by `ClientConfig::max_in_flight`) whose
+//! responses are matched by rpc_id; the server runs requests of one connection that share a record,
+//! operation or trade in send order. The pool routes each record to a stable connection. TiangZ business
+//! threads must never perform blocking database I/O.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     hash::{Hash, Hasher},
-    sync::Arc,
+    io,
+    sync::{
+        Arc, Mutex as StdMutex, PoisonError, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -27,7 +35,19 @@ use tiangz_dbproxy_protocol::{
     MAX_BATCH_SNAPSHOT_WRITES, MAX_CLIENT_NAME_BYTES, MAX_TRANSACTION_RECORDS,
     PROTOCOL_FINGERPRINT, PROTOCOL_VERSION, ProtocolError, read_message, wire, write_message,
 };
-use tokio::{net::TcpStream, sync::Mutex, time::timeout};
+use tokio::{
+    net::{
+        TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::{Mutex, MutexGuard, Semaphore, oneshot},
+    task::JoinHandle,
+    time::timeout,
+};
+
+/// 每条连接默认同时在途的请求数，与服务端默认值一致。
+/// Default in-flight requests per connection, matching the server default.
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientConnectionOutcome {
@@ -106,6 +126,9 @@ pub struct ClientConfig {
     pub max_frame_bytes: usize,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
+    /// 每条连接同时在途的请求上限；超出时在客户端排队。
+    /// In-flight requests per connection; excess requests queue in the client.
+    pub max_in_flight: usize,
     pub observer: Option<Arc<dyn ClientObserver>>,
 }
 
@@ -120,6 +143,7 @@ impl fmt::Debug for ClientConfig {
             .field("max_frame_bytes", &self.max_frame_bytes)
             .field("connect_timeout", &self.connect_timeout)
             .field("request_timeout", &self.request_timeout)
+            .field("max_in_flight", &self.max_in_flight)
             .field("observer", &self.observer.as_ref().map(|_| "configured"))
             .finish()
     }
@@ -139,6 +163,7 @@ impl ClientConfig {
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             observer: None,
         }
     }
@@ -192,9 +217,9 @@ pub enum ClientError {
     InvalidConfig(&'static str),
     #[error("DBProxy connect timed out")]
     ConnectTimeout,
-    #[error("DBProxy request timed out; this connection can no longer be reused")]
+    #[error("DBProxy request timed out; its outcome is unknown")]
     RequestTimeout,
-    #[error("DBProxy connection can no longer be reused after an incomplete request")]
+    #[error("DBProxy connection can no longer be used")]
     ConnectionUnusable,
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
@@ -206,20 +231,287 @@ pub enum ClientError {
     Remote(RemoteError),
 }
 
-struct ClientConnection {
-    stream: TcpStream,
-    endpoint_index: usize,
-    next_rpc_id: u64,
-    max_frame_bytes: usize,
-    request_timeout: Duration,
-    usable: bool,
+type ResponseWaiter = oneshot::Sender<Result<wire::ResponseEnvelope, ClientError>>;
+
+/// 读取端结束的原因；每个等待者各自得到一个对应的错误。
+/// Why the read side ended; every waiter receives its own matching error.
+#[derive(Clone, Debug)]
+enum ConnectionFailure {
+    Closed,
+    Io(io::ErrorKind, String),
+    Invalid,
+    Unexpected(&'static str),
 }
 
-/// 可克隆的客户端句柄；克隆只共享同一条连接，不会自动增加并发度。
-/// Cloneable client handle; clones share one connection and do not add parallelism.
+impl ConnectionFailure {
+    fn from_protocol(error: &ProtocolError) -> Self {
+        match error {
+            ProtocolError::Io(error) => Self::Io(error.kind(), error.to_string()),
+            _ => Self::Invalid,
+        }
+    }
+
+    fn error(&self) -> ClientError {
+        match self {
+            Self::Closed => ClientError::ConnectionClosed,
+            Self::Io(kind, message) => {
+                ClientError::Protocol(ProtocolError::Io(io::Error::new(*kind, message.clone())))
+            }
+            Self::Invalid => ClientError::UnexpectedResponse("DBProxy sent an invalid frame"),
+            Self::Unexpected(message) => ClientError::UnexpectedResponse(message),
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingResponses {
+    waiters: HashMap<u64, ResponseWaiter>,
+    failure: Option<ConnectionFailure>,
+}
+
+/// 发送端与读取任务共享的连接状态。 / Connection state shared by senders and the reader task.
+struct ConnectionShared {
+    opened_at: Instant,
+    last_frame_micros: AtomicU64,
+    usable: AtomicBool,
+    pending: StdMutex<PendingResponses>,
+}
+
+impl ConnectionShared {
+    fn new() -> Self {
+        Self {
+            opened_at: Instant::now(),
+            last_frame_micros: AtomicU64::new(0),
+            usable: AtomicBool::new(true),
+            pending: StdMutex::new(PendingResponses::default()),
+        }
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, PendingResponses> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn now_micros(&self) -> u64 {
+        u64::try_from(self.opened_at.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    fn usable(&self) -> bool {
+        self.usable.load(Ordering::Acquire)
+    }
+
+    /// 不再分配新请求；已发出的请求仍可收到响应。 / Stop new requests; sent ones may still be answered.
+    fn mark_unusable(&self) {
+        self.usable.store(false, Ordering::Release);
+    }
+
+    fn register(
+        &self,
+        rpc_id: u64,
+    ) -> Result<oneshot::Receiver<Result<wire::ResponseEnvelope, ClientError>>, ClientError> {
+        let mut pending = self.pending();
+        if let Some(failure) = &pending.failure {
+            return Err(failure.error());
+        }
+        let (sender, receiver) = oneshot::channel();
+        pending.waiters.insert(rpc_id, sender);
+        Ok(receiver)
+    }
+
+    fn forget(&self, rpc_id: u64) {
+        self.pending().waiters.remove(&rpc_id);
+    }
+
+    fn complete(&self, response: wire::ResponseEnvelope) {
+        self.last_frame_micros
+            .store(self.now_micros(), Ordering::Release);
+        // 超时后才到的响应已无人等待，直接丢弃。 / Late responses after a timeout have no waiter.
+        let waiter = self.pending().waiters.remove(&response.rpc_id);
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(Ok(response));
+        }
+    }
+
+    fn fail(&self, failure: ConnectionFailure) {
+        self.mark_unusable();
+        let waiters = {
+            let mut pending = self.pending();
+            pending.failure.get_or_insert(failure.clone());
+            std::mem::take(&mut pending.waiters)
+        };
+        for waiter in waiters.into_values() {
+            let _ = waiter.send(Err(failure.error()));
+        }
+    }
+}
+
+/// 一条已握手的物理连接。写入互斥，读取由独立任务按 rpc_id 分发。
+/// One handshaken physical connection. Writes are exclusive; a reader task routes responses by rpc_id.
+struct ClientConnection {
+    endpoint_index: usize,
+    writer: Mutex<Option<OwnedWriteHalf>>,
+    shared: Arc<ConnectionShared>,
+    next_rpc_id: AtomicU64,
+    in_flight: Semaphore,
+    max_frame_bytes: usize,
+    request_timeout: Duration,
+    reader: JoinHandle<()>,
+}
+
+impl Drop for ClientConnection {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+/// 写入中途失败或被取消时，帧可能只写了一半：关闭写端，服务端据此结束连接。
+/// A write that fails or is cancelled midway may leave half a frame: close the write side so the server ends
+/// the connection.
+struct WriteAttempt<'a> {
+    writer: MutexGuard<'a, Option<OwnedWriteHalf>>,
+    shared: &'a ConnectionShared,
+    finished: bool,
+}
+
+impl Drop for WriteAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.shared.mark_unusable();
+            self.writer.take();
+        }
+    }
+}
+
+/// 请求结束前被取消或超时时移除等待者，迟到的响应随即被丢弃。
+/// Removes the waiter when the request is cancelled or times out, so a late response is discarded.
+struct Registration<'a> {
+    shared: &'a ConnectionShared,
+    rpc_id: u64,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        self.shared.forget(self.rpc_id);
+    }
+}
+
+impl ClientConnection {
+    fn new(stream: TcpStream, endpoint_index: usize, config: &ClientConfig) -> Self {
+        let (reader, writer) = stream.into_split();
+        let shared = Arc::new(ConnectionShared::new());
+        let reader = tokio::spawn(read_responses(
+            reader,
+            Arc::clone(&shared),
+            config.max_frame_bytes,
+        ));
+        Self {
+            endpoint_index,
+            writer: Mutex::new(Some(writer)),
+            shared,
+            next_rpc_id: AtomicU64::new(1),
+            in_flight: Semaphore::new(config.max_in_flight),
+            max_frame_bytes: config.max_frame_bytes,
+            request_timeout: config.request_timeout,
+            reader,
+        }
+    }
+
+    /// 发送一个请求并等待其响应；`queue_wait` 记录等待在途名额与写入权的时间。
+    /// Send one request and await its response; `queue_wait` records the wait for a slot and the writer.
+    async fn exchange(
+        &self,
+        body: wire::request_envelope::Body,
+        started_at: Instant,
+        queue_wait: &mut Duration,
+    ) -> Result<wire::ResponseEnvelope, ClientError> {
+        if !self.shared.usable() {
+            return Err(ClientError::ConnectionUnusable);
+        }
+        let _slot = self
+            .in_flight
+            .acquire()
+            .await
+            .map_err(|_| ClientError::ConnectionUnusable)?;
+        let rpc_id = self.next_rpc_id.fetch_add(1, Ordering::Relaxed);
+        let response = self.shared.register(rpc_id)?;
+        let _registration = Registration {
+            shared: &self.shared,
+            rpc_id,
+        };
+        let frame = wire::ClientFrame {
+            body: Some(wire::client_frame::Body::Request(wire::RequestEnvelope {
+                rpc_id,
+                body: Some(body),
+            })),
+        };
+        let mut attempt = WriteAttempt {
+            writer: self.writer.lock().await,
+            shared: &self.shared,
+            finished: false,
+        };
+        *queue_wait = started_at.elapsed();
+        if !self.shared.usable() {
+            attempt.finished = true;
+            return Err(ClientError::ConnectionUnusable);
+        }
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        let Some(writer) = attempt.writer.as_mut() else {
+            attempt.finished = true;
+            return Err(ClientError::ConnectionUnusable);
+        };
+        match tokio::time::timeout_at(
+            deadline,
+            write_message(writer, &frame, self.max_frame_bytes),
+        )
+        .await
+        {
+            Ok(Ok(())) => attempt.finished = true,
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Err(ClientError::RequestTimeout),
+        }
+        drop(attempt);
+        let sent_at = self.shared.now_micros();
+        match tokio::time::timeout_at(deadline, response).await {
+            Ok(Ok(Ok(response))) if response.error.is_some() => {
+                Err(ClientError::Remote(remote_error(response.error)))
+            }
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ClientError::ConnectionClosed),
+            Err(_) => {
+                // 发出后连一帧都没收到才判定连接失效；其他请求有响应说明只是这个请求慢。
+                // Only a connection silent since this send is presumed dead; other responses mean this request is
+                // merely slow.
+                if self.shared.last_frame_micros.load(Ordering::Acquire) < sent_at {
+                    self.shared.mark_unusable();
+                }
+                Err(ClientError::RequestTimeout)
+            }
+        }
+    }
+}
+
+async fn read_responses(mut reader: OwnedReadHalf, shared: Arc<ConnectionShared>, maximum: usize) {
+    let failure = loop {
+        match read_message::<_, wire::ServerFrame>(&mut reader, maximum).await {
+            Ok(Some(frame)) => match frame.body {
+                Some(wire::server_frame::Body::Response(response)) => shared.complete(response),
+                Some(wire::server_frame::Body::Hello(_)) => {
+                    break ConnectionFailure::Unexpected("server repeated the handshake");
+                }
+                None => break ConnectionFailure::Unexpected("empty response frame"),
+            },
+            Ok(None) => break ConnectionFailure::Closed,
+            Err(error) => break ConnectionFailure::from_protocol(&error),
+        }
+    };
+    shared.fail(failure);
+}
+
+/// 可克隆的客户端句柄；克隆共享同一条连接及其在途上限。
+/// Cloneable client handle; clones share one connection and its in-flight limit.
 #[derive(Clone)]
 pub struct DbProxyClient {
-    connection: Arc<Mutex<ClientConnection>>,
+    connection: Arc<RwLock<Arc<ClientConnection>>>,
+    reconnecting: Arc<Mutex<()>>,
     config: ClientConfig,
 }
 
@@ -494,8 +786,14 @@ impl DbProxyClient {
         let mut last_error = None;
         let mut last_rejection = None;
         for endpoint_index in 0..candidates.len() {
-            match Self::connect_observed(config.clone(), endpoint_index).await {
-                Ok(client) => return Ok(client),
+            match Self::connect_observed(&config, endpoint_index).await {
+                Ok(connection) => {
+                    return Ok(Self {
+                        connection: Arc::new(RwLock::new(Arc::new(connection))),
+                        reconnecting: Arc::new(Mutex::new(())),
+                        config,
+                    });
+                }
                 Err(error) if is_endpoint_unavailable(&error) => last_error = Some(error),
                 Err(error) if is_candidate_handshake_rejection(&error) => {
                     last_rejection = Some(error)
@@ -509,11 +807,11 @@ impl DbProxyClient {
     }
 
     async fn connect_observed(
-        config: ClientConfig,
+        config: &ClientConfig,
         endpoint_index: usize,
-    ) -> Result<Self, ClientError> {
+    ) -> Result<ClientConnection, ClientError> {
         let started_at = Instant::now();
-        let result = Self::connect_single(config.clone(), endpoint_index).await;
+        let result = Self::connect_single(config, endpoint_index).await;
         if let Some(observer) = &config.observer {
             observer.connection_attempt(
                 endpoint_index,
@@ -525,9 +823,9 @@ impl DbProxyClient {
     }
 
     async fn connect_single(
-        config: ClientConfig,
+        config: &ClientConfig,
         endpoint_index: usize,
-    ) -> Result<Self, ClientError> {
+    ) -> Result<ClientConnection, ClientError> {
         let candidates = config.endpoint_candidates()?;
         let endpoint = candidates
             .get(endpoint_index)
@@ -548,6 +846,11 @@ impl DbProxyClient {
         }
         if config.max_frame_bytes == 0 {
             return Err(ClientError::InvalidConfig("max frame bytes is zero"));
+        }
+        if !(1..=Semaphore::MAX_PERMITS).contains(&config.max_in_flight) {
+            return Err(ClientError::InvalidConfig(
+                "max in-flight requests is outside the supported range",
+            ));
         }
 
         let mut stream = timeout(config.connect_timeout, TcpStream::connect(endpoint))
@@ -597,17 +900,16 @@ impl DbProxyClient {
             ));
         }
 
-        Ok(Self {
-            connection: Arc::new(Mutex::new(ClientConnection {
-                stream,
-                endpoint_index,
-                next_rpc_id: 1,
-                max_frame_bytes: config.max_frame_bytes,
-                request_timeout: config.request_timeout,
-                usable: true,
-            })),
-            config,
-        })
+        Ok(ClientConnection::new(stream, endpoint_index, config))
+    }
+
+    fn current(&self) -> Arc<ClientConnection> {
+        Arc::clone(
+            &self
+                .connection
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 
     async fn call_once(
@@ -616,67 +918,12 @@ impl DbProxyClient {
     ) -> Result<wire::ResponseEnvelope, ClientError> {
         let operation = request_operation(&body);
         let started_at = Instant::now();
-        let mut connection = self.connection.lock().await;
-        let queue_wait = started_at.elapsed();
-        let endpoint_index = connection.endpoint_index;
-        let result = async {
-            if !connection.usable {
-                return Err(ClientError::ConnectionUnusable);
-            }
-            let rpc_id = connection.next_rpc_id;
-            connection.next_rpc_id = connection.next_rpc_id.wrapping_add(1).max(1);
-            let frame = wire::ClientFrame {
-                body: Some(wire::client_frame::Body::Request(wire::RequestEnvelope {
-                    rpc_id,
-                    body: Some(body),
-                })),
-            };
-            let max_frame_bytes = connection.max_frame_bytes;
-            let request_timeout = connection.request_timeout;
-            let exchange = async {
-                write_message(&mut connection.stream, &frame, max_frame_bytes).await?;
-                read_message::<_, wire::ServerFrame>(&mut connection.stream, max_frame_bytes).await
-            };
-            let result = match timeout(request_timeout, exchange).await {
-                Ok(result) => result,
-                Err(_) => {
-                    connection.usable = false;
-                    return Err(ClientError::RequestTimeout);
-                }
-            };
-            let frame = match result {
-                Ok(Some(frame)) => frame,
-                Ok(None) => {
-                    connection.usable = false;
-                    return Err(ClientError::ConnectionClosed);
-                }
-                Err(error) => {
-                    connection.usable = false;
-                    return Err(error.into());
-                }
-            };
-            let wire::server_frame::Body::Response(response) = frame
-                .body
-                .ok_or(ClientError::UnexpectedResponse("empty response frame"))?
-            else {
-                connection.usable = false;
-                return Err(ClientError::UnexpectedResponse(
-                    "server repeated the handshake",
-                ));
-            };
-            if response.rpc_id != rpc_id {
-                connection.usable = false;
-                return Err(ClientError::UnexpectedResponse("rpc id mismatch"));
-            }
-            if response.error.is_some() {
-                return Err(ClientError::Remote(remote_error(response.error)));
-            }
-            Ok(response)
-        }
-        .await;
+        let connection = self.current();
+        let mut queue_wait = Duration::ZERO;
+        let result = connection.exchange(body, started_at, &mut queue_wait).await;
         if let Some(observer) = &self.config.observer {
             observer.request_attempt_timed(
-                endpoint_index,
+                connection.endpoint_index,
                 operation,
                 ClientRequestTiming {
                     queue_wait,
@@ -702,25 +949,29 @@ impl DbProxyClient {
         }
     }
 
+    /// 当前连接失效时换到下一个候选地址；旧连接上已发出的请求仍可收到响应。
+    /// Replace an unusable connection with the next candidate; requests already sent on the old one may still
+    /// be answered.
     async fn reconnect_next(&self) -> Result<(), ClientError> {
         let candidates = self.config.endpoint_candidates()?;
-        let mut connection = self.connection.lock().await;
+        let _reconnecting = self.reconnecting.lock().await;
+        let current = self.current();
         // 并发失败者可能排在成功重连者后面，不要再替换已修复的连接。
         // A concurrent caller may already have repaired this shared connection.
-        if connection.usable {
+        if current.shared.usable() {
             return Ok(());
         }
-        let current_index = connection.endpoint_index;
+        let current_index = current.endpoint_index;
         let mut last_error = None;
         let mut last_rejection = None;
         for offset in 1..=candidates.len() {
             let endpoint_index = (current_index + offset) % candidates.len();
-            match Self::connect_observed(self.config.clone(), endpoint_index).await {
+            match Self::connect_observed(&self.config, endpoint_index).await {
                 Ok(next) => {
-                    let next_connection = Arc::try_unwrap(next.connection)
-                        .map_err(|_| ClientError::ConnectionUnusable)?
-                        .into_inner();
-                    *connection = next_connection;
+                    *self
+                        .connection
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner) = Arc::new(next);
                     if let Some(observer) = &self.config.observer {
                         observer.endpoint_failover(current_index, endpoint_index);
                     }
@@ -733,7 +984,6 @@ impl DbProxyClient {
                 Err(error) => return Err(error),
             }
         }
-        connection.usable = false;
         Err(last_rejection
             .or(last_error)
             .unwrap_or(ClientError::ConnectionClosed))
@@ -1631,7 +1881,7 @@ fn request_operation(body: &wire::request_envelope::Body) -> &'static str {
     }
 }
 
-fn connection_outcome(result: &Result<DbProxyClient, ClientError>) -> ClientConnectionOutcome {
+fn connection_outcome<T>(result: &Result<T, ClientError>) -> ClientConnectionOutcome {
     match result {
         Ok(_) => ClientConnectionOutcome::Connected,
         Err(ClientError::ConnectTimeout) => ClientConnectionOutcome::Timeout,
@@ -1679,6 +1929,9 @@ mod reconnect_tests;
 
 #[cfg(test)]
 mod timing_tests;
+
+#[cfg(test)]
+mod multiplex_tests;
 
 #[cfg(test)]
 mod tests {

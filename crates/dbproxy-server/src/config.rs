@@ -74,6 +74,10 @@ pub struct ServerSection {
     pub max_payload_bytes: usize,
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    /// 每条客户端连接同时处理的请求上限；同一记录仍按到达顺序执行。
+    /// Concurrent requests per client connection; requests on one record still run in arrival order.
+    #[serde(default = "default_max_in_flight_per_connection")]
+    pub max_in_flight_per_connection: usize,
     #[serde(default = "default_handshake_timeout_ms")]
     pub handshake_timeout_ms: u64,
     #[serde(default = "default_shutdown_grace_ms")]
@@ -282,6 +286,7 @@ pub struct ResolvedDbProxyConfig {
     pub max_frame_bytes: usize,
     pub max_payload_bytes: usize,
     pub max_connections: usize,
+    pub max_in_flight_per_connection: usize,
     pub handshake_timeout: Duration,
     pub shutdown_grace: Duration,
     pub runtime_worker_threads: usize,
@@ -362,6 +367,10 @@ impl fmt::Debug for ResolvedDbProxyConfig {
             .field("max_frame_bytes", &self.max_frame_bytes)
             .field("max_payload_bytes", &self.max_payload_bytes)
             .field("max_connections", &self.max_connections)
+            .field(
+                "max_in_flight_per_connection",
+                &self.max_in_flight_per_connection,
+            )
             .field("runtime_worker_threads", &self.runtime_worker_threads)
             .field("storage_backend", &self.storage.name())
             .field("storage_shards", &self.storage.shards())
@@ -470,6 +479,14 @@ impl DbProxyConfig {
             return Err(ConfigError(
                 "server.maxConnections is outside the supported range".into(),
             ));
+        }
+        if !(1..=crate::MAX_IN_FLIGHT_PER_CONNECTION)
+            .contains(&self.server.max_in_flight_per_connection)
+        {
+            return Err(ConfigError(format!(
+                "server.maxInFlightPerConnection must be 1..={}",
+                crate::MAX_IN_FLIGHT_PER_CONNECTION
+            )));
         }
         require_positive("server.maxPayloadBytes", self.server.max_payload_bytes)?;
         if self.server.max_payload_bytes > self.server.max_frame_bytes {
@@ -616,6 +633,7 @@ impl DbProxyConfig {
             max_frame_bytes: self.server.max_frame_bytes,
             max_payload_bytes: self.server.max_payload_bytes,
             max_connections: self.server.max_connections,
+            max_in_flight_per_connection: self.server.max_in_flight_per_connection,
             handshake_timeout: Duration::from_millis(self.server.handshake_timeout_ms),
             shutdown_grace: Duration::from_millis(self.server.shutdown_grace_ms),
             runtime_worker_threads: self.runtime.worker_threads,
@@ -637,6 +655,9 @@ impl DbProxyConfig {
 
 fn default_max_connections() -> usize {
     crate::DEFAULT_MAX_CONNECTIONS
+}
+fn default_max_in_flight_per_connection() -> usize {
+    crate::DEFAULT_MAX_IN_FLIGHT_PER_CONNECTION
 }
 
 pub(crate) fn required_environment(
@@ -854,6 +875,44 @@ mod tests {
                 assert_eq!(result.unwrap().max_connections, expected);
             } else {
                 assert!(result.unwrap_err().to_string().contains("maxConnections"));
+            }
+        }
+    }
+
+    #[test]
+    fn in_flight_limit_defaults_and_rejects_invalid_values_before_secrets() {
+        for (limit, expected) in [
+            (None, Some(crate::DEFAULT_MAX_IN_FLIGHT_PER_CONNECTION)),
+            (Some(1), Some(1)),
+            (
+                Some(crate::MAX_IN_FLIGHT_PER_CONNECTION),
+                Some(crate::MAX_IN_FLIGHT_PER_CONNECTION),
+            ),
+            (Some(0), None),
+            (Some(crate::MAX_IN_FLIGHT_PER_CONNECTION + 1), None),
+        ] {
+            let mut value = serde_json::json!({"configVersion":1,"server":{"listenAddr":"127.0.0.1:0","authTokenEnv":"AUTH"},"storage":{"backend":"memory","shards":1}});
+            if let Some(limit) = limit {
+                value["server"]["maxInFlightPerConnection"] = limit.into();
+            }
+            let path = write_config(&value.to_string());
+            let result = load_config_with(&path, |_| {
+                assert!(
+                    expected.is_some(),
+                    "invalid limit must fail before reading secrets"
+                );
+                Some("0123456789abcdef".into())
+            });
+            fs::remove_file(path).unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(result.unwrap().max_in_flight_per_connection, expected);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("maxInFlightPerConnection")
+                );
             }
         }
     }

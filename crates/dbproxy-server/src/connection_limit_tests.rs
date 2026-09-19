@@ -178,13 +178,20 @@ async fn panic_releases_slot_and_forced_shutdown_drains_active_gauge() {
     let mut f = Fixture::new(1).await;
     f.backend.mode.store(1, Ordering::SeqCst);
     let client = f.client().await;
-    // A backend panic closes the socket; automatic client retry may panic a second task too.
-    assert!(
-        client
-            .load(&RecordKey::new("test", "panic").unwrap())
-            .await
-            .is_err()
-    );
+    // 多请求在途后，后端panic只让该请求收到明确错误，连接和其他在途请求不受影响。
+    // With multiplexing a backend panic fails only that request, explicitly; the connection survives.
+    assert!(matches!(
+        client.load(&RecordKey::new("test", "panic").unwrap()).await,
+        Err(tiangz_dbproxy_client::ClientError::Remote(
+            tiangz_dbproxy_client::RemoteError {
+                code: wire::ErrorCode::Internal,
+                ..
+            }
+        ))
+    ));
+    f.wait_metric("dbproxy_requests_in_flight", 0).await;
+    f.wait_metric("dbproxy_connections_active", 1).await;
+    drop(client);
     f.wait_metric("dbproxy_connections_active", 0).await;
     f.backend.mode.store(0, Ordering::SeqCst);
     let recovered = f.client().await;
