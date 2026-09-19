@@ -15,6 +15,14 @@ services:
     command:
       - postgres
       - -c
+      - fsync=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - wal_sync_method=fdatasync
+      - -c
+      - full_page_writes=on
+      - -c
       - max_connections=100
       - -c
       - shared_buffers=512MB

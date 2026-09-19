@@ -89,6 +89,36 @@
 
 仍需在正式部署环境按目标 QPS 决定 PostgreSQL shard/连接池大小、读写池比例、worker 数量和告警阈值；没有容量证据时不引入协议多路复用或通用批处理框架。
 
+## 待读验证：读写连接池分配 / Pending validation: read/write pool allocation
+
+`connect_split(read_size, write_size)` 将客户端物理连接分为独立的 read pool 和 write pool。每条连接一次只允许一个在途请求；记录操作按 `RecordKey` 稳定路由，操作按 `operation_id`（交易使用对应交易 ID）稳定路由。同一个键会固定在同一池内的一条连接上，不同键才会形成并行度。连接池拆分可以隔离慢写造成的队头阻塞，但不替代 revision/CAS、业务锁或权威读取契约。
+
+当前故障演练使用的 **24 读 + 8 写** 只是测试基线，不是已经证明的生产最优比例。该比例的合理性必须用相同总连接数、相同负载和重复测量来判断；仅凭玩家数、CPU 核数或 PostgreSQL `max_connections` 推导比例不够。
+
+### 测试矩阵 / Test matrix
+
+- 固定总客户端连接数为 32，固定 DBProxy 版本、server 配置、PostgreSQL/Redis 配置、机器资源、玩家数和测试数据；候选至少包括共享池 `connect(32)`、`28/4`、`24/8`、`20/12` 和 `16/16`。
+- 每个候选先运行 2–5 分钟 smoke，再预热 5 分钟并测量 15–20 分钟；每个场景至少重复 3 轮，报告中位数、P95 和 P99，不用单轮峰值下结论。
+- 场景一为当前 100 玩家混合负载；场景二提高 `load/load_multi` 比例验证读池；场景三提高 transaction、trade、enqueue 和 AOF ACK 比例验证写池；故障窗口和长稳验收只在健康矩阵完成后对候选或胜出配置执行。
+- 增加一个多键场景（至少 10,000 个键）检查稳定哈希在各连接槽的分布；再增加少量热点键场景，明确单键固定在一条连接上时，扩大池不能消除该键的串行瓶颈。
+- 让一个 endpoint 短暂不可用，验证 read/write 两个池的物理连接都能独立切换到备用 endpoint，恢复后无连接风暴、旧响应串线或数据正确性错误。
+
+### 观测和数据 / Observability and data
+
+- 客户端必须安装 `ClientObserver`，按 read/write 分类记录 `queue_wait`（等待连接互斥锁）和 `exchange`（编码、网络、DBProxy 服务端处理及返回）；当前 `dbproxy_fault_soak` 未安装该 observer，因此它能证明正确性，不能单独证明 24/8 最优。
+- 观测标签只保留池类型和连接槽等有界维度，不把 `RecordKey`、玩家 ID 或 `operation_id` 放进 Prometheus 标签。若需要槽位公平性，单独输出每槽请求数/等待时间汇总。
+- 同时保存 DBProxy 的 `dbproxy_requests_in_flight`、RPC 请求/失败/错误/耗时、连接 active/limit/rejected、cache-repair/outbox backlog 与 oldest-age，以及 PostgreSQL/Redis 的 CPU、内存、I/O、活动连接和等待；记录测试版本、配置哈希和时间窗口。
+- 每轮都必须检查 `SOAK_FINAL.validation.passed=true`、`readsBehindAcknowledgedRevision=0`、缺失/旧读/不变量错误为零，故障后的 backlog、processing 和 dead-letter 按场景预期收敛。性能提升不能抵消正确性失败。
+
+### 选择规则 / Decision rules
+
+- 健康基线中，以 `queue_wait` 的 P95/P99 作为连接数不足的直接信号；先用“排队等待不超过总 `exchange` 的 10%”作为临时门槛，若业务 SLA 更严格则以 SLA 为准，并在首轮基线上校准。
+- 读池等待高而写池低，且 DBProxy/PG/Redis 仍有余量时，增加 read pool；写池等待高而读池低时，增加 write pool。两池等待都低但 `exchange` 高，优先归因于 DBProxy、PostgreSQL、Redis 或网络，而不是继续调整比例。
+- 连接槽请求数明显不均衡时，先检查稳定哈希分布和热点键；不能用总吞吐掩盖单槽队头阻塞。
+- 候选必须在不引入错误、重连异常、旧读或队列不收敛的前提下，改善目标池的 P95/P99；如果读 P99 出现预先约定的明显回退（默认以基线相对回退 10% 为临时拒绝门槛），即使总吞吐上升也不接受。
+
+矩阵结果进入正式部署参数前，应附上原始采样、三轮汇总和归因结论。没有上述证据时，继续使用 24/8 作为可回退的演练基线，不把它写成容量承诺。
+
 ## 已完成：权威快照 HASH 分区
 
 - [x] `dbproxy_snapshots` 使用 `(namespace, record_key)` 建立 32 个原生 HASH 分区。
