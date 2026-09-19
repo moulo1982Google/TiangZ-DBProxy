@@ -94,7 +94,13 @@ Redis 锁不可用或等待超时时，系统仍可回源 PostgreSQL；协调层
 
 ## Redis AOF 普通快照 backlog
 
-`RedisSnapshotBacklog` 的 Lua 脚本原子写 entry 和 pending 索引，随后执行 `WAITAOF 1 0 2000`。AOF 没有确认就不返回可靠 ACK。worker 领取时把记录移到 processing 并设置 lease：
+`RedisSnapshotBacklog` 的 Lua 脚本原子写 entry 和 pending 索引，随后执行 `WAITAOF 1 0 2000`。AOF 没有确认就不返回可靠 ACK。
+
+入队采用组提交（2026-09-19）：每个节点由一个后台任务独占入队连接，写入与等待落盘期间到达的请求自然积累，下一轮用一次脚本写入整批（最多512条）、只等一次 `WAITAOF`，再逐个回复。`WAITAOF` 覆盖该连接此前的全部写入，所以"确认即已进入本地AOF"的保证不变；`appendfsync everysec`下吞吐不再受"每条等一次落盘"限制。此前单连接持锁、逐条等待落盘，满载时约1次/秒/节点，可靠Redis短暂故障后即可因超时重试进入无法自愈的过载。
+
+同时加入过载保护，`EnqueueBatchConfig`默认值：排队上限4096次入队调用，满则立即返回可重试错误；从接收到开始写入超过2秒的请求不再写入并返回可重试错误；调用方已放弃的请求直接跳过。排队期限加`WAITAOF`超时低于常见5秒客户端超时，调用方收到明确结果而不是超时。整批写入或确认失败时，批内请求共享同一个结果未知错误，按原请求号重试。被拒绝的请求一定没有写入Redis。
+
+worker 领取时把记录移到 processing 并设置 lease：
 
 ```text
 enqueue -> WAITAOF -> pending

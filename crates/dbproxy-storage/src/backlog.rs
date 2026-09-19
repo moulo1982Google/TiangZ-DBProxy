@@ -9,12 +9,13 @@
 //! PostgreSQL yet. Deployments must enable Redis persistence and monitor its durability.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use redis::Script;
 use redis::aio::ConnectionManager;
 use tiangz_dbproxy_core::{RecordKey, SnapshotWrite, StoreError};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::{DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS, StorageError, open_redis_connection_manager};
 
@@ -24,6 +25,17 @@ const LEASES_KEY: &str = "dbproxy:snapshot-backlog:leases";
 const LEASE_SEQUENCE_KEY: &str = "dbproxy:snapshot-backlog:lease-sequence";
 const ENTRY_PREFIX: &str = "dbproxy:snapshot-backlog:entry:";
 const RECLAIM_LIMIT: i64 = 128;
+
+// 批内顺序写入，同一记录后写覆盖先写，与逐条入队的合并语义一致。
+// Writes in batch order; a later write to the same record replaces the earlier one, matching per-call coalescing.
+const ENQUEUE_BATCH_SCRIPT: &str = r#"
+local score = ARGV[1]
+for index = 2, #ARGV, 3 do
+    redis.call('SET', ARGV[index], ARGV[index + 1])
+    redis.call('ZADD', KEYS[1], score, ARGV[index + 2])
+end
+return (#ARGV - 1) / 3
+"#;
 
 const CLAIM_SCRIPT: &str = r#"
 local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[4])
@@ -214,15 +226,195 @@ pub struct RedisSnapshotBacklogStats {
 /// 基于 Redis AOF 的普通快照持久积压队列。
 #[derive(Clone)]
 pub struct RedisSnapshotBacklog {
-    enqueue_connection: Arc<Mutex<ConnectionManager>>,
+    enqueue: EnqueueBatcher,
     worker_connection: Arc<Mutex<ConnectionManager>>,
     stats_connection: Arc<Mutex<ConnectionManager>>,
+}
+
+/// 入队组提交参数。排队上限与期限保证过载时快速拒绝，而不是执行调用方早已放弃的请求。
+/// Enqueue group-commit limits. The queue bound and deadline reject fast under overload instead of
+/// executing requests the caller has long abandoned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EnqueueBatchConfig {
+    /// 等待写入的批次上限（每次入队调用算一个）。 / Maximum queued submissions (one per enqueue call).
+    pub queue_capacity: usize,
+    /// 一次写入与一次WAITAOF合并的记录上限。 / Records merged into one write and one WAITAOF.
+    pub max_batch_records: usize,
+    /// 从接收到开始写入的最长排队时间；超过则不写入并返回可重试错误。
+    /// Longest wait from acceptance to write start; beyond it nothing is written and a retryable error returns.
+    pub max_queue_wait: Duration,
+}
+
+impl Default for EnqueueBatchConfig {
+    fn default() -> Self {
+        // 排队期限加上WAITAOF超时须小于常见客户端5秒超时，调用方收到的是明确结果而不是超时。
+        // Queue deadline plus WAITAOF timeout stay below the usual 5 s client timeout, so callers get an answer, not a timeout.
+        Self {
+            queue_capacity: 4096,
+            max_batch_records: 512,
+            max_queue_wait: Duration::from_millis(2_000),
+        }
+    }
+}
+
+struct EnqueueEntry {
+    entry_key: String,
+    encoded: Vec<u8>,
+    member: String,
+}
+
+struct EnqueueJob {
+    entries: Vec<EnqueueEntry>,
+    accepted_at: Instant,
+    reply: oneshot::Sender<Result<(), StorageError>>,
+}
+
+/// 把同一时刻的入队合并为一次Redis写入和一次WAITAOF。 / Writes concurrent enqueues with one Redis write and one WAITAOF.
+#[async_trait]
+trait EnqueueSink: Send + 'static {
+    /// 写入全部记录并等待本连接此前的写入进入本地AOF。 / Write every record and wait until this connection's writes reach local AOF.
+    async fn write(&mut self, entries: &[&EnqueueEntry]) -> Result<(), StorageError>;
+}
+
+struct RedisEnqueueSink {
+    connection: ConnectionManager,
+    script: Script,
+}
+
+#[async_trait]
+impl EnqueueSink for RedisEnqueueSink {
+    async fn write(&mut self, entries: &[&EnqueueEntry]) -> Result<(), StorageError> {
+        let score = RedisSnapshotBacklog::now_unix_ms()?;
+        let mut invocation = self.script.prepare_invoke();
+        invocation.key(PENDING_KEY).arg(score);
+        for entry in entries {
+            invocation
+                .arg(&entry.entry_key)
+                .arg(&entry.encoded)
+                .arg(&entry.member);
+        }
+        let accepted: i64 = invocation.invoke_async(&mut self.connection).await?;
+        if accepted != i64::try_from(entries.len()).unwrap_or(i64::MAX) {
+            return Err(StorageError::BacklogProtocol(
+                "batch enqueue returned an invalid count".to_string(),
+            ));
+        }
+        // WAITAOF覆盖本连接此前的全部写入，所以一次等待确认整批。 / WAITAOF covers every prior write of this connection, so one wait acknowledges the batch.
+        wait_for_local_aof(&mut self.connection).await
+    }
+}
+
+/// 组提交入口：调用方只提交并等待自己的结果；唯一的后台任务独占写入连接。
+/// Group-commit entry: callers submit and await their own result; one background task owns the write connection.
+#[derive(Clone)]
+struct EnqueueBatcher {
+    sender: mpsc::Sender<EnqueueJob>,
+    capacity: usize,
+}
+
+impl EnqueueBatcher {
+    fn spawn<S: EnqueueSink>(sink: S, config: EnqueueBatchConfig) -> Self {
+        let (sender, receiver) = mpsc::channel(config.queue_capacity);
+        tokio::spawn(run_enqueue_batcher(receiver, sink, config));
+        Self {
+            sender,
+            capacity: config.queue_capacity,
+        }
+    }
+
+    async fn submit(&self, entries: Vec<EnqueueEntry>) -> Result<(), StorageError> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .try_send(EnqueueJob {
+                entries,
+                accepted_at: Instant::now(),
+                reply,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => StorageError::BacklogEnqueueOverloaded {
+                    capacity: self.capacity,
+                },
+                mpsc::error::TrySendError::Closed(_) => StorageError::BacklogEnqueueStopped,
+            })?;
+        result
+            .await
+            .map_err(|_| StorageError::BacklogEnqueueStopped)?
+    }
+}
+
+/// 写入进行中（包括等待落盘）到达的请求自然积累，下一轮一次写完；超期或已放弃的请求不写入。
+/// Requests arriving while a write (including its fsync wait) is in progress accumulate and are written together
+/// next round; expired or abandoned requests are never written.
+async fn run_enqueue_batcher<S: EnqueueSink>(
+    mut jobs: mpsc::Receiver<EnqueueJob>,
+    mut sink: S,
+    config: EnqueueBatchConfig,
+) {
+    while let Some(first) = jobs.recv().await {
+        let mut records = first.entries.len();
+        let mut batch = vec![first];
+        while records < config.max_batch_records {
+            match jobs.try_recv() {
+                Ok(job) => {
+                    records += job.entries.len();
+                    batch.push(job);
+                }
+                Err(_) => break,
+            }
+        }
+        let now = Instant::now();
+        let mut live = Vec::with_capacity(batch.len());
+        for job in batch {
+            if job.reply.is_closed() {
+                continue;
+            }
+            let waited = now.duration_since(job.accepted_at);
+            if waited > config.max_queue_wait {
+                let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+                let _ = job
+                    .reply
+                    .send(Err(StorageError::BacklogEnqueueDeadlineExceeded {
+                        waited_ms,
+                    }));
+                continue;
+            }
+            live.push(job);
+        }
+        if live.is_empty() {
+            continue;
+        }
+        let entries: Vec<&EnqueueEntry> = live.iter().flat_map(|job| job.entries.iter()).collect();
+        // 写入与确认对整批共享同一个结果；失败时结果未知，调用方按原请求号重试。
+        // Write and acknowledgement share one outcome across the batch; on failure the outcome is unknown and callers retry with their request IDs.
+        let outcome = sink
+            .write(&entries)
+            .await
+            .map_err(|error| error.to_string());
+        for job in live {
+            let _ = job
+                .reply
+                .send(outcome.clone().map_err(StorageError::BacklogEnqueueFailed));
+        }
+    }
 }
 
 impl RedisSnapshotBacklog {
     /// 连接 Redis；不会自动改变 Redis 的持久化配置。
     /// Connect to Redis; persistence configuration remains a deployment responsibility.
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
+        Self::connect_with_config(url, EnqueueBatchConfig::default()).await
+    }
+
+    /// 使用指定组提交参数连接。 / Connect with explicit group-commit limits.
+    pub async fn connect_with_config(
+        url: &str,
+        config: EnqueueBatchConfig,
+    ) -> Result<Self, StorageError> {
+        if config.queue_capacity == 0 || config.max_batch_records == 0 {
+            return Err(StorageError::BacklogProtocol(
+                "enqueue queue capacity and batch size must be positive".to_string(),
+            ));
+        }
         // Keep AOF acknowledgement, lease processing, and observability independent. A slow
         // WAITAOF or a reconnect in one role must not hold up either of the other two roles.
         let (enqueue_connection, worker_connection, stats_connection) = tokio::try_join!(
@@ -230,8 +422,12 @@ impl RedisSnapshotBacklog {
             open_redis_connection_manager(url),
             open_redis_connection_manager(url),
         )?;
+        let sink = RedisEnqueueSink {
+            connection: enqueue_connection,
+            script: Script::new(ENQUEUE_BATCH_SCRIPT),
+        };
         Ok(Self {
-            enqueue_connection: Arc::new(Mutex::new(enqueue_connection)),
+            enqueue: EnqueueBatcher::spawn(sink, config),
             worker_connection: Arc::new(Mutex::new(worker_connection)),
             stats_connection: Arc::new(Mutex::new(stats_connection)),
         })
@@ -301,61 +497,28 @@ impl RedisSnapshotBacklog {
     /// 写入或替换一条普通快照；同一 RecordKey 永远只保留最新请求。
     /// Enqueue or replace one ordinary snapshot; one RecordKey keeps only its newest request.
     pub async fn enqueue(&self, request: SnapshotWrite) -> Result<(), StorageError> {
-        Self::validate(&request)?;
-        let member = Self::member(&request.record);
-        let encoded = Self::encode(&request)?;
-        let score = Self::now_unix_ms()?;
-        let entry_key = Self::entry_key(&member);
-        let script = Script::new(
-            "redis.call('SET', KEYS[1], ARGV[1]); redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3]); return 1",
-        );
-        let mut connection = self.enqueue_connection.lock().await;
-        let _: i64 = script
-            .key(entry_key)
-            .key(PENDING_KEY)
-            .arg(encoded)
-            .arg(score)
-            .arg(member)
-            .invoke_async(&mut *connection)
-            .await?;
-        wait_for_local_aof(&mut connection).await?;
-        Ok(())
+        self.enqueue.submit(vec![Self::prepare(&request)?]).await
     }
 
-    /// 原子接收一批普通快照；同一批只产生一次 Redis 往返。批内记录必须已经去重。
-    /// Atomically accept one snapshot batch with a single Redis round trip. Records must be unique.
+    /// 原子接收一批普通快照；与同一时刻的其他入队合并为一次写入和一次AOF确认。批内记录必须已经去重。
+    /// Atomically accept one snapshot batch, merged with concurrent enqueues into one write and one AOF
+    /// acknowledgement. Records must be unique.
     pub async fn enqueue_multi(&self, requests: &[SnapshotWrite]) -> Result<(), StorageError> {
-        let mut prepared = Vec::with_capacity(requests.len());
-        for request in requests {
-            Self::validate(request)?;
-            let member = Self::member(&request.record);
-            prepared.push((Self::entry_key(&member), Self::encode(request)?, member));
-        }
-        let score = Self::now_unix_ms()?;
-        let script = Script::new(
-            r#"
-local score = ARGV[1]
-for index = 2, #ARGV, 3 do
-    redis.call('SET', ARGV[index], ARGV[index + 1])
-    redis.call('ZADD', KEYS[1], score, ARGV[index + 2])
-end
-return (#ARGV - 1) / 3
-"#,
-        );
-        let mut invocation = script.prepare_invoke();
-        invocation.key(PENDING_KEY).arg(score);
-        for (entry_key, encoded, member) in prepared {
-            invocation.arg(entry_key).arg(encoded).arg(member);
-        }
-        let mut connection = self.enqueue_connection.lock().await;
-        let accepted: i64 = invocation.invoke_async(&mut *connection).await?;
-        if accepted != i64::try_from(requests.len()).unwrap_or(i64::MAX) {
-            return Err(StorageError::BacklogProtocol(
-                "batch enqueue returned an invalid count".to_string(),
-            ));
-        }
-        wait_for_local_aof(&mut connection).await?;
-        Ok(())
+        let entries = requests
+            .iter()
+            .map(Self::prepare)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.enqueue.submit(entries).await
+    }
+
+    fn prepare(request: &SnapshotWrite) -> Result<EnqueueEntry, StorageError> {
+        Self::validate(request)?;
+        let member = Self::member(&request.record);
+        Ok(EnqueueEntry {
+            entry_key: Self::entry_key(&member),
+            encoded: Self::encode(request)?,
+            member,
+        })
     }
 
     /// Read backlog depth and the age of the oldest pending item without mutating the queue.
@@ -676,4 +839,233 @@ async fn wait_for_local_aof(connection: &mut ConnectionManager) -> Result<(), St
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod enqueue_batcher_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::Semaphore;
+    use tokio::time::sleep;
+
+    /// 可阻塞、可在指定批次失败的替身写入端。 / Gated sink double that can fail a chosen batch.
+    #[derive(Clone)]
+    struct FakeSink {
+        batches: Arc<StdMutex<Vec<Vec<String>>>>,
+        gate: Arc<Semaphore>,
+        fail_batch: Option<usize>,
+    }
+
+    #[async_trait]
+    impl EnqueueSink for FakeSink {
+        async fn write(&mut self, entries: &[&EnqueueEntry]) -> Result<(), StorageError> {
+            self.gate.acquire().await.expect("gate open").forget();
+            let index = {
+                let mut batches = self.batches.lock().unwrap();
+                batches.push(entries.iter().map(|entry| entry.member.clone()).collect());
+                batches.len()
+            };
+            if self.fail_batch == Some(index) {
+                return Err(StorageError::BacklogProtocol(
+                    "injected write failure".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn sink(fail_batch: Option<usize>) -> FakeSink {
+        FakeSink {
+            batches: Arc::default(),
+            gate: Arc::new(Semaphore::new(0)),
+            fail_batch,
+        }
+    }
+
+    fn entry(name: &str) -> Vec<EnqueueEntry> {
+        vec![EnqueueEntry {
+            entry_key: format!("entry:{name}"),
+            encoded: name.as_bytes().to_vec(),
+            member: name.to_string(),
+        }]
+    }
+
+    fn config(queue_capacity: usize, max_queue_wait_ms: u64) -> EnqueueBatchConfig {
+        EnqueueBatchConfig {
+            queue_capacity,
+            max_batch_records: 512,
+            max_queue_wait: Duration::from_millis(max_queue_wait_ms),
+        }
+    }
+
+    fn batches(sink: &FakeSink) -> Vec<Vec<String>> {
+        sink.batches.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn requests_arriving_during_a_write_share_the_next_write() {
+        let sink = sink(None);
+        let batcher = EnqueueBatcher::spawn(sink.clone(), config(4096, 10_000));
+        let first = tokio::spawn({
+            let batcher = batcher.clone();
+            async move { batcher.submit(entry("first")).await }
+        });
+        sleep(Duration::from_millis(50)).await;
+        let waiting: Vec<_> = (0..50)
+            .map(|i| {
+                let batcher = batcher.clone();
+                tokio::spawn(async move { batcher.submit(entry(&format!("p{i}"))).await })
+            })
+            .collect();
+        sleep(Duration::from_millis(50)).await;
+        sink.gate.add_permits(10);
+        first.await.unwrap().unwrap();
+        for handle in waiting {
+            handle.await.unwrap().unwrap();
+        }
+        let written = batches(&sink);
+        // 第一次写入期间到达的50个请求只用一次写入和一次AOF确认。 / The 50 requests that arrived during the first write use one write and one AOF wait.
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0], vec!["first"]);
+        assert_eq!(written[1].len(), 50);
+    }
+
+    #[tokio::test]
+    async fn expired_requests_are_rejected_without_being_written() {
+        let sink = sink(None);
+        let batcher = EnqueueBatcher::spawn(sink.clone(), config(4096, 50));
+        let first = tokio::spawn({
+            let batcher = batcher.clone();
+            async move { batcher.submit(entry("first")).await }
+        });
+        sleep(Duration::from_millis(30)).await;
+        let stale: Vec<_> = (0..3)
+            .map(|i| {
+                let batcher = batcher.clone();
+                tokio::spawn(async move { batcher.submit(entry(&format!("stale{i}"))).await })
+            })
+            .collect();
+        sleep(Duration::from_millis(150)).await;
+        sink.gate.add_permits(10);
+        first.await.unwrap().unwrap();
+        for handle in stale {
+            assert!(matches!(
+                handle.await.unwrap(),
+                Err(StorageError::BacklogEnqueueDeadlineExceeded { .. })
+            ));
+        }
+        batcher.submit(entry("fresh")).await.unwrap();
+        assert_eq!(
+            batches(&sink),
+            vec![vec!["first".to_string()], vec!["fresh".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_rejects_immediately_instead_of_waiting() {
+        let sink = sink(None);
+        let batcher = EnqueueBatcher::spawn(sink.clone(), config(1, 10_000));
+        let first = tokio::spawn({
+            let batcher = batcher.clone();
+            async move { batcher.submit(entry("first")).await }
+        });
+        sleep(Duration::from_millis(30)).await;
+        let queued = tokio::spawn({
+            let batcher = batcher.clone();
+            async move { batcher.submit(entry("queued")).await }
+        });
+        sleep(Duration::from_millis(30)).await;
+        let rejected = tokio::time::timeout(
+            Duration::from_millis(200),
+            batcher.submit(entry("rejected")),
+        )
+        .await
+        .expect("overload must not wait");
+        assert!(matches!(
+            rejected,
+            Err(StorageError::BacklogEnqueueOverloaded { capacity: 1 })
+        ));
+        sink.gate.add_permits(10);
+        first.await.unwrap().unwrap();
+        queued.await.unwrap().unwrap();
+        assert!(
+            !batches(&sink)
+                .iter()
+                .flatten()
+                .any(|member| member == "rejected")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_fails_its_whole_batch_and_later_batches_continue() {
+        let sink = sink(Some(2));
+        let batcher = EnqueueBatcher::spawn(sink.clone(), config(4096, 10_000));
+        let first = tokio::spawn({
+            let batcher = batcher.clone();
+            async move { batcher.submit(entry("first")).await }
+        });
+        sleep(Duration::from_millis(30)).await;
+        let failing: Vec<_> = ["b", "c"]
+            .iter()
+            .map(|name| {
+                let batcher = batcher.clone();
+                let name = name.to_string();
+                tokio::spawn(async move { batcher.submit(entry(&name)).await })
+            })
+            .collect();
+        sleep(Duration::from_millis(30)).await;
+        sink.gate.add_permits(10);
+        first.await.unwrap().unwrap();
+        for handle in failing {
+            match handle.await.unwrap() {
+                Err(StorageError::BacklogEnqueueFailed(message)) => {
+                    assert!(message.contains("injected write failure"))
+                }
+                other => panic!("expected shared batch failure, got {other:?}"),
+            }
+        }
+        batcher.submit(entry("after")).await.unwrap();
+        assert_eq!(batches(&sink).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn abandoned_requests_are_not_written() {
+        let sink = sink(None);
+        let batcher = EnqueueBatcher::spawn(sink.clone(), config(4096, 10_000));
+        let first = tokio::spawn({
+            let batcher = batcher.clone();
+            async move { batcher.submit(entry("first")).await }
+        });
+        sleep(Duration::from_millis(30)).await;
+        let abandoned = tokio::spawn({
+            let batcher = batcher.clone();
+            async move { batcher.submit(entry("abandoned")).await }
+        });
+        sleep(Duration::from_millis(30)).await;
+        abandoned.abort();
+        let kept = tokio::spawn({
+            let batcher = batcher.clone();
+            async move { batcher.submit(entry("kept")).await }
+        });
+        sleep(Duration::from_millis(30)).await;
+        sink.gate.add_permits(10);
+        first.await.unwrap().unwrap();
+        kept.await.unwrap().unwrap();
+        assert_eq!(
+            batches(&sink),
+            vec![vec!["first".to_string()], vec!["kept".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_limits_are_rejected_before_connecting() {
+        let invalid = EnqueueBatchConfig {
+            queue_capacity: 0,
+            ..EnqueueBatchConfig::default()
+        };
+        assert!(matches!(
+            RedisSnapshotBacklog::connect_with_config("redis://127.0.0.1:1/0", invalid).await,
+            Err(StorageError::BacklogProtocol(_))
+        ));
+    }
 }

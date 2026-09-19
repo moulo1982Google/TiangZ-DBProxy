@@ -49,7 +49,8 @@ pub use latency::{STORAGE_LATENCY_BOUNDS_MS, StorageStageSnapshot};
 use latency::{Stage, StorageLatency};
 
 pub use backlog::{
-    RedisSnapshotBacklog, RedisSnapshotBacklogStats, SnapshotBacklogAck, SnapshotBacklogLease,
+    EnqueueBatchConfig, RedisSnapshotBacklog, RedisSnapshotBacklogStats, SnapshotBacklogAck,
+    SnapshotBacklogLease,
 };
 pub use cache_repair::{CacheRepairLease, CacheRepairStats, PostgresCacheRepairQueue};
 pub use outbox::{
@@ -453,6 +454,17 @@ pub enum StorageError {
     BacklogLeaseTooLarge { lease_ms: u64 },
     #[error("backlog protocol error: {0}")]
     BacklogProtocol(String),
+    /// 入队排队已满，未写入Redis；调用方可用同一请求号重试。 / Enqueue queue is full and nothing was written; retry with the same request ID.
+    #[error("snapshot backlog enqueue queue is full ({capacity} pending batches)")]
+    BacklogEnqueueOverloaded { capacity: usize },
+    /// 入队请求排队超过期限，未写入Redis。 / The enqueue request waited past its deadline and was not written.
+    #[error("snapshot backlog enqueue waited {waited_ms}ms past its deadline and was not written")]
+    BacklogEnqueueDeadlineExceeded { waited_ms: u64 },
+    /// 同一批次共享的写入或AOF确认失败；结果未知，按原请求号重试。 / Shared batch write or AOF acknowledgement failed; outcome unknown, retry with the same request ID.
+    #[error("{0}")]
+    BacklogEnqueueFailed(String),
+    #[error("snapshot backlog enqueue batcher stopped")]
+    BacklogEnqueueStopped,
     #[error("durable queue lease must be greater than zero")]
     InvalidQueueLease,
     #[error("durable queue worker id is empty")]
