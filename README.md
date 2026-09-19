@@ -239,11 +239,11 @@ LoadTrade              读取交易当前版本、状态和不透明Payload
 LoadTradeTransaction   按operationId和tradeId读取已提交交易回执
 ```
 
-每条连接先校验`protocol_version + protocol_fingerprint + auth_token`，之后才允许 RPC。帧使用大端四字节长度前缀，默认上限 8 MiB。客户端连接内按顺序执行请求；`DbProxyClientPool::connect`保持读写共享连接的兼容行为，`connect_split`可把读写分到独立连接组，避免慢写和 AOF ACK 阻塞读连接。两种模式都按`RecordKey`或 operation ID 稳定路由。服务端存储连接也按相同原则分片，避免所有玩家共享一个事务锁。
+每条连接先校验`protocol_version + protocol_fingerprint + auth_token`，之后才允许 RPC。帧使用大端四字节长度前缀，默认上限 8 MiB。一条连接可同时有多个在途请求（服务端`server.maxInFlightPerConnection`、客户端`max_in_flight`，默认均为64），同一连接上涉及同一记录、操作或交易的请求按到达顺序执行，其余并发，见[网络协议](docs/network-protocol.md#连接并发和-endpoint)；`DbProxyClientPool::connect`保持读写共享连接的兼容行为，`connect_split`可把读写分到独立连接组，避免慢写和 AOF ACK 阻塞读连接。两种模式都按`RecordKey`或 operation ID 稳定路由。服务端存储连接也按相同原则分片，避免所有玩家共享一个事务锁。
 
 详细错误码、ACK语义、Endpoint故障切换和跨记录限制见[网络协议说明](docs/network-protocol.md)。
 
-`SnapshotFlushQueue`是 DBProxy 进程内的协调器；`RedisSnapshotBacklog`是独立的 Redis AOF 持久积压区。前者随进程消失，后者只有在入队脚本后通过 `WAITAOF` 才返回成功，DBProxy/Redis 重启后可以重新领取。两者都只适合等级、任务进度、角色位置等允许小范围回退的数据；关键经济事务必须走 PostgreSQL 事务。AOF 和本地数据卷不等于 Redis 多副本高可用。
+`SnapshotFlushQueue`是 DBProxy 进程内的协调器；`RedisSnapshotBacklog`是独立的 Redis AOF 持久积压区。前者随进程消失，后者只有在入队脚本后通过 `WAITAOF` 才返回成功，DBProxy/Redis 重启后可以重新领取。同一时刻的入队按组提交合并为一次写入和一次 `WAITAOF`，并带排队上限和2秒排队期限，过载时快速返回可重试错误；部署配置`backlog.enqueueAck: "memory"`可改为写入Redis内存即确认（Redis崩溃可能丢约1秒已确认入队，默认`"aof"`），见[架构说明](docs/architecture.md#redis-aof-普通快照-backlog)。两者都只适合等级、任务进度、角色位置等允许小范围回退的数据；关键经济事务必须走 PostgreSQL 事务。AOF 和本地数据卷不等于 Redis 多副本高可用。
 
 ## 许可证
 

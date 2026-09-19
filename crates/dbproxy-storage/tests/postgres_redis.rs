@@ -15,10 +15,10 @@ use tiangz_dbproxy_core::{
     TransactionalRecordWrite, TransactionalWrite, TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_storage::{
-    CacheFallbackConfig, CacheFallbackLockConfig, DEFAULT_OUTBOX_STREAM_PREFIX,
-    PostgresSnapshotStore, RedisOutboxPublisher, RedisSnapshotBacklog, RedisSnapshotCache,
-    SNAPSHOT_PARTITION_COUNT, SnapshotBacklogAck, SnapshotCacheConfig, StorageError,
-    StorageMetrics, TieredSnapshotStore, TieredSnapshotStoreConfig,
+    CacheFallbackConfig, CacheFallbackLockConfig, DEFAULT_OUTBOX_STREAM_PREFIX, EnqueueAck,
+    EnqueueBatchConfig, PostgresSnapshotStore, RedisOutboxPublisher, RedisSnapshotBacklog,
+    RedisSnapshotCache, SNAPSHOT_PARTITION_COUNT, SnapshotBacklogAck, SnapshotCacheConfig,
+    StorageError, StorageMetrics, TieredSnapshotStore, TieredSnapshotStoreConfig,
 };
 
 fn test_suffix() -> String {
@@ -403,6 +403,7 @@ async fn postgres_snapshot_table_uses_32_hash_partitions() {
             (9, "outbox-relay".to_string()),
             (10, "cache-repair-leases".to_string()),
             (11, "outbox-index-cleanup".to_string()),
+            (12, "queued-fence".to_string()),
         ]
     );
 
@@ -754,6 +755,308 @@ async fn batch_save_preserves_partial_results_and_batches_cache_updates() {
         SnapshotWriteOutcome::Applied {
             revision: Revision(1)
         }
+    );
+}
+
+fn queued_write(record: &RecordKey, request_id: &str, payload: &[u8]) -> SnapshotWrite {
+    SnapshotWrite {
+        request_id: request_id.to_string(),
+        record: record.clone(),
+        schema: "queued.fence".to_string(),
+        schema_version: 1,
+        payload: payload.to_vec(),
+        expected_revision: None,
+        updated_at_unix_ms: 1,
+    }
+}
+
+async fn stored_payload(store: &PostgresSnapshotStore, record: &RecordKey) -> Vec<u8> {
+    store.load(record).await.unwrap().unwrap().payload
+}
+
+/// 防护序号：只有更大的序号能覆盖；迟到的旧值、升级前的旧条目（序号0）都不写入。
+/// Fence sequences: only a larger sequence overwrites; late older values and legacy entries (sequence 0) do not.
+#[tokio::test]
+#[ignore = "需要本机 PostgreSQL；使用 --ignored 显式运行"]
+async fn queued_flush_fence_keeps_the_newest_sequence() {
+    let url = std::env::var("DBPROXY_POSTGRES_URL").unwrap();
+    let mut store = PostgresSnapshotStore::connect(&url).await.unwrap();
+    let writer = store.clone();
+    let suffix = test_suffix();
+    let record = RecordKey::new(format!("queued-fence-{suffix}"), "1").unwrap();
+    let save = |request: SnapshotWrite, sequence: u64| {
+        let mut store = writer.clone();
+        async move {
+            store
+                .save_queued_batch(&[request], &[sequence])
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .unwrap()
+        }
+    };
+    let newer = queued_write(&record, &format!("{suffix}-newer"), b"newer");
+    assert_eq!(
+        save(newer, 20).await,
+        SnapshotWriteOutcome::Applied {
+            revision: Revision(1)
+        }
+    );
+    let late = queued_write(&record, &format!("{suffix}-late"), b"late");
+    assert_eq!(
+        save(late.clone(), 10).await,
+        SnapshotWriteOutcome::Duplicate {
+            revision: Revision(1)
+        }
+    );
+    assert_eq!(
+        save(late, 10).await,
+        SnapshotWriteOutcome::Duplicate {
+            revision: Revision(1)
+        }
+    );
+    let legacy = queued_write(&record, &format!("{suffix}-legacy"), b"legacy");
+    assert_eq!(
+        save(legacy, 0).await,
+        SnapshotWriteOutcome::Duplicate {
+            revision: Revision(1)
+        }
+    );
+    assert_eq!(stored_payload(&store, &record).await, b"newer");
+    let newest = queued_write(&record, &format!("{suffix}-newest"), b"newest");
+    assert_eq!(
+        save(newest, 30).await,
+        SnapshotWriteOutcome::Applied {
+            revision: Revision(2)
+        }
+    );
+    assert_eq!(stored_payload(&store, &record).await, b"newest");
+
+    // 普通无条件写入的行没有序号，第一次排队写照常覆盖。 / A row from a plain blind write has no sequence and accepts one.
+    let plain = RecordKey::new(format!("queued-fence-{suffix}"), "plain").unwrap();
+    store
+        .save(queued_write(&plain, &format!("{suffix}-plain"), b"plain"))
+        .await
+        .unwrap();
+    let fenced = queued_write(&plain, &format!("{suffix}-fenced"), b"fenced");
+    assert_eq!(
+        save(fenced, 5).await,
+        SnapshotWriteOutcome::Applied {
+            revision: Revision(2)
+        }
+    );
+    assert_eq!(stored_payload(&store, &plain).await, b"fenced");
+    let conditional = SnapshotWrite {
+        expected_revision: Some(Revision(2)),
+        ..queued_write(&plain, &format!("{suffix}-conditional"), b"conditional")
+    };
+    assert!(matches!(
+        store
+            .save_queued_batch(&[conditional], &[40])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap(),
+        Err(StorageError::Core(
+            StoreError::QueuedSnapshotRequiresUnconditionalWrite { .. }
+        ))
+    ));
+}
+
+/// 落库任务的租约过期、记录被另一个任务领取落库后，原任务的旧值才到PG：必须被防护序号拒绝。
+/// A worker whose lease expired writes its older value only after another worker flushed the newer one: the fence
+/// sequence must reject it.
+#[tokio::test]
+#[ignore = "需要本机 PostgreSQL 与 Redis；使用 --ignored --test-threads=1 显式运行"]
+async fn a_worker_writing_after_its_lease_expired_cannot_overwrite_newer_data() {
+    let pg = std::env::var("DBPROXY_POSTGRES_URL").unwrap();
+    let redis_url = std::env::var("DBPROXY_REDIS_URL")
+        .expect("DBPROXY_REDIS_URL must be set for the integration test");
+    let mut store = PostgresSnapshotStore::connect(&pg).await.unwrap();
+    let slow_worker = RedisSnapshotBacklog::connect(&redis_url).await.unwrap();
+    let other_worker = RedisSnapshotBacklog::connect(&redis_url).await.unwrap();
+    let suffix = test_suffix();
+    let record = RecordKey::new(format!("queued-stale-{suffix}"), "1").unwrap();
+    async fn claim_own(
+        backlog: &RedisSnapshotBacklog,
+        record: &RecordKey,
+        lease_ms: u64,
+    ) -> Option<tiangz_dbproxy_storage::SnapshotBacklogLease> {
+        let mut own = None;
+        for lease in backlog.claim_multi(lease_ms, 1_024).await.unwrap() {
+            if &lease.request.record == record {
+                own = Some(lease);
+            } else {
+                backlog
+                    .release_multi(std::slice::from_ref(&lease))
+                    .await
+                    .unwrap();
+            }
+        }
+        own
+    }
+
+    slow_worker
+        .enqueue(queued_write(&record, &format!("{suffix}-old"), b"old"))
+        .await
+        .unwrap();
+    // 1毫秒租约：随后的“卡顿”必然超过租约。 / A 1 ms lease: the following stall always outlives it.
+    let stale = claim_own(&slow_worker, &record, 1)
+        .await
+        .expect("slow worker claim");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    slow_worker
+        .enqueue(queued_write(&record, &format!("{suffix}-new"), b"new"))
+        .await
+        .unwrap();
+    let newer = claim_own(&other_worker, &record, 30_000)
+        .await
+        .expect("the expired lease is reclaimed and the newer payload claimed");
+    assert_eq!(newer.request.payload, b"new");
+    assert!(newer.fence_sequence.unwrap() > stale.fence_sequence.unwrap());
+
+    let flush = |lease: &tiangz_dbproxy_storage::SnapshotBacklogLease| {
+        (
+            vec![lease.request.clone()],
+            vec![lease.fence_sequence.unwrap()],
+        )
+    };
+    let (requests, sequences) = flush(&newer);
+    assert!(matches!(
+        store
+            .save_queued_batch(&requests, &sequences)
+            .await
+            .unwrap()[0],
+        Ok(SnapshotWriteOutcome::Applied { .. })
+    ));
+    let (requests, sequences) = flush(&stale);
+    assert!(matches!(
+        store
+            .save_queued_batch(&requests, &sequences)
+            .await
+            .unwrap()[0],
+        Ok(SnapshotWriteOutcome::Duplicate { .. })
+    ));
+    assert_eq!(stored_payload(&store, &record).await, b"new");
+    assert_eq!(
+        other_worker.ack(&newer).await.unwrap(),
+        SnapshotBacklogAck::Removed
+    );
+    assert_eq!(
+        slow_worker.ack(&stale).await.unwrap(),
+        SnapshotBacklogAck::LeaseLost
+    );
+}
+
+// 本组Redis积压用例会领取并释放库中全部待处理条目，请用 --test-threads=1 串行运行。
+// These Redis backlog tests claim and release every pending entry; run them with --test-threads=1.
+/// 正在落库的记录又被入队时，其他worker不得并发领取；否则旧值可能后到PG覆盖新值。
+/// A record re-enqueued while being flushed must not be claimed by another worker, or an older value could land last.
+#[tokio::test]
+#[ignore = "需要本机 Redis；使用 --ignored 显式运行"]
+async fn redis_backlog_never_claims_a_record_under_a_live_lease() {
+    let redis_url = std::env::var("DBPROXY_REDIS_URL")
+        .expect("DBPROXY_REDIS_URL must be set for the integration test");
+    let first_worker = RedisSnapshotBacklog::connect(&redis_url).await.unwrap();
+    let second_worker = RedisSnapshotBacklog::connect(&redis_url).await.unwrap();
+    let suffix = test_suffix();
+    let record = RecordKey::new(format!("backlog-lease-{suffix}"), "1").unwrap();
+    let write = |payload: u8| SnapshotWrite {
+        request_id: format!("backlog-lease-{suffix}-{payload}"),
+        record: record.clone(),
+        schema: "backlog.lease".to_string(),
+        schema_version: 1,
+        payload: vec![payload],
+        expected_revision: None,
+        updated_at_unix_ms: u64::from(payload),
+    };
+    async fn claim_own(
+        backlog: &RedisSnapshotBacklog,
+        record: &RecordKey,
+    ) -> Option<tiangz_dbproxy_storage::SnapshotBacklogLease> {
+        let mut own = None;
+        for lease in backlog.claim_multi(30_000, 1_024).await.unwrap() {
+            if &lease.request.record == record {
+                own = Some(lease);
+            } else {
+                backlog
+                    .release_multi(std::slice::from_ref(&lease))
+                    .await
+                    .unwrap();
+            }
+        }
+        own
+    }
+    first_worker.enqueue(write(1)).await.unwrap();
+    let stale = claim_own(&first_worker, &record)
+        .await
+        .expect("first claim");
+    assert_eq!(stale.request.payload, [1]);
+    first_worker.enqueue(write(2)).await.unwrap();
+    assert!(
+        claim_own(&second_worker, &record).await.is_none(),
+        "a record under a live lease must not be claimed twice"
+    );
+    assert_eq!(
+        first_worker.ack(&stale).await.unwrap(),
+        SnapshotBacklogAck::Superseded
+    );
+    let newer = claim_own(&second_worker, &record)
+        .await
+        .expect("newer payload re-queued");
+    assert_eq!(newer.request.payload, [2]);
+    assert_eq!(
+        second_worker.ack(&newer).await.unwrap(),
+        SnapshotBacklogAck::Removed
+    );
+}
+
+/// 内存确认档位只少等AOF落盘，入队内容与领取语义不变。
+/// The memory acknowledgement level only skips the AOF wait; queued content and claim semantics are unchanged.
+#[tokio::test]
+#[ignore = "需要本机 Redis；使用 --ignored 显式运行"]
+async fn redis_backlog_memory_ack_keeps_queue_semantics() {
+    let redis_url = std::env::var("DBPROXY_REDIS_URL")
+        .expect("DBPROXY_REDIS_URL must be set for the integration test");
+    let backlog = RedisSnapshotBacklog::connect_with_config(
+        &redis_url,
+        EnqueueBatchConfig {
+            ack: EnqueueAck::Memory,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let suffix = test_suffix();
+    let record = RecordKey::new(format!("backlog-memory-{suffix}"), "1").unwrap();
+    let write = |payload: &[u8]| SnapshotWrite {
+        request_id: format!("backlog-memory-{suffix}-{}", payload[0]),
+        record: record.clone(),
+        schema: "backlog.memory".to_string(),
+        schema_version: 1,
+        payload: payload.to_vec(),
+        expected_revision: None,
+        updated_at_unix_ms: 1,
+    };
+    backlog.enqueue(write(b"a")).await.unwrap();
+    backlog.enqueue(write(b"b")).await.unwrap();
+    let mut claimed = None;
+    for lease in backlog.claim_multi(30_000, 1_024).await.unwrap() {
+        if lease.request.record == record {
+            claimed = Some(lease);
+        } else {
+            backlog
+                .release_multi(std::slice::from_ref(&lease))
+                .await
+                .unwrap();
+        }
+    }
+    let lease = claimed.expect("memory-acknowledged enqueue must be claimable");
+    assert_eq!(lease.request.payload, b"b");
+    assert_eq!(
+        backlog.ack(&lease).await.unwrap(),
+        SnapshotBacklogAck::Removed
     );
 }
 

@@ -39,6 +39,7 @@
         "maxFrameBytes": { "type": "integer", "minimum": 1, "default": 8388608 },
         "maxPayloadBytes": { "type": "integer", "minimum": 1, "default": 1048576 },
         "maxConnections": { "type": "integer", "minimum": 1, "default": 256, "description": "每个实例的 TCP 连接上限，包含尚未完成握手的连接；超限立即关闭。" },
+        "maxInFlightPerConnection": { "type": "integer", "minimum": 1, "maximum": 4096, "default": 64, "description": "每条连接同时处理的请求上限，满额时停止读取该连接直到有请求完成；同一连接上涉及同一记录、操作或交易的请求仍按到达顺序执行。" },
         "handshakeTimeoutMs": { "type": "integer", "minimum": 1, "default": 5000 },
         "shutdownGraceMs": { "type": "integer", "minimum": 1, "default": 5000 }
       }
@@ -90,7 +91,12 @@
         "workers": { "type": "integer", "minimum": 1, "default": 1 },
         "leaseMs": { "type": "integer", "minimum": 1, "default": 30000 },
         "idleDelayMs": { "type": "integer", "minimum": 1, "default": 20 },
-        "failureDelayMs": { "type": "integer", "minimum": 1, "default": 1000 }
+        "failureDelayMs": { "type": "integer", "minimum": 1, "default": 1000 },
+        "enqueueAck": {
+          "enum": ["aof", "memory"],
+          "default": "aof",
+          "description": "普通快照入队何时确认。aof：等本地AOF落盘，Redis崩溃不丢已确认入队；memory：写入Redis内存即确认，按appendfsync everysec，Redis崩溃可能丢约1秒已确认入队，正常重启不丢。整个DBProxy部署统一生效。"
+        }
       }
     },
     "cacheRepair": {

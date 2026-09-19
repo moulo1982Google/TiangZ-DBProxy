@@ -74,6 +74,10 @@ pub struct ServerSection {
     pub max_payload_bytes: usize,
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    /// 每条客户端连接同时处理的请求上限；同一记录仍按到达顺序执行。
+    /// Concurrent requests per client connection; requests on one record still run in arrival order.
+    #[serde(default = "default_max_in_flight_per_connection")]
+    pub max_in_flight_per_connection: usize,
     #[serde(default = "default_handshake_timeout_ms")]
     pub handshake_timeout_ms: u64,
     #[serde(default = "default_shutdown_grace_ms")]
@@ -176,6 +180,28 @@ pub struct BacklogSection {
     pub idle_delay_ms: u64,
     #[serde(default = "default_backlog_failure_delay_ms")]
     pub failure_delay_ms: u64,
+    /// "aof"（默认）等本地AOF落盘才确认入队；"memory"写入Redis内存即确认，Redis崩溃可能丢约1秒已确认入队。
+    /// "aof" (default) acknowledges after local AOF fsync; "memory" acknowledges once in Redis memory and a Redis
+    /// crash may lose about one second of acknowledged enqueues.
+    #[serde(default)]
+    pub enqueue_ack: EnqueueAckSetting,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum EnqueueAckSetting {
+    #[default]
+    Aof,
+    Memory,
+}
+
+impl From<EnqueueAckSetting> for tiangz_dbproxy_storage::EnqueueAck {
+    fn from(value: EnqueueAckSetting) -> Self {
+        match value {
+            EnqueueAckSetting::Aof => Self::Aof,
+            EnqueueAckSetting::Memory => Self::Memory,
+        }
+    }
 }
 
 impl Default for BacklogSection {
@@ -185,6 +211,7 @@ impl Default for BacklogSection {
             lease_ms: default_backlog_lease_ms(),
             idle_delay_ms: default_backlog_idle_delay_ms(),
             failure_delay_ms: default_backlog_failure_delay_ms(),
+            enqueue_ack: EnqueueAckSetting::default(),
         }
     }
 }
@@ -259,6 +286,7 @@ pub struct ResolvedDbProxyConfig {
     pub max_frame_bytes: usize,
     pub max_payload_bytes: usize,
     pub max_connections: usize,
+    pub max_in_flight_per_connection: usize,
     pub handshake_timeout: Duration,
     pub shutdown_grace: Duration,
     pub runtime_worker_threads: usize,
@@ -267,6 +295,7 @@ pub struct ResolvedDbProxyConfig {
     pub backlog_lease_ms: u64,
     pub backlog_idle_delay: Duration,
     pub backlog_failure_delay: Duration,
+    pub backlog_enqueue_ack: tiangz_dbproxy_storage::EnqueueAck,
     pub cache_repair: ResolvedRetryQueue,
     pub outbox: ResolvedRetryQueue,
     pub outbox_relay: crate::relay_config::ResolvedOutboxRelay,
@@ -338,10 +367,15 @@ impl fmt::Debug for ResolvedDbProxyConfig {
             .field("max_frame_bytes", &self.max_frame_bytes)
             .field("max_payload_bytes", &self.max_payload_bytes)
             .field("max_connections", &self.max_connections)
+            .field(
+                "max_in_flight_per_connection",
+                &self.max_in_flight_per_connection,
+            )
             .field("runtime_worker_threads", &self.runtime_worker_threads)
             .field("storage_backend", &self.storage.name())
             .field("storage_shards", &self.storage.shards())
             .field("backlog_workers", &self.backlog_workers)
+            .field("backlog_enqueue_ack", &self.backlog_enqueue_ack)
             .field("cache_repair_workers", &self.cache_repair.workers)
             .field("outbox_workers", &self.outbox.workers)
             .field("observability_listen_addr", &self.observability_listen_addr)
@@ -445,6 +479,14 @@ impl DbProxyConfig {
             return Err(ConfigError(
                 "server.maxConnections is outside the supported range".into(),
             ));
+        }
+        if !(1..=crate::MAX_IN_FLIGHT_PER_CONNECTION)
+            .contains(&self.server.max_in_flight_per_connection)
+        {
+            return Err(ConfigError(format!(
+                "server.maxInFlightPerConnection must be 1..={}",
+                crate::MAX_IN_FLIGHT_PER_CONNECTION
+            )));
         }
         require_positive("server.maxPayloadBytes", self.server.max_payload_bytes)?;
         if self.server.max_payload_bytes > self.server.max_frame_bytes {
@@ -591,6 +633,7 @@ impl DbProxyConfig {
             max_frame_bytes: self.server.max_frame_bytes,
             max_payload_bytes: self.server.max_payload_bytes,
             max_connections: self.server.max_connections,
+            max_in_flight_per_connection: self.server.max_in_flight_per_connection,
             handshake_timeout: Duration::from_millis(self.server.handshake_timeout_ms),
             shutdown_grace: Duration::from_millis(self.server.shutdown_grace_ms),
             runtime_worker_threads: self.runtime.worker_threads,
@@ -599,6 +642,7 @@ impl DbProxyConfig {
             backlog_lease_ms: self.backlog.lease_ms,
             backlog_idle_delay: Duration::from_millis(self.backlog.idle_delay_ms),
             backlog_failure_delay: Duration::from_millis(self.backlog.failure_delay_ms),
+            backlog_enqueue_ack: self.backlog.enqueue_ack.into(),
             cache_repair,
             outbox,
             outbox_relay,
@@ -611,6 +655,9 @@ impl DbProxyConfig {
 
 fn default_max_connections() -> usize {
     crate::DEFAULT_MAX_CONNECTIONS
+}
+fn default_max_in_flight_per_connection() -> usize {
+    crate::DEFAULT_MAX_IN_FLIGHT_PER_CONNECTION
 }
 
 pub(crate) fn required_environment(
@@ -833,6 +880,44 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_limit_defaults_and_rejects_invalid_values_before_secrets() {
+        for (limit, expected) in [
+            (None, Some(crate::DEFAULT_MAX_IN_FLIGHT_PER_CONNECTION)),
+            (Some(1), Some(1)),
+            (
+                Some(crate::MAX_IN_FLIGHT_PER_CONNECTION),
+                Some(crate::MAX_IN_FLIGHT_PER_CONNECTION),
+            ),
+            (Some(0), None),
+            (Some(crate::MAX_IN_FLIGHT_PER_CONNECTION + 1), None),
+        ] {
+            let mut value = serde_json::json!({"configVersion":1,"server":{"listenAddr":"127.0.0.1:0","authTokenEnv":"AUTH"},"storage":{"backend":"memory","shards":1}});
+            if let Some(limit) = limit {
+                value["server"]["maxInFlightPerConnection"] = limit.into();
+            }
+            let path = write_config(&value.to_string());
+            let result = load_config_with(&path, |_| {
+                assert!(
+                    expected.is_some(),
+                    "invalid limit must fail before reading secrets"
+                );
+                Some("0123456789abcdef".into())
+            });
+            fs::remove_file(path).unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(result.unwrap().max_in_flight_per_connection, expected);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("maxInFlightPerConnection")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn observability_binding_policy_is_checked_before_secrets_or_connections() {
         for (address, opt_in, allowed) in [
             ("127.0.0.1:9090", false, true),
@@ -887,6 +972,10 @@ mod tests {
         assert_eq!(config.runtime_worker_threads, 4);
         assert_eq!(config.max_payload_bytes, DEFAULT_MAX_PAYLOAD_BYTES);
         assert_eq!(config.backlog_workers, 1);
+        assert_eq!(
+            config.backlog_enqueue_ack,
+            tiangz_dbproxy_storage::EnqueueAck::Aof
+        );
         assert_eq!(config.cache_repair.workers, 1);
         assert_eq!(config.cache_repair.lease_ms, 30_000);
         assert_eq!(config.cache_repair.max_attempts, 20);
@@ -1091,6 +1180,35 @@ mod tests {
         assert_eq!(config.runtime_worker_threads, 4);
         assert_eq!(config.storage.name(), "memory");
         assert_eq!(config.storage.shards(), 8);
+    }
+
+    #[test]
+    fn enqueue_ack_is_a_deployment_choice_and_rejects_unknown_levels() {
+        let config = |ack: &str| {
+            let path = write_config(&format!(
+                r#"{{
+          "configVersion": 1,
+          "server": {{ "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" }},
+          "storage": {{ "backend": "memory" }},
+          "backlog": {{ "enqueueAck": {ack} }}
+        }}"#
+            ));
+            let result = load_config_with(&path, |name| {
+                (name == "AUTH").then(|| "memory-test-token".to_string())
+            });
+            fs::remove_file(path).unwrap();
+            result
+        };
+        assert_eq!(
+            config(r#""memory""#).unwrap().backlog_enqueue_ack,
+            tiangz_dbproxy_storage::EnqueueAck::Memory
+        );
+        assert_eq!(
+            config(r#""aof""#).unwrap().backlog_enqueue_ack,
+            tiangz_dbproxy_storage::EnqueueAck::Aof
+        );
+        assert!(config(r#""none""#).is_err());
+        assert!(config(r#""AOF""#).is_err());
     }
 
     #[test]

@@ -91,7 +91,7 @@
 
 ## 待读验证：读写连接池分配 / Pending validation: read/write pool allocation
 
-`connect_split(read_size, write_size)` 将客户端物理连接分为独立的 read pool 和 write pool。每条连接一次只允许一个在途请求；记录操作按 `RecordKey` 稳定路由，操作按 `operation_id`（交易使用对应交易 ID）稳定路由。同一个键会固定在同一池内的一条连接上，不同键才会形成并行度。连接池拆分可以隔离慢写造成的队头阻塞，但不替代 revision/CAS、业务锁或权威读取契约。
+`connect_split(read_size, write_size)` 将客户端物理连接分为独立的 read pool 和 write pool。每条连接可有多个在途请求（2026-09-19起，同一记录/操作/交易仍按发送顺序执行）；记录操作按 `RecordKey` 稳定路由，操作按 `operation_id`（交易使用对应交易 ID）稳定路由。同一个键会固定在同一池内的一条连接上，不同键才会形成并行度。连接池拆分可以隔离慢写造成的队头阻塞，但不替代 revision/CAS、业务锁或权威读取契约。
 
 当前故障演练使用的 **24 读 + 8 写** 只是测试基线，不是已经证明的生产最优比例。该比例的合理性必须用相同总连接数、相同负载和重复测量来判断；仅凭玩家数、CPU 核数或 PostgreSQL `max_connections` 推导比例不够。
 

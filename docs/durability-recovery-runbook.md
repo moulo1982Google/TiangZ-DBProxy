@@ -7,7 +7,7 @@
 | API/worker | 成功代表什么 |
 | --- | --- |
 | `SaveSnapshot` / `ApplyTransaction` / `ApplyMultiTransaction` / `ApplyTradeTransaction` | PostgreSQL 权威事务已经提交；Redis 缓存可以稍后由持久修复队列补齐 |
-| `EnqueueSnapshot` / `EnqueueMultiSnapshot` | Redis 已执行入队脚本，并通过 `WAITAOF 1 0 2000` 确认本机 AOF；尚不代表 PostgreSQL 已提交 |
+| `EnqueueSnapshot` / `EnqueueMultiSnapshot` | Redis 已执行入队脚本，并通过 `WAITAOF 1 0 2000` 确认本机 AOF；尚不代表 PostgreSQL 已提交。部署配置 `backlog.enqueueAck: "memory"` 时不等待 `WAITAOF`，只代表已写入 Redis 内存，Redis 崩溃可能丢失约1秒已确认入队。落库带入队时的防护序号，迟到的旧值不会覆盖已落库的新值 |
 | Outbox worker 的 PostgreSQL ACK | 事件已写入 Redis Stream，且本机 Redis AOF 已确认；仍可能至少一次重复投递 |
 
 如果 Redis 未启用 AOF，`WAITAOF` 会返回 Redis 错误；如果已启用但 2 秒内没有本机确认，则返回 `RedisAofNotDurable`。两种情况都拒绝可靠 ACK，不会把易失内存写入伪装成持久成功。连接管理器的响应窗口是 3 秒，刻意比 2 秒 AOF 判定多留 1 秒网络与调度余量。笔记本轻量模式默认关闭 AOF，因此测试这两个路径时必须使用 `-Aof`。

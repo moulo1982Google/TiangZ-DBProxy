@@ -65,6 +65,7 @@ async fn default_reads_over_tcp_never_serve_stale_or_negative_cache() {
                         },
                         ..Default::default()
                     },
+                    enqueue: Default::default(),
                 },
             )
             .await

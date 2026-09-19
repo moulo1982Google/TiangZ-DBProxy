@@ -94,7 +94,21 @@ Redis 锁不可用或等待超时时，系统仍可回源 PostgreSQL；协调层
 
 ## Redis AOF 普通快照 backlog
 
-`RedisSnapshotBacklog` 的 Lua 脚本原子写 entry 和 pending 索引，随后执行 `WAITAOF 1 0 2000`。AOF 没有确认就不返回可靠 ACK。worker 领取时把记录移到 processing 并设置 lease：
+`RedisSnapshotBacklog` 的 Lua 脚本原子写 entry 和 pending 索引，随后执行 `WAITAOF 1 0 2000`。AOF 没有确认就不返回可靠 ACK。
+
+入队采用组提交（2026-09-19）：每个节点由一个后台任务独占入队连接，写入与等待落盘期间到达的请求自然积累，下一轮用一次脚本写入整批（最多512条）、只等一次 `WAITAOF`，再逐个回复。`WAITAOF` 覆盖该连接此前的全部写入，所以"确认即已进入本地AOF"的保证不变；`appendfsync everysec`下吞吐不再受"每条等一次落盘"限制。此前单连接持锁、逐条等待落盘，满载时约1次/秒/节点，可靠Redis短暂故障后即可因超时重试进入无法自愈的过载。
+
+同时加入过载保护，`EnqueueBatchConfig`默认值：排队上限4096次入队调用，满则立即返回可重试错误；从接收到开始写入超过2秒的请求不再写入并返回可重试错误；调用方已放弃的请求直接跳过。排队期限加`WAITAOF`超时低于常见5秒客户端超时，调用方收到明确结果而不是超时。整批写入或确认失败时，批内请求共享同一个结果未知错误，按原请求号重试。被拒绝的请求一定没有写入Redis。
+
+确认档位是部署配置 `backlog.enqueueAck`（2026-09-19），整个DBProxy进程统一生效，协议和业务代码不变：`aof`（默认）如上等 `WAITAOF`；`memory` 脚本写入Redis内存即确认，不再等待落盘。`memory` 下，Redis正常重启不丢数据，但Redis进程或机器崩溃可能丢失约1秒（`appendfsync everysec`）已确认的入队；已进入PostgreSQL的部分不受影响。只把允许丢几秒的数据配置到这种部署；充值、抽卡、建筑升级等必须直接写PostgreSQL。
+
+落库防护序号（2026-09-20）：租约只能减少并发落库，保证不了"旧写入不会晚到"——任务领取后卡顿、两台DBProxy时钟偏差、Redis崩溃回滚领取状态，都可能让租约已失效的任务把旧值写进PostgreSQL，而排队写是无条件覆盖。现在正确性不再依赖租约：
+
+- 入队脚本给每条写入分配严格递增的防护序号 `max(Redis时钟微秒, 上一序号+1)`，写进积压条目（格式 `\0Q1:<序号>:<快照>`）。混入Redis时钟，Redis崩溃回滚计数后新序号仍大于已落库的；只依赖Redis一台机器的时钟。升级前入队的旧格式条目照常解析，序号按0处理。
+- `dbproxy_snapshots.queued_sequence`（迁移12，可为空）保存已落库的序号。落库是条件UPSERT：只有序号更大才覆盖；否则不写，返回 `Duplicate` 和当前版本，任务照常确认，缓存按PG当前值同步。普通写入和事务不写这一列，也不受它约束；前提仍是一条记录只用一种写法。
+- 加固（不再承担正确性）：领取和续租的租约时间改用Redis `TIME`，不受DBProxy节点时钟偏差影响；落库事务设 `statement_timeout` 10秒，由PostgreSQL取消而不是在租约过期后才提交；领取时跳过仍有有效租约的记录。
+
+worker 领取时把记录移到 processing 并设置 lease：
 
 ```text
 enqueue -> WAITAOF -> pending

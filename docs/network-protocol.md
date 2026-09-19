@@ -51,7 +51,7 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 
 ### Enqueue ACK
 
-`Enqueue*` 在 Lua 入队后执行 `WAITAOF 1 0 2000`。AOF 未启用、超时或 Redis 不可用会返回 `STORAGE_UNAVAILABLE`。成功仍只代表 Redis 本地 AOF 接收；货币、背包、奖励、交易禁止走该路径。
+`Enqueue*` 在 Lua 入队后执行 `WAITAOF 1 0 2000`（部署配置 `backlog.enqueueAck: "memory"` 时跳过，写入 Redis 内存即成功，协议不变）。AOF 未启用、超时或 Redis 不可用会返回 `STORAGE_UNAVAILABLE`。成功仍只代表 Redis 本地 AOF 接收；货币、背包、奖励、交易禁止走该路径。
 
 ### 多记录与交易
 
@@ -79,7 +79,9 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 
 `server.maxConnections` 默认 256，必须为正数；每个实例独立限制 TCP 连接总数，包含尚未认证的握手。accept 后先尝试取得名额，满额直接关闭连接，不读取帧、不创建连接任务，也不发送握手成功。正常断开、握手失败/超时、任务 panic 或取消均释放名额。`dbproxy_connections_rejected_total` 记录容量拒绝，`dbproxy_connections_limit` 给出上限；认证失败仍使用握手拒绝指标。根据客户端池总连接数及 `maxFrameBytes` 的内存预算设置上限，不能把玩家数直接当作连接数。观测 HTTP 端口不占业务连接名额。
 
-一个 `DbProxyClient` 连接内只有一个在途请求。请求写出后超时会废弃连接，防止后续 RPC 读取旧响应。`DbProxyClientPool::connect` 按 RecordKey 在一组共享读写连接中稳定路由，保持原有连接数和顺序语义；`connect_split(read_size, write_size)` 使用两组物理连接，读查询进入 read pool，写入、事务和 enqueue 进入 write pool，避免慢写造成跨用途队头阻塞。它不替代业务锁或 revision/CAS。服务端再按记录或 operation ID 路由到独立存储 shard。
+一条连接可同时有多个在途请求（2026-09-19）。服务端 `server.maxInFlightPerConnection`（默认64，1..=4096）限制每条连接同时处理的请求数，满额时暂停读取该连接；客户端 `ClientConfig::max_in_flight`（默认64）限制发出未回的请求数，超出在客户端排队。响应按完成顺序返回、以 `rpc_id` 对应，协议格式不变。**顺序保证只针对同一连接上共享键的请求**：涉及同一 RecordKey、operation ID 或 trade ID 的请求按到达顺序执行，前一个执行完后一个才开始；不相关的请求并发执行。连接池把同一记录稳定路由到同一连接，所以业务按调用顺序发出的同一记录写入仍按序落库。不同连接之间没有顺序保证，与此前相同。
+
+单个请求超时不再废弃整条连接：发出后该连接若收到过任何其他响应，只算这个请求慢，迟到的响应被丢弃；发出后整条连接一帧未收到才判定失效并换连接，旧连接上已发出的请求仍可收到结果。写入中途失败或被取消会关闭写端，服务端据此结束连接。服务端某个请求 panic 只让该请求收到 `INTERNAL`（结果未知，按原幂等 ID 重试），同连接其他请求不受影响。连接关闭或停机时，服务端先执行完已接收的请求并尽量写回响应。旧客户端（一次一个请求）与新服务端、新客户端与旧服务端（逐个处理）都兼容。`DbProxyClientPool::connect` 按 RecordKey 在一组共享读写连接中稳定路由，保持原有连接数和顺序语义；`connect_split(read_size, write_size)` 使用两组物理连接，读查询进入 read pool，写入、事务和 enqueue 进入 write pool，避免慢写造成跨用途队头阻塞。它不替代业务锁或 revision/CAS。服务端再按记录或 operation ID 路由到独立存储 shard。
 
 Rust 客户端接收有序 Endpoint 列表。初次连接和故障重连都跳过不可达候选，以及握手阶段的认证拒绝、协议拒绝、指纹或 Relay 能力不匹配；仍严格验证每个候选，不降低协议或认证要求。候选握手拒绝继续记录为 `Rejected`，不会改记为 `Unavailable`；全部候选失败时优先返回拒绝原因，避免被后续网络错误覆盖。端点无关的本地配置错误立即失败。业务 RPC 阶段的 Remote 错误（包括 Unauthorized、Revision/Operation/Trade 冲突）不触发切换。所有候选都必须共享同一 PostgreSQL/Redis，否则幂等和 Revision 契约不成立。
 

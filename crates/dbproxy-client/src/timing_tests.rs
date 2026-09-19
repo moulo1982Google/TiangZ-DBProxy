@@ -107,7 +107,8 @@ fn request() -> wire::request_envelope::Body {
 async fn queue_and_server_wait_are_attributed_to_separate_stages() {
     timeout(Duration::from_secs(5), async {
         let (client, observer, arrival, release, server) = fixture(Duration::from_secs(2)).await;
-        let lock = client.connection.lock().await;
+        let connection = client.current();
+        let lock = connection.writer.lock().await;
         let mut call = Box::pin(client.call_once(request()));
         let before_attempt = Instant::now();
         // Poll while owning the lock: the attempt is provably queued before starting the interval.
