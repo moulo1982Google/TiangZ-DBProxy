@@ -757,6 +757,69 @@ async fn batch_save_preserves_partial_results_and_batches_cache_updates() {
     );
 }
 
+// 本组Redis积压用例会领取并释放库中全部待处理条目，请用 --test-threads=1 串行运行。
+// These Redis backlog tests claim and release every pending entry; run them with --test-threads=1.
+/// 正在落库的记录又被入队时，其他worker不得并发领取；否则旧值可能后到PG覆盖新值。
+/// A record re-enqueued while being flushed must not be claimed by another worker, or an older value could land last.
+#[tokio::test]
+#[ignore = "需要本机 Redis；使用 --ignored 显式运行"]
+async fn redis_backlog_never_claims_a_record_under_a_live_lease() {
+    let redis_url = std::env::var("DBPROXY_REDIS_URL")
+        .expect("DBPROXY_REDIS_URL must be set for the integration test");
+    let first_worker = RedisSnapshotBacklog::connect(&redis_url).await.unwrap();
+    let second_worker = RedisSnapshotBacklog::connect(&redis_url).await.unwrap();
+    let suffix = test_suffix();
+    let record = RecordKey::new(format!("backlog-lease-{suffix}"), "1").unwrap();
+    let write = |payload: u8| SnapshotWrite {
+        request_id: format!("backlog-lease-{suffix}-{payload}"),
+        record: record.clone(),
+        schema: "backlog.lease".to_string(),
+        schema_version: 1,
+        payload: vec![payload],
+        expected_revision: None,
+        updated_at_unix_ms: u64::from(payload),
+    };
+    async fn claim_own(
+        backlog: &RedisSnapshotBacklog,
+        record: &RecordKey,
+    ) -> Option<tiangz_dbproxy_storage::SnapshotBacklogLease> {
+        let mut own = None;
+        for lease in backlog.claim_multi(30_000, 1_024).await.unwrap() {
+            if &lease.request.record == record {
+                own = Some(lease);
+            } else {
+                backlog
+                    .release_multi(std::slice::from_ref(&lease))
+                    .await
+                    .unwrap();
+            }
+        }
+        own
+    }
+    first_worker.enqueue(write(1)).await.unwrap();
+    let stale = claim_own(&first_worker, &record)
+        .await
+        .expect("first claim");
+    assert_eq!(stale.request.payload, [1]);
+    first_worker.enqueue(write(2)).await.unwrap();
+    assert!(
+        claim_own(&second_worker, &record).await.is_none(),
+        "a record under a live lease must not be claimed twice"
+    );
+    assert_eq!(
+        first_worker.ack(&stale).await.unwrap(),
+        SnapshotBacklogAck::Superseded
+    );
+    let newer = claim_own(&second_worker, &record)
+        .await
+        .expect("newer payload re-queued");
+    assert_eq!(newer.request.payload, [2]);
+    assert_eq!(
+        second_worker.ack(&newer).await.unwrap(),
+        SnapshotBacklogAck::Removed
+    );
+}
+
 /// 内存确认档位只少等AOF落盘，入队内容与领取语义不变。
 /// The memory acknowledgement level only skips the AOF wait; queued content and claim semantics are unchanged.
 #[tokio::test]

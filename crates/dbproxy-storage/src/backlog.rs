@@ -54,7 +54,10 @@ for _ = 1, ARGV[4] do
     end
     local member = item[1]
     local payload = redis.call('GET', ARGV[3] .. member)
-    if payload then
+    -- 仍有有效租约的记录不重复领取：其ACK会把更新的载荷重新排队，避免两个worker并发落库、旧值后到覆盖新值。
+    -- Skip records still under a live lease: its ACK re-queues the newer payload, so two workers never flush
+    -- one record concurrently and let an older value land last.
+    if payload and not redis.call('ZSCORE', KEYS[2], member) then
         local lease = tostring(redis.call('INCR', KEYS[4]))
         redis.call('ZADD', KEYS[2], ARGV[2], member)
         redis.call('HSET', KEYS[3], member, lease)
@@ -87,7 +90,10 @@ for _ = 1, scan_limit do
     end
     local member = item[1]
     local payload = redis.call('GET', ARGV[3] .. member)
-    if payload then
+    -- 仍有有效租约的记录不重复领取：其ACK会把更新的载荷重新排队，避免两个worker并发落库、旧值后到覆盖新值。
+    -- Skip records still under a live lease: its ACK re-queues the newer payload, so two workers never flush
+    -- one record concurrently and let an older value land last.
+    if payload and not redis.call('ZSCORE', KEYS[2], member) then
         local lease = tostring(redis.call('INCR', KEYS[4]))
         redis.call('ZADD', KEYS[2], ARGV[2], member)
         redis.call('HSET', KEYS[3], member, lease)
