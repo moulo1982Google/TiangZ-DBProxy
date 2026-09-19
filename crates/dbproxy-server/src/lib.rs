@@ -395,6 +395,49 @@ impl StorageBackend {
         self.shards[self.shard_index(record)].clone()
     }
 
+    /// 积压落库：带防护序号保存，迟到的旧值不会覆盖已落库的新值。升级前入队的旧条目没有序号，按0处理。
+    /// Backlog flush: fenced saves so a late older value never overwrites a newer one. Legacy entries enqueued before
+    /// the upgrade have no sequence and flush as 0.
+    async fn save_backlog_leases(
+        &self,
+        leases: &[tiangz_dbproxy_storage::SnapshotBacklogLease],
+    ) -> Result<Vec<Result<SnapshotWriteOutcome, BackendError>>, BackendError> {
+        let Some(first) = leases.first() else {
+            return Ok(Vec::new());
+        };
+        let mut shard = self.shard(&first.request.record);
+        let mut indexed: Vec<_> = leases.iter().enumerate().collect();
+        // 与 save_multi 相同：按记录排序取锁，响应恢复调用者顺序。 / As save_multi: lock in record order, restore order below.
+        indexed.sort_by(|(_, a), (_, b)| {
+            a.request
+                .record
+                .namespace
+                .cmp(&b.request.record.namespace)
+                .then_with(|| a.request.record.key.cmp(&b.request.record.key))
+        });
+        let indexes = indexed.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        let requests = indexed
+            .iter()
+            .map(|(_, lease)| lease.request.clone())
+            .collect::<Vec<_>>();
+        let sequences = indexed
+            .iter()
+            .map(|(_, lease)| lease.fence_sequence.unwrap_or(0))
+            .collect::<Vec<_>>();
+        let outcomes = shard.save_queued_batch(requests, sequences).await?;
+        if outcomes.len() != indexes.len() {
+            return Err(BackendError::Worker(
+                "queued batch save result count mismatch".to_string(),
+            ));
+        }
+        let mut indexed: Vec<_> = indexes.into_iter().zip(outcomes).collect();
+        indexed.sort_by_key(|(index, _)| *index);
+        Ok(indexed
+            .into_iter()
+            .map(|(_, outcome)| outcome.map_err(BackendError::from))
+            .collect())
+    }
+
     fn shard_for_operation(&self, operation_id: &str) -> TieredSnapshotStore {
         let mut hasher = StableHasher::default();
         operation_id.hash(&mut hasher);
@@ -437,11 +480,7 @@ impl StorageBackend {
         if leases.is_empty() {
             return Ok(Vec::new());
         }
-        let requests = leases
-            .iter()
-            .map(|lease| lease.request.clone())
-            .collect::<Vec<_>>();
-        let outcomes = match self.save_multi(requests).await {
+        let outcomes = match self.save_backlog_leases(&leases).await {
             Ok(outcomes) => outcomes,
             Err(error) => {
                 if let Err(release_error) = self.backlog.release_multi(&leases).await {

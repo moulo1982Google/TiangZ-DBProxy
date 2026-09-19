@@ -1330,6 +1330,13 @@ impl PostgresSnapshotStore {
             include_str!("../migrations/011_outbox_index_cleanup.sql"),
         )
         .await?;
+        apply_schema_migration(
+            &transaction,
+            12,
+            "queued-fence",
+            include_str!("../migrations/012_queued_fence.sql"),
+        )
+        .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -1387,6 +1394,34 @@ impl PostgresSnapshotStore {
         &mut self,
         requests: &[SnapshotWrite],
     ) -> Result<Vec<Result<SnapshotWriteOutcome, StorageError>>, StorageError> {
+        self.save_batch_fenced(requests, None).await
+    }
+
+    /// 排队写落库：每条带入队时的防护序号，只有序号大于已存序号才覆盖。序号不更新的迟到旧值不写入，
+    /// 返回 Duplicate 与当前版本，调用方照常确认。事务设语句超时，由PG端取消而不是在租约过期后才提交。
+    /// Flush queued writes: each carries its enqueue fence sequence and only overwrites a smaller stored one. A late
+    /// older value is not written and returns Duplicate with the current revision, so the caller acknowledges it as
+    /// usual. The transaction carries a statement timeout so PostgreSQL cancels it instead of committing after the
+    /// lease has expired.
+    pub async fn save_queued_batch(
+        &mut self,
+        requests: &[SnapshotWrite],
+        fence_sequences: &[u64],
+    ) -> Result<Vec<Result<SnapshotWriteOutcome, StorageError>>, StorageError> {
+        if fence_sequences.len() != requests.len() {
+            return Err(StorageError::PersistenceProtocol(
+                "queued batch fence sequences do not match its writes".to_string(),
+            ));
+        }
+        self.save_batch_fenced(requests, Some(fence_sequences))
+            .await
+    }
+
+    async fn save_batch_fenced(
+        &mut self,
+        requests: &[SnapshotWrite],
+        fence_sequences: Option<&[u64]>,
+    ) -> Result<Vec<Result<SnapshotWriteOutcome, StorageError>>, StorageError> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -1397,10 +1432,27 @@ impl PostgresSnapshotStore {
         for (index, request) in requests.iter().enumerate() {
             let values = (|| -> Result<_, StorageError> {
                 validate_request(request)?;
+                let fence = fence_sequences
+                    .map(|sequences| {
+                        if request.expected_revision.is_some() {
+                            return Err(StorageError::from(
+                                StoreError::QueuedSnapshotRequiresUnconditionalWrite {
+                                    record: request.record.clone(),
+                                },
+                            ));
+                        }
+                        i64::try_from(sequences[index]).map_err(|_| {
+                            StorageError::PersistenceProtocol(
+                                "queued fence sequence is too large".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?;
                 Ok((
                     schema_version_to_i64(request.schema_version),
                     revision_to_i64(&request.record, request.expected_revision)?,
                     timestamp_to_i64(&request.record, request.updated_at_unix_ms)?,
+                    fence,
                 ))
             })();
             match values {
@@ -1422,8 +1474,15 @@ impl PostgresSnapshotStore {
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
+        if fence_sequences.is_some() {
+            transaction
+                .batch_execute(&format!(
+                    "SET LOCAL statement_timeout = {QUEUED_FLUSH_STATEMENT_TIMEOUT_MS}"
+                ))
+                .await?;
+        }
         for (index, values) in prepared.into_iter().enumerate() {
-            let Some((schema_version, expected, updated_at)) = values else {
+            let Some((schema_version, expected, updated_at, fence)) = values else {
                 continue;
             };
             match save_snapshot_in_transaction(
@@ -1432,6 +1491,7 @@ impl PostgresSnapshotStore {
                 schema_version,
                 expected,
                 updated_at,
+                fence,
             )
             .await
             {
@@ -1454,12 +1514,16 @@ impl PostgresSnapshotStore {
     }
 }
 
+/// 排队写落库语句的超时，远小于默认30秒积压租约。 / Statement timeout for queued flushes, well under the default 30 s lease.
+pub const QUEUED_FLUSH_STATEMENT_TIMEOUT_MS: u64 = 10_000;
+
 async fn save_snapshot_in_transaction(
     transaction: &Transaction<'_>,
     request: &SnapshotWrite,
     schema_version: i64,
     expected: Option<i64>,
     updated_at: i64,
+    fence: Option<i64>,
 ) -> Result<SnapshotWriteOutcome, StorageError> {
     // Claim first so concurrent retries wait on the unique key and observe the first result.
     let claimed = transaction
@@ -1494,6 +1558,10 @@ async fn save_snapshot_in_transaction(
         let revision = revision_from_i64(&request.record, receipt.get(6))?;
         cache_repair::enqueue_in_transaction(transaction, &request.record, revision).await?;
         return Ok(SnapshotWriteOutcome::Duplicate { revision });
+    }
+
+    if let Some(fence) = fence {
+        return save_fenced_snapshot(transaction, request, schema_version, updated_at, fence).await;
     }
 
     // Update first so a non-zero expected revision can reach an existing row without also
@@ -1599,6 +1667,82 @@ SELECT revision FROM inserted
         .await?;
     cache_repair::enqueue_in_transaction(transaction, &request.record, revision).await?;
     Ok(SnapshotWriteOutcome::Applied { revision })
+}
+
+/// 防护写入：序号更大才覆盖（旧行或非排队行序号为空时照常写入）；否则不写，返回当前版本。
+/// Fenced write: overwrite only with a larger sequence (rows without one accept it); otherwise leave the row and
+/// return its current revision.
+async fn save_fenced_snapshot(
+    transaction: &Transaction<'_>,
+    request: &SnapshotWrite,
+    schema_version: i64,
+    updated_at: i64,
+    fence: i64,
+) -> Result<SnapshotWriteOutcome, StorageError> {
+    let written = transaction
+        .query_opt(
+            r#"
+INSERT INTO dbproxy_snapshots (
+    namespace, record_key, schema_name, schema_version,
+    revision, payload, updated_at_unix_ms, queued_sequence
+)
+VALUES ($1, $2, $3, $4, 1, $5, $6, $7)
+ON CONFLICT (namespace, record_key) DO UPDATE
+SET schema_name = EXCLUDED.schema_name,
+    schema_version = EXCLUDED.schema_version,
+    revision = dbproxy_snapshots.revision + 1,
+    payload = EXCLUDED.payload,
+    updated_at_unix_ms = EXCLUDED.updated_at_unix_ms,
+    queued_sequence = EXCLUDED.queued_sequence
+WHERE dbproxy_snapshots.queued_sequence IS NULL
+   OR dbproxy_snapshots.queued_sequence < EXCLUDED.queued_sequence
+RETURNING revision
+"#,
+            &[
+                &request.record.namespace,
+                &request.record.key,
+                &request.schema,
+                &schema_version,
+                &request.payload,
+                &updated_at,
+                &fence,
+            ],
+        )
+        .await?;
+    let (revision, outcome) = match written {
+        Some(row) => {
+            let revision = revision_from_i64(&request.record, row.get(0))?;
+            (revision, SnapshotWriteOutcome::Applied { revision })
+        }
+        None => {
+            // 已有更新的排队写落库：本条是迟到的旧值。 / A newer queued write already landed: this one is late.
+            let row = transaction
+                .query_one(
+                    "SELECT revision FROM dbproxy_snapshots WHERE namespace = $1 AND record_key = $2",
+                    &[&request.record.namespace, &request.record.key],
+                )
+                .await?;
+            let revision = revision_from_i64(&request.record, row.get(0))?;
+            tracing::debug!(
+                namespace = %request.record.namespace,
+                "stale queued snapshot fenced out by a newer sequence"
+            );
+            (revision, SnapshotWriteOutcome::Duplicate { revision })
+        }
+    };
+    transaction
+        .execute(
+            "UPDATE dbproxy_idempotency SET revision = $2 WHERE request_id = $1",
+            &[
+                &request.request_id,
+                &i64::try_from(revision.0).map_err(|_| StorageError::RevisionTooLarge {
+                    record: request.record.clone(),
+                })?,
+            ],
+        )
+        .await?;
+    cache_repair::enqueue_in_transaction(transaction, &request.record, revision).await?;
+    Ok(outcome)
 }
 
 #[async_trait]
@@ -2878,10 +3022,36 @@ impl TieredSnapshotStore {
         &mut self,
         requests: Vec<SnapshotWrite>,
     ) -> Result<Vec<Result<SnapshotWriteOutcome, StorageError>>, StorageError> {
+        self.save_batch_with_fences(requests, None).await
+    }
+
+    /// 排队写落库批次，缓存同步与普通批次相同；被防护拒绝的旧值按 Duplicate 从PG重读后再写缓存。
+    /// Queued flush batch with the same cache synchronisation; fenced-out values reload from PostgreSQL as Duplicate.
+    pub async fn save_queued_batch(
+        &mut self,
+        requests: Vec<SnapshotWrite>,
+        fence_sequences: Vec<u64>,
+    ) -> Result<Vec<Result<SnapshotWriteOutcome, StorageError>>, StorageError> {
+        self.save_batch_with_fences(requests, Some(fence_sequences))
+            .await
+    }
+
+    async fn save_batch_with_fences(
+        &mut self,
+        requests: Vec<SnapshotWrite>,
+        fence_sequences: Option<Vec<u64>>,
+    ) -> Result<Vec<Result<SnapshotWriteOutcome, StorageError>>, StorageError> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let mut outcomes = self.postgres.save_batch(&requests).await?;
+        let mut outcomes = match &fence_sequences {
+            Some(sequences) => {
+                self.postgres
+                    .save_queued_batch(&requests, sequences)
+                    .await?
+            }
+            None => self.postgres.save_batch(&requests).await?,
+        };
         let mut snapshots = Vec::with_capacity(requests.len());
         let mut duplicate_indexes = Vec::new();
         for (index, (request, outcome)) in requests.iter().zip(outcomes.iter()).enumerate() {

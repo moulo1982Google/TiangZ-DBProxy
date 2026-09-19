@@ -102,6 +102,12 @@ Redis 锁不可用或等待超时时，系统仍可回源 PostgreSQL；协调层
 
 确认档位是部署配置 `backlog.enqueueAck`（2026-09-19），整个DBProxy进程统一生效，协议和业务代码不变：`aof`（默认）如上等 `WAITAOF`；`memory` 脚本写入Redis内存即确认，不再等待落盘。`memory` 下，Redis正常重启不丢数据，但Redis进程或机器崩溃可能丢失约1秒（`appendfsync everysec`）已确认的入队；已进入PostgreSQL的部分不受影响。只把允许丢几秒的数据配置到这种部署；充值、抽卡、建筑升级等必须直接写PostgreSQL。
 
+落库防护序号（2026-09-20）：租约只能减少并发落库，保证不了"旧写入不会晚到"——任务领取后卡顿、两台DBProxy时钟偏差、Redis崩溃回滚领取状态，都可能让租约已失效的任务把旧值写进PostgreSQL，而排队写是无条件覆盖。现在正确性不再依赖租约：
+
+- 入队脚本给每条写入分配严格递增的防护序号 `max(Redis时钟微秒, 上一序号+1)`，写进积压条目（格式 `\0Q1:<序号>:<快照>`）。混入Redis时钟，Redis崩溃回滚计数后新序号仍大于已落库的；只依赖Redis一台机器的时钟。升级前入队的旧格式条目照常解析，序号按0处理。
+- `dbproxy_snapshots.queued_sequence`（迁移12，可为空）保存已落库的序号。落库是条件UPSERT：只有序号更大才覆盖；否则不写，返回 `Duplicate` 和当前版本，任务照常确认，缓存按PG当前值同步。普通写入和事务不写这一列，也不受它约束；前提仍是一条记录只用一种写法。
+- 加固（不再承担正确性）：领取和续租的租约时间改用Redis `TIME`，不受DBProxy节点时钟偏差影响；落库事务设 `statement_timeout` 10秒，由PostgreSQL取消而不是在租约过期后才提交；领取时跳过仍有有效租约的记录。
+
 worker 领取时把记录移到 processing 并设置 lease：
 
 ```text

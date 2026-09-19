@@ -24,42 +24,61 @@ const PROCESSING_KEY: &str = "dbproxy:snapshot-backlog:processing";
 const LEASES_KEY: &str = "dbproxy:snapshot-backlog:leases";
 const LEASE_SEQUENCE_KEY: &str = "dbproxy:snapshot-backlog:lease-sequence";
 const ENTRY_PREFIX: &str = "dbproxy:snapshot-backlog:entry:";
+const FENCE_SEQUENCE_KEY: &str = "dbproxy:snapshot-backlog:fence-sequence";
+/// 带防护序号的条目格式："\0Q1:<序号>:<bincode快照>"。旧格式直接是bincode，首字节是非空request_id的长度，不会是0。
+/// Sequenced entry format "\0Q1:<sequence>:<bincode snapshot>". Legacy entries are plain bincode whose first byte is
+/// the length of a non-empty request_id, so it is never 0.
+const SEQUENCED_ENTRY_TAG: &[u8] = b"\0Q1:";
 const RECLAIM_LIMIT: i64 = 128;
 
 // 批内顺序写入，同一记录后写覆盖先写，与逐条入队的合并语义一致。
+// 每条写入取一个严格递增的防护序号：max(Redis时钟微秒, 上一序号+1)。混入Redis时钟后，
+// 即使Redis崩溃把计数回滚，新序号仍大于已落库的序号；只依赖Redis一台机器的时钟。
 // Writes in batch order; a later write to the same record replaces the earlier one, matching per-call coalescing.
+// Every write takes a strictly increasing fence sequence max(Redis clock in microseconds, previous + 1). Mixing in
+// the Redis clock keeps new sequences above ones already written to PostgreSQL even if a Redis crash rolls the
+// counter back; only the single Redis clock is involved.
 const ENQUEUE_BATCH_SCRIPT: &str = r#"
 local score = ARGV[1]
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
+local sequence = tonumber(redis.call('GET', KEYS[2]) or '0')
 for index = 2, #ARGV, 3 do
-    redis.call('SET', ARGV[index], ARGV[index + 1])
+    if now > sequence then sequence = now else sequence = sequence + 1 end
+    redis.call('SET', ARGV[index], '\0Q1:' .. string.format('%.0f', sequence) .. ':' .. ARGV[index + 1])
     redis.call('ZADD', KEYS[1], score, ARGV[index + 2])
 end
+redis.call('SET', KEYS[2], string.format('%.0f', sequence))
 return (#ARGV - 1) / 3
 "#;
 
 const CLAIM_SCRIPT: &str = r#"
-local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[4])
+-- 租约时间统一用Redis时钟，不受各DBProxy节点时钟偏差影响。 / Leases use the Redis clock, immune to DBProxy clock skew.
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local deadline = now + tonumber(ARGV[1])
+local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', now, 'LIMIT', 0, ARGV[3])
 for _, member in ipairs(expired) do
     redis.call('ZREM', KEYS[2], member)
     redis.call('HDEL', KEYS[3], member)
-    if redis.call('EXISTS', ARGV[3] .. member) == 1 then
-        redis.call('ZADD', KEYS[1], ARGV[1], member)
+    if redis.call('EXISTS', ARGV[2] .. member) == 1 then
+        redis.call('ZADD', KEYS[1], now, member)
     end
 end
 
-for _ = 1, ARGV[4] do
+for _ = 1, ARGV[3] do
     local item = redis.call('ZPOPMIN', KEYS[1], 1)
     if #item == 0 then
         return {}
     end
     local member = item[1]
-    local payload = redis.call('GET', ARGV[3] .. member)
+    local payload = redis.call('GET', ARGV[2] .. member)
     -- 仍有有效租约的记录不重复领取：其ACK会把更新的载荷重新排队，避免两个worker并发落库、旧值后到覆盖新值。
     -- Skip records still under a live lease: its ACK re-queues the newer payload, so two workers never flush
     -- one record concurrently and let an older value land last.
     if payload and not redis.call('ZSCORE', KEYS[2], member) then
         local lease = tostring(redis.call('INCR', KEYS[4]))
-        redis.call('ZADD', KEYS[2], ARGV[2], member)
+        redis.call('ZADD', KEYS[2], deadline, member)
         redis.call('HSET', KEYS[3], member, lease)
         return { member, lease, payload }
     end
@@ -68,18 +87,22 @@ return {}
 "#;
 
 const CLAIM_MULTI_SCRIPT: &str = r#"
-local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[4])
+-- 租约时间统一用Redis时钟，不受各DBProxy节点时钟偏差影响。 / Leases use the Redis clock, immune to DBProxy clock skew.
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local deadline = now + tonumber(ARGV[1])
+local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', now, 'LIMIT', 0, ARGV[3])
 for _, member in ipairs(expired) do
     redis.call('ZREM', KEYS[2], member)
     redis.call('HDEL', KEYS[3], member)
-    if redis.call('EXISTS', ARGV[3] .. member) == 1 then
-        redis.call('ZADD', KEYS[1], ARGV[1], member)
+    if redis.call('EXISTS', ARGV[2] .. member) == 1 then
+        redis.call('ZADD', KEYS[1], now, member)
     end
 end
 
 local claimed = {}
-local claim_limit = tonumber(ARGV[5])
-local scan_limit = tonumber(ARGV[4]) + claim_limit
+local claim_limit = tonumber(ARGV[4])
+local scan_limit = tonumber(ARGV[3]) + claim_limit
 for _ = 1, scan_limit do
     if (#claimed / 3) >= claim_limit then
         break
@@ -89,13 +112,13 @@ for _ = 1, scan_limit do
         break
     end
     local member = item[1]
-    local payload = redis.call('GET', ARGV[3] .. member)
+    local payload = redis.call('GET', ARGV[2] .. member)
     -- 仍有有效租约的记录不重复领取：其ACK会把更新的载荷重新排队，避免两个worker并发落库、旧值后到覆盖新值。
     -- Skip records still under a live lease: its ACK re-queues the newer payload, so two workers never flush
     -- one record concurrently and let an older value land last.
     if payload and not redis.call('ZSCORE', KEYS[2], member) then
         local lease = tostring(redis.call('INCR', KEYS[4]))
-        redis.call('ZADD', KEYS[2], ARGV[2], member)
+        redis.call('ZADD', KEYS[2], deadline, member)
         redis.call('HSET', KEYS[3], member, lease)
         table.insert(claimed, member)
         table.insert(claimed, lease)
@@ -191,13 +214,15 @@ return results
 "#;
 
 const RENEW_SCRIPT: &str = r#"
+local clock = redis.call('TIME')
+local deadline = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000) + tonumber(ARGV[3])
 if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then
     return 0
 end
 if redis.call('EXISTS', ARGV[4] .. ARGV[1]) == 0 then
     return 0
 end
-redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
+redis.call('ZADD', KEYS[1], deadline, ARGV[1])
 return 1
 "#;
 
@@ -206,6 +231,9 @@ return 1
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotBacklogLease {
     pub request: SnapshotWrite,
+    /// 入队时分配的防护序号；升级前入队的旧条目为 None，落库时按 0 处理。
+    /// Fence sequence assigned at enqueue; legacy entries enqueued before the upgrade have None and flush as 0.
+    pub fence_sequence: Option<u64>,
     member: String,
     lease_id: String,
     encoded: Vec<u8>,
@@ -308,7 +336,10 @@ impl EnqueueSink for RedisEnqueueSink {
     async fn write(&mut self, entries: &[&EnqueueEntry]) -> Result<(), StorageError> {
         let score = RedisSnapshotBacklog::now_unix_ms()?;
         let mut invocation = self.script.prepare_invoke();
-        invocation.key(PENDING_KEY).arg(score);
+        invocation
+            .key(PENDING_KEY)
+            .key(FENCE_SEQUENCE_KEY)
+            .arg(score);
         for entry in entries {
             invocation
                 .arg(&entry.entry_key)
@@ -483,11 +514,28 @@ impl RedisSnapshotBacklog {
         i64::try_from(millis).map_err(|_| StorageError::BacklogTimestampTooLarge)
     }
 
-    fn lease_deadline(now: i64, lease_ms: u64) -> Result<i64, StorageError> {
-        let lease =
-            i64::try_from(lease_ms).map_err(|_| StorageError::BacklogLeaseTooLarge { lease_ms })?;
-        now.checked_add(lease)
-            .ok_or(StorageError::BacklogTimestampTooLarge)
+    /// 租约长度交给Redis脚本按Redis时钟计算到期时间。 / The Redis script computes the deadline on the Redis clock.
+    fn lease_length(lease_ms: u64) -> Result<i64, StorageError> {
+        i64::try_from(lease_ms).map_err(|_| StorageError::BacklogLeaseTooLarge { lease_ms })
+    }
+
+    /// 解析积压条目：新格式带防护序号，旧格式（升级前入队）没有。
+    /// Parse a backlog entry: the sequenced format carries a fence sequence, legacy entries do not.
+    fn decode_entry(bytes: &[u8]) -> Result<(Option<u64>, SnapshotWrite), StorageError> {
+        let Some(rest) = bytes.strip_prefix(SEQUENCED_ENTRY_TAG) else {
+            return Ok((None, Self::decode(bytes)?));
+        };
+        let separator = rest.iter().position(|byte| *byte == b':').ok_or_else(|| {
+            StorageError::BacklogProtocol("sequenced entry has no separator".to_string())
+        })?;
+        let sequence = std::str::from_utf8(&rest[..separator])
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .filter(|sequence| i64::try_from(*sequence).is_ok())
+            .ok_or_else(|| {
+                StorageError::BacklogProtocol("sequenced entry has an invalid sequence".to_string())
+            })?;
+        Ok((Some(sequence), Self::decode(&rest[separator + 1..])?))
     }
 
     fn encode(request: &SnapshotWrite) -> Result<Vec<u8>, StorageError> {
@@ -598,8 +646,7 @@ impl RedisSnapshotBacklog {
         if lease_ms == 0 {
             return Err(StorageError::InvalidBacklogLease);
         }
-        let now = Self::now_unix_ms()?;
-        let deadline = Self::lease_deadline(now, lease_ms)?;
+        let lease_ms = Self::lease_length(lease_ms)?;
         let script = Script::new(CLAIM_SCRIPT);
         let mut connection = self.worker_connection.lock().await;
         let values: Vec<Vec<u8>> = script
@@ -607,8 +654,7 @@ impl RedisSnapshotBacklog {
             .key(PROCESSING_KEY)
             .key(LEASES_KEY)
             .key(LEASE_SEQUENCE_KEY)
-            .arg(now)
-            .arg(deadline)
+            .arg(lease_ms)
             .arg(ENTRY_PREFIX)
             .arg(RECLAIM_LIMIT)
             .invoke_async(&mut *connection)
@@ -626,7 +672,7 @@ impl RedisSnapshotBacklog {
         let lease_id = String::from_utf8(values[1].clone())
             .map_err(|error| StorageError::BacklogProtocol(error.to_string()))?;
         let encoded = values[2].clone();
-        let request = Self::decode(&encoded)?;
+        let (fence_sequence, request) = Self::decode_entry(&encoded)?;
         if Self::member(&request.record) != member {
             return Err(StorageError::BacklogProtocol(
                 "claim record member does not match payload".to_string(),
@@ -634,6 +680,7 @@ impl RedisSnapshotBacklog {
         }
         Ok(Some(SnapshotBacklogLease {
             request,
+            fence_sequence,
             member,
             lease_id,
             encoded,
@@ -654,8 +701,7 @@ impl RedisSnapshotBacklog {
                 "batch claim size is zero".to_string(),
             ));
         }
-        let now = Self::now_unix_ms()?;
-        let deadline = Self::lease_deadline(now, lease_ms)?;
+        let lease_ms = Self::lease_length(lease_ms)?;
         let claim_limit = i64::try_from(max_items).map_err(|_| {
             StorageError::BacklogProtocol("batch claim size is too large".to_string())
         })?;
@@ -666,8 +712,7 @@ impl RedisSnapshotBacklog {
             .key(PROCESSING_KEY)
             .key(LEASES_KEY)
             .key(LEASE_SEQUENCE_KEY)
-            .arg(now)
-            .arg(deadline)
+            .arg(lease_ms)
             .arg(ENTRY_PREFIX)
             .arg(RECLAIM_LIMIT)
             .arg(claim_limit)
@@ -686,7 +731,7 @@ impl RedisSnapshotBacklog {
             let lease_id = String::from_utf8(tuple[1].clone())
                 .map_err(|error| StorageError::BacklogProtocol(error.to_string()))?;
             let encoded = tuple[2].clone();
-            let request = Self::decode(&encoded)?;
+            let (fence_sequence, request) = Self::decode_entry(&encoded)?;
             if Self::member(&request.record) != member {
                 return Err(StorageError::BacklogProtocol(
                     "batch claim record member does not match payload".to_string(),
@@ -694,6 +739,7 @@ impl RedisSnapshotBacklog {
             }
             leases.push(SnapshotBacklogLease {
                 request,
+                fence_sequence,
                 member,
                 lease_id,
                 encoded,
@@ -712,8 +758,7 @@ impl RedisSnapshotBacklog {
         if lease_ms == 0 {
             return Err(StorageError::InvalidBacklogLease);
         }
-        let now = Self::now_unix_ms()?;
-        let deadline = Self::lease_deadline(now, lease_ms)?;
+        let lease_ms = Self::lease_length(lease_ms)?;
         let script = Script::new(RENEW_SCRIPT);
         let mut connection = self.worker_connection.lock().await;
         let result: i64 = script
@@ -721,7 +766,7 @@ impl RedisSnapshotBacklog {
             .key(LEASES_KEY)
             .arg(&lease.member)
             .arg(&lease.lease_id)
-            .arg(deadline)
+            .arg(lease_ms)
             .arg(ENTRY_PREFIX)
             .invoke_async(&mut *connection)
             .await?;
@@ -1094,5 +1139,55 @@ mod enqueue_batcher_tests {
             RedisSnapshotBacklog::connect_with_config("redis://127.0.0.1:1/0", invalid).await,
             Err(StorageError::BacklogProtocol(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod entry_format_tests {
+    use super::*;
+
+    fn write() -> SnapshotWrite {
+        SnapshotWrite {
+            request_id: "request-1".to_string(),
+            record: RecordKey::new("player", "1").unwrap(),
+            schema: "player.snapshot".to_string(),
+            schema_version: 1,
+            payload: b"payload:with:colons".to_vec(),
+            expected_revision: None,
+            updated_at_unix_ms: 7,
+        }
+    }
+
+    #[test]
+    fn sequenced_and_legacy_entries_both_decode() {
+        let encoded = RedisSnapshotBacklog::encode(&write()).unwrap();
+        assert_ne!(
+            encoded[0], 0,
+            "legacy entries never start with the sequenced tag"
+        );
+        assert_eq!(
+            RedisSnapshotBacklog::decode_entry(&encoded).unwrap(),
+            (None, write())
+        );
+        let mut sequenced = b"\0Q1:1789825591256123:".to_vec();
+        sequenced.extend_from_slice(&encoded);
+        assert_eq!(
+            RedisSnapshotBacklog::decode_entry(&sequenced).unwrap(),
+            (Some(1_789_825_591_256_123), write())
+        );
+    }
+
+    #[test]
+    fn malformed_sequenced_entries_are_rejected() {
+        let encoded = RedisSnapshotBacklog::encode(&write()).unwrap();
+        for prefix in [
+            b"\0Q1:".to_vec(),
+            b"\0Q1:12a:".to_vec(),
+            b"\0Q1:99999999999999999999:".to_vec(),
+        ] {
+            let mut entry = prefix;
+            entry.extend_from_slice(&encoded);
+            assert!(RedisSnapshotBacklog::decode_entry(&entry).is_err());
+        }
     }
 }
