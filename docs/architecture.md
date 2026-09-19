@@ -100,6 +100,8 @@ Redis 锁不可用或等待超时时，系统仍可回源 PostgreSQL；协调层
 
 同时加入过载保护，`EnqueueBatchConfig`默认值：排队上限4096次入队调用，满则立即返回可重试错误；从接收到开始写入超过2秒的请求不再写入并返回可重试错误；调用方已放弃的请求直接跳过。排队期限加`WAITAOF`超时低于常见5秒客户端超时，调用方收到明确结果而不是超时。整批写入或确认失败时，批内请求共享同一个结果未知错误，按原请求号重试。被拒绝的请求一定没有写入Redis。
 
+确认档位是部署配置 `backlog.enqueueAck`（2026-09-19），整个DBProxy进程统一生效，协议和业务代码不变：`aof`（默认）如上等 `WAITAOF`；`memory` 脚本写入Redis内存即确认，不再等待落盘。`memory` 下，Redis正常重启不丢数据，但Redis进程或机器崩溃可能丢失约1秒（`appendfsync everysec`）已确认的入队；已进入PostgreSQL的部分不受影响。只把允许丢几秒的数据配置到这种部署；充值、抽卡、建筑升级等必须直接写PostgreSQL。
+
 worker 领取时把记录移到 processing 并设置 lease：
 
 ```text

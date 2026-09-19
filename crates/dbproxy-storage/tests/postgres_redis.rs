@@ -15,10 +15,10 @@ use tiangz_dbproxy_core::{
     TransactionalRecordWrite, TransactionalWrite, TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_storage::{
-    CacheFallbackConfig, CacheFallbackLockConfig, DEFAULT_OUTBOX_STREAM_PREFIX,
-    PostgresSnapshotStore, RedisOutboxPublisher, RedisSnapshotBacklog, RedisSnapshotCache,
-    SNAPSHOT_PARTITION_COUNT, SnapshotBacklogAck, SnapshotCacheConfig, StorageError,
-    StorageMetrics, TieredSnapshotStore, TieredSnapshotStoreConfig,
+    CacheFallbackConfig, CacheFallbackLockConfig, DEFAULT_OUTBOX_STREAM_PREFIX, EnqueueAck,
+    EnqueueBatchConfig, PostgresSnapshotStore, RedisOutboxPublisher, RedisSnapshotBacklog,
+    RedisSnapshotCache, SNAPSHOT_PARTITION_COUNT, SnapshotBacklogAck, SnapshotCacheConfig,
+    StorageError, StorageMetrics, TieredSnapshotStore, TieredSnapshotStoreConfig,
 };
 
 fn test_suffix() -> String {
@@ -754,6 +754,54 @@ async fn batch_save_preserves_partial_results_and_batches_cache_updates() {
         SnapshotWriteOutcome::Applied {
             revision: Revision(1)
         }
+    );
+}
+
+/// 内存确认档位只少等AOF落盘，入队内容与领取语义不变。
+/// The memory acknowledgement level only skips the AOF wait; queued content and claim semantics are unchanged.
+#[tokio::test]
+#[ignore = "需要本机 Redis；使用 --ignored 显式运行"]
+async fn redis_backlog_memory_ack_keeps_queue_semantics() {
+    let redis_url = std::env::var("DBPROXY_REDIS_URL")
+        .expect("DBPROXY_REDIS_URL must be set for the integration test");
+    let backlog = RedisSnapshotBacklog::connect_with_config(
+        &redis_url,
+        EnqueueBatchConfig {
+            ack: EnqueueAck::Memory,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let suffix = test_suffix();
+    let record = RecordKey::new(format!("backlog-memory-{suffix}"), "1").unwrap();
+    let write = |payload: &[u8]| SnapshotWrite {
+        request_id: format!("backlog-memory-{suffix}-{}", payload[0]),
+        record: record.clone(),
+        schema: "backlog.memory".to_string(),
+        schema_version: 1,
+        payload: payload.to_vec(),
+        expected_revision: None,
+        updated_at_unix_ms: 1,
+    };
+    backlog.enqueue(write(b"a")).await.unwrap();
+    backlog.enqueue(write(b"b")).await.unwrap();
+    let mut claimed = None;
+    for lease in backlog.claim_multi(30_000, 1_024).await.unwrap() {
+        if lease.request.record == record {
+            claimed = Some(lease);
+        } else {
+            backlog
+                .release_multi(std::slice::from_ref(&lease))
+                .await
+                .unwrap();
+        }
+    }
+    let lease = claimed.expect("memory-acknowledged enqueue must be claimable");
+    assert_eq!(lease.request.payload, b"b");
+    assert_eq!(
+        backlog.ack(&lease).await.unwrap(),
+        SnapshotBacklogAck::Removed
     );
 }
 

@@ -243,6 +243,20 @@ pub struct EnqueueBatchConfig {
     /// 从接收到开始写入的最长排队时间；超过则不写入并返回可重试错误。
     /// Longest wait from acceptance to write start; beyond it nothing is written and a retryable error returns.
     pub max_queue_wait: Duration,
+    /// 入队何时算成功。 / When an enqueue counts as accepted.
+    pub ack: EnqueueAck,
+}
+
+/// 入队确认档位，由部署配置统一选择。 / Enqueue acknowledgement level, chosen once per deployment.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EnqueueAck {
+    /// 等本地AOF落盘后才确认；Redis崩溃也不丢已确认写入。 / Acknowledge after local AOF fsync; acknowledged writes survive a Redis crash.
+    #[default]
+    Aof,
+    /// 写入Redis内存即确认；按appendfsync everysec，Redis崩溃可能丢失约1秒内已确认的写入，正常重启不丢。
+    /// Acknowledge once in Redis memory; with appendfsync everysec a Redis crash may lose about the last second of
+    /// acknowledged writes, while a clean restart loses nothing.
+    Memory,
 }
 
 impl Default for EnqueueBatchConfig {
@@ -253,6 +267,7 @@ impl Default for EnqueueBatchConfig {
             queue_capacity: 4096,
             max_batch_records: 512,
             max_queue_wait: Duration::from_millis(2_000),
+            ack: EnqueueAck::Aof,
         }
     }
 }
@@ -279,6 +294,7 @@ trait EnqueueSink: Send + 'static {
 struct RedisEnqueueSink {
     connection: ConnectionManager,
     script: Script,
+    ack: EnqueueAck,
 }
 
 #[async_trait]
@@ -299,8 +315,11 @@ impl EnqueueSink for RedisEnqueueSink {
                 "batch enqueue returned an invalid count".to_string(),
             ));
         }
-        // WAITAOF覆盖本连接此前的全部写入，所以一次等待确认整批。 / WAITAOF covers every prior write of this connection, so one wait acknowledges the batch.
-        wait_for_local_aof(&mut self.connection).await
+        match self.ack {
+            // WAITAOF覆盖本连接此前的全部写入，所以一次等待确认整批。 / WAITAOF covers every prior write of this connection, so one wait acknowledges the batch.
+            EnqueueAck::Aof => wait_for_local_aof(&mut self.connection).await,
+            EnqueueAck::Memory => Ok(()),
+        }
     }
 }
 
@@ -425,6 +444,7 @@ impl RedisSnapshotBacklog {
         let sink = RedisEnqueueSink {
             connection: enqueue_connection,
             script: Script::new(ENQUEUE_BATCH_SCRIPT),
+            ack: config.ack,
         };
         Ok(Self {
             enqueue: EnqueueBatcher::spawn(sink, config),
@@ -895,6 +915,7 @@ mod enqueue_batcher_tests {
             queue_capacity,
             max_batch_records: 512,
             max_queue_wait: Duration::from_millis(max_queue_wait_ms),
+            ack: EnqueueAck::Aof,
         }
     }
 

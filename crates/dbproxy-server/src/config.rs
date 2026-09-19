@@ -176,6 +176,28 @@ pub struct BacklogSection {
     pub idle_delay_ms: u64,
     #[serde(default = "default_backlog_failure_delay_ms")]
     pub failure_delay_ms: u64,
+    /// "aof"（默认）等本地AOF落盘才确认入队；"memory"写入Redis内存即确认，Redis崩溃可能丢约1秒已确认入队。
+    /// "aof" (default) acknowledges after local AOF fsync; "memory" acknowledges once in Redis memory and a Redis
+    /// crash may lose about one second of acknowledged enqueues.
+    #[serde(default)]
+    pub enqueue_ack: EnqueueAckSetting,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum EnqueueAckSetting {
+    #[default]
+    Aof,
+    Memory,
+}
+
+impl From<EnqueueAckSetting> for tiangz_dbproxy_storage::EnqueueAck {
+    fn from(value: EnqueueAckSetting) -> Self {
+        match value {
+            EnqueueAckSetting::Aof => Self::Aof,
+            EnqueueAckSetting::Memory => Self::Memory,
+        }
+    }
 }
 
 impl Default for BacklogSection {
@@ -185,6 +207,7 @@ impl Default for BacklogSection {
             lease_ms: default_backlog_lease_ms(),
             idle_delay_ms: default_backlog_idle_delay_ms(),
             failure_delay_ms: default_backlog_failure_delay_ms(),
+            enqueue_ack: EnqueueAckSetting::default(),
         }
     }
 }
@@ -267,6 +290,7 @@ pub struct ResolvedDbProxyConfig {
     pub backlog_lease_ms: u64,
     pub backlog_idle_delay: Duration,
     pub backlog_failure_delay: Duration,
+    pub backlog_enqueue_ack: tiangz_dbproxy_storage::EnqueueAck,
     pub cache_repair: ResolvedRetryQueue,
     pub outbox: ResolvedRetryQueue,
     pub outbox_relay: crate::relay_config::ResolvedOutboxRelay,
@@ -342,6 +366,7 @@ impl fmt::Debug for ResolvedDbProxyConfig {
             .field("storage_backend", &self.storage.name())
             .field("storage_shards", &self.storage.shards())
             .field("backlog_workers", &self.backlog_workers)
+            .field("backlog_enqueue_ack", &self.backlog_enqueue_ack)
             .field("cache_repair_workers", &self.cache_repair.workers)
             .field("outbox_workers", &self.outbox.workers)
             .field("observability_listen_addr", &self.observability_listen_addr)
@@ -599,6 +624,7 @@ impl DbProxyConfig {
             backlog_lease_ms: self.backlog.lease_ms,
             backlog_idle_delay: Duration::from_millis(self.backlog.idle_delay_ms),
             backlog_failure_delay: Duration::from_millis(self.backlog.failure_delay_ms),
+            backlog_enqueue_ack: self.backlog.enqueue_ack.into(),
             cache_repair,
             outbox,
             outbox_relay,
@@ -887,6 +913,10 @@ mod tests {
         assert_eq!(config.runtime_worker_threads, 4);
         assert_eq!(config.max_payload_bytes, DEFAULT_MAX_PAYLOAD_BYTES);
         assert_eq!(config.backlog_workers, 1);
+        assert_eq!(
+            config.backlog_enqueue_ack,
+            tiangz_dbproxy_storage::EnqueueAck::Aof
+        );
         assert_eq!(config.cache_repair.workers, 1);
         assert_eq!(config.cache_repair.lease_ms, 30_000);
         assert_eq!(config.cache_repair.max_attempts, 20);
@@ -1091,6 +1121,35 @@ mod tests {
         assert_eq!(config.runtime_worker_threads, 4);
         assert_eq!(config.storage.name(), "memory");
         assert_eq!(config.storage.shards(), 8);
+    }
+
+    #[test]
+    fn enqueue_ack_is_a_deployment_choice_and_rejects_unknown_levels() {
+        let config = |ack: &str| {
+            let path = write_config(&format!(
+                r#"{{
+          "configVersion": 1,
+          "server": {{ "listenAddr": "127.0.0.1:7800", "authTokenEnv": "AUTH" }},
+          "storage": {{ "backend": "memory" }},
+          "backlog": {{ "enqueueAck": {ack} }}
+        }}"#
+            ));
+            let result = load_config_with(&path, |name| {
+                (name == "AUTH").then(|| "memory-test-token".to_string())
+            });
+            fs::remove_file(path).unwrap();
+            result
+        };
+        assert_eq!(
+            config(r#""memory""#).unwrap().backlog_enqueue_ack,
+            tiangz_dbproxy_storage::EnqueueAck::Memory
+        );
+        assert_eq!(
+            config(r#""aof""#).unwrap().backlog_enqueue_ack,
+            tiangz_dbproxy_storage::EnqueueAck::Aof
+        );
+        assert!(config(r#""none""#).is_err());
+        assert!(config(r#""AOF""#).is_err());
     }
 
     #[test]

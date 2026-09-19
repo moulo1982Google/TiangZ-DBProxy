@@ -90,7 +90,12 @@
         "workers": { "type": "integer", "minimum": 1, "default": 1 },
         "leaseMs": { "type": "integer", "minimum": 1, "default": 30000 },
         "idleDelayMs": { "type": "integer", "minimum": 1, "default": 20 },
-        "failureDelayMs": { "type": "integer", "minimum": 1, "default": 1000 }
+        "failureDelayMs": { "type": "integer", "minimum": 1, "default": 1000 },
+        "enqueueAck": {
+          "enum": ["aof", "memory"],
+          "default": "aof",
+          "description": "普通快照入队何时确认。aof：等本地AOF落盘，Redis崩溃不丢已确认入队；memory：写入Redis内存即确认，按appendfsync everysec，Redis崩溃可能丢约1秒已确认入队，正常重启不丢。整个DBProxy部署统一生效。"
+        }
       }
     },
     "cacheRepair": {

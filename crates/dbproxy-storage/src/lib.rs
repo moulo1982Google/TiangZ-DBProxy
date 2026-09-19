@@ -49,8 +49,8 @@ pub use latency::{STORAGE_LATENCY_BOUNDS_MS, StorageStageSnapshot};
 use latency::{Stage, StorageLatency};
 
 pub use backlog::{
-    EnqueueBatchConfig, RedisSnapshotBacklog, RedisSnapshotBacklogStats, SnapshotBacklogAck,
-    SnapshotBacklogLease,
+    EnqueueAck, EnqueueBatchConfig, RedisSnapshotBacklog, RedisSnapshotBacklogStats,
+    SnapshotBacklogAck, SnapshotBacklogLease,
 };
 pub use cache_repair::{CacheRepairLease, CacheRepairStats, PostgresCacheRepairQueue};
 pub use outbox::{

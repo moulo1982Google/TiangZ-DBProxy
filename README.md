@@ -243,7 +243,7 @@ LoadTradeTransaction   按operationId和tradeId读取已提交交易回执
 
 详细错误码、ACK语义、Endpoint故障切换和跨记录限制见[网络协议说明](docs/network-protocol.md)。
 
-`SnapshotFlushQueue`是 DBProxy 进程内的协调器；`RedisSnapshotBacklog`是独立的 Redis AOF 持久积压区。前者随进程消失，后者只有在入队脚本后通过 `WAITAOF` 才返回成功，DBProxy/Redis 重启后可以重新领取。同一时刻的入队按组提交合并为一次写入和一次 `WAITAOF`，并带排队上限和2秒排队期限，过载时快速返回可重试错误，见[架构说明](docs/architecture.md#redis-aof-普通快照-backlog)。两者都只适合等级、任务进度、角色位置等允许小范围回退的数据；关键经济事务必须走 PostgreSQL 事务。AOF 和本地数据卷不等于 Redis 多副本高可用。
+`SnapshotFlushQueue`是 DBProxy 进程内的协调器；`RedisSnapshotBacklog`是独立的 Redis AOF 持久积压区。前者随进程消失，后者只有在入队脚本后通过 `WAITAOF` 才返回成功，DBProxy/Redis 重启后可以重新领取。同一时刻的入队按组提交合并为一次写入和一次 `WAITAOF`，并带排队上限和2秒排队期限，过载时快速返回可重试错误；部署配置`backlog.enqueueAck: "memory"`可改为写入Redis内存即确认（Redis崩溃可能丢约1秒已确认入队，默认`"aof"`），见[架构说明](docs/architecture.md#redis-aof-普通快照-backlog)。两者都只适合等级、任务进度、角色位置等允许小范围回退的数据；关键经济事务必须走 PostgreSQL 事务。AOF 和本地数据卷不等于 Redis 多副本高可用。
 
 ## 许可证
 

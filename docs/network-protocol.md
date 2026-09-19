@@ -51,7 +51,7 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 
 ### Enqueue ACK
 
-`Enqueue*` 在 Lua 入队后执行 `WAITAOF 1 0 2000`。AOF 未启用、超时或 Redis 不可用会返回 `STORAGE_UNAVAILABLE`。成功仍只代表 Redis 本地 AOF 接收；货币、背包、奖励、交易禁止走该路径。
+`Enqueue*` 在 Lua 入队后执行 `WAITAOF 1 0 2000`（部署配置 `backlog.enqueueAck: "memory"` 时跳过，写入 Redis 内存即成功，协议不变）。AOF 未启用、超时或 Redis 不可用会返回 `STORAGE_UNAVAILABLE`。成功仍只代表 Redis 本地 AOF 接收；货币、背包、奖励、交易禁止走该路径。
 
 ### 多记录与交易
 

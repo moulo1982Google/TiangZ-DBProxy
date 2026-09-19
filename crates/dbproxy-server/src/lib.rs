@@ -47,10 +47,11 @@ use tiangz_dbproxy_protocol::{
     is_compatible_protocol_fingerprint, read_message, wire, write_message,
 };
 use tiangz_dbproxy_storage::{
-    CacheRepairAcknowledgements, CacheRepairStats, DEFAULT_OUTBOX_STREAM_PREFIX, OutboxStats,
-    PostgresCacheRepairQueue, PostgresOutboxQueue, PostgresSnapshotStore, RedisOutboxPublisher,
-    RedisSnapshotBacklog, RedisSnapshotBacklogStats, SnapshotBacklogAck, StorageError,
-    StorageMetrics, TieredSnapshotStore, TieredSnapshotStoreConfig,
+    CacheRepairAcknowledgements, CacheRepairStats, DEFAULT_OUTBOX_STREAM_PREFIX,
+    EnqueueBatchConfig, OutboxStats, PostgresCacheRepairQueue, PostgresOutboxQueue,
+    PostgresSnapshotStore, RedisOutboxPublisher, RedisSnapshotBacklog, RedisSnapshotBacklogStats,
+    SnapshotBacklogAck, StorageError, StorageMetrics, TieredSnapshotStore,
+    TieredSnapshotStoreConfig,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -215,6 +216,8 @@ pub struct StorageBackend {
 pub struct StorageBackendConfig {
     pub shard_count: usize,
     pub tiered: TieredSnapshotStoreConfig,
+    /// 普通快照入队的组提交与确认档位。 / Group commit and acknowledgement level for ordinary snapshot enqueues.
+    pub enqueue: EnqueueBatchConfig,
 }
 
 impl StorageBackend {
@@ -231,6 +234,7 @@ impl StorageBackend {
             StorageBackendConfig {
                 shard_count,
                 tiered: TieredSnapshotStoreConfig::default(),
+                enqueue: EnqueueBatchConfig::default(),
             },
         )
         .await
@@ -332,7 +336,7 @@ impl StorageBackend {
         Ok(Self {
             shards,
             authoritative_read_namespaces: Vec::new(),
-            backlog: RedisSnapshotBacklog::connect(redis_url).await?,
+            backlog: RedisSnapshotBacklog::connect_with_config(redis_url, config.enqueue).await?,
             cache_repairs,
             cache_acknowledgements,
             outbox,
