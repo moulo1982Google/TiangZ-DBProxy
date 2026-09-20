@@ -350,6 +350,9 @@ async fn run_servers(
         metrics.mark_stopped();
     }
     admission_metrics.mark_stopped();
+    // 运维据此确认进程已完成收尾；停机信号用例也断言这一行。
+    // Operators rely on this line to confirm a clean stop; the shutdown-signal tests assert it too.
+    tracing::info!("TiangZ DBProxy stopped");
     Ok(())
 }
 
