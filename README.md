@@ -1,4 +1,6 @@
 # TiangZ DBProxy
+[![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)
+[![license](https://img.shields.io/github/license/moulo1982Google/TiangZ-DBProxy?label=license)](LICENSE)
 
 本地新增多租户入口 `--tenants`：凭据绑定独立后端，可共用 PostgreSQL/Redis 实例但分别使用独立 database/逻辑 DB；连接配额与观测按租户区分。原 --config 不变。用法、约束及真实存储未验收范围见 [多租户 v1](docs/multitenancy.md)。
 
