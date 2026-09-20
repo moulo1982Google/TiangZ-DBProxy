@@ -18,7 +18,14 @@ DBProxy 不依赖 TiangZ Runtime，也不包含任何游戏玩法。TiangZ 只�
 
 ## 当前状态
 
-`v0.6.0` 是当前工作版本。它在已有快照、关键事务、多 Endpoint 和跨记录原子事务之上，增加持久缓存修复队列、AOF 确认与重连、交易托管状态机、不可变账本、PostgreSQL Outbox 和权威快照 HASH 分区：
+`v0.6.0` 是当前版本（2026-09-20 发布）。它在已有快照、关键事务、多 Endpoint 和跨记录原子事务之上，增加持久缓存修复队列、AOF 确认与重连、交易托管状态机、不可变账本、PostgreSQL Outbox 和权威快照 HASH 分区：
+
+本次发布另外包含入队与连接层改动，协议格式不变，新旧客户端与服务端互相兼容：
+
+- 入队组提交：同一时刻到达的入队合并为一次脚本写入和一次确认，带排队上限4096与2秒排队期限，过载时快速返回可重试错误。
+- 入队确认档位 `backlog.enqueueAck`：`aof`（默认，等本地AOF落盘）或 `memory`（写入Redis内存即确认，Redis崩溃可能丢约1秒已确认入队）。整个部署统一生效。
+- 同一连接多请求在途：`server.maxInFlightPerConnection`（默认64）限制每条连接并发处理的请求；同一连接上共享RecordKey、operation ID或trade ID的请求按到达顺序执行，其余并发，响应按`rpc_id`对应。
+- 排队写落库防护序号：入队分配严格递增序号，落库只有序号更大才覆盖，迟到的旧值不再回写；配套迁移12给快照表加 `queued_sequence`。租约时间改用Redis `TIME`，落库事务带10秒语句超时。
 
 - `RecordKey`：`namespace + key`
 - `Revision`：由 DBProxy 生成的单调版本号
@@ -98,7 +105,7 @@ DBProxy-2: 127.0.0.1:7801 ─┘                    + 可选易失缓存 Redis
 
 ## 开发
 
-当前处于持续开发阶段，`Cargo.toml`、`Cargo.lock`和工作区版本号不作为冻结契约；日常修改依赖时允许Cargo重新解析，CI也不使用`--locked`。准备发布正式Tag时，再统一执行锁文件、版本、协议指纹和完整测试审查。
+`v0.6.0` 标签发布时已统一审查锁文件、版本、协议指纹与完整测试。标签之后继续开发时，`Cargo.toml`、`Cargo.lock`和工作区版本号仍不作为冻结契约；日常修改依赖时允许Cargo重新解析，CI也不使用`--locked`。下一次发布正式Tag前，同样要统一执行锁文件、版本、协议指纹和完整测试审查。
 
 ```powershell
 cargo test --workspace

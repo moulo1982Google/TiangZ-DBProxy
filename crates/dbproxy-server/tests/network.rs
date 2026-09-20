@@ -172,11 +172,14 @@ impl ClientObserver for RecordingObserver {
     }
 }
 
-fn unused_endpoint() -> String {
-    // 绑定后立即释放端口，只用于模拟首个 Endpoint 尚未启动。
-    // Bind and release a port immediately to simulate an unavailable primary Endpoint.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().to_string()
+fn unused_endpoint() -> (tokio::net::TcpSocket, String) {
+    // 保留已绑定但不监听的套接字：连接被明确拒绝，端口也不会被并行用例占用后变成可用地址。
+    // Keep a bound, non-listening socket: connections are refused and a parallel test cannot take the port and make
+    // the endpoint answer after all.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let endpoint = socket.local_addr().unwrap().to_string();
+    (socket, endpoint)
 }
 
 impl TestServer {
@@ -806,7 +809,8 @@ async fn client_fails_over_to_the_second_endpoint_and_replays_the_same_write() {
 async fn client_connects_to_backup_when_primary_endpoint_is_unavailable() {
     const TOKEN: &str = "network-initial-failover-token";
     let server = TestServer::start(TOKEN).await;
-    let config = ClientConfig::new(unused_endpoint(), TOKEN, "initial-failover-test")
+    let (_reserved, unavailable) = unused_endpoint();
+    let config = ClientConfig::new(unavailable, TOKEN, "initial-failover-test")
         .with_endpoints(vec![server.endpoint.clone()]);
     let client = DbProxyClient::connect(config).await.unwrap();
 
