@@ -76,8 +76,10 @@ jobs:
         run: npm run test:typescript
       - name: 准备本地集成测试配置
         run: cp deploy/local/.env.example deploy/local/.env
-      - name: 启动 PostgreSQL 与 Redis
-        run: docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml up -d --wait
+      - name: 启动 PostgreSQL、可靠 Redis 与缓存 Redis
+        # 叠加 validation：故障矩阵要强杀独立的缓存 Redis（6380、无AOF/RDB、tmpfs），基础 compose 不含它。
+        # Overlay validation: the fault matrix kills the separate cache Redis (6380, no AOF/RDB, tmpfs) that the base compose omits.
+        run: docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.validation.yml up -d --wait
       - name: 真实存储测试
         env:
           DBPROXY_CACHE_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6379/0
@@ -91,7 +93,9 @@ jobs:
       - name: 真实网络闭环测试
         run: cargo test -p tiangz-dbproxy-server --test postgres_redis_network --locked -- --ignored --nocapture --test-threads=1
       - name: Redis 与 PostgreSQL 故障矩阵
+        env:
+          DBPROXY_CACHE_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6380/0
         run: cargo test -p tiangz-dbproxy-storage --test fault_matrix --locked -- --ignored --nocapture --test-threads=1
       - name: 清理测试容器
         if: always()
-        run: docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml down -v --remove-orphans
+        run: docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.validation.yml down -v --remove-orphans
