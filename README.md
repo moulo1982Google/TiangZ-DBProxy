@@ -1,5 +1,8 @@
 # TiangZ DBProxy
-[![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)
+[![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)
+[![nightly acceptance](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml?query=event%3Aschedule)
+[![security](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/security.yml)
+[![tag](https://img.shields.io/github/v/tag/moulo1982Google/TiangZ-DBProxy?label=tag&sort=semver)](https://github.com/moulo1982Google/TiangZ-DBProxy/tags)
 [![license](https://img.shields.io/github/license/moulo1982Google/TiangZ-DBProxy?label=license)](LICENSE)
 
 本地新增多租户入口 `--tenants`：凭据绑定独立后端，可共用 PostgreSQL/Redis 实例但分别使用独立 database/逻辑 DB；连接配额与观测按租户区分。原 --config 不变。用法、约束及真实存储未验收范围见 [多租户 v1](docs/multitenancy.md)。
@@ -117,6 +120,8 @@ npm run test:typescript
 ```
 
 GitHub Actions 的普通分支和 Pull Request 只运行开发门禁；推送 `v*` Tag 或发布对应的 GitHub Release 时会自动进入发布验收门，使用 `npm ci`、`cargo ... --locked`，并启动 PostgreSQL/Redis 完成真实存储、网络闭环和故障矩阵测试。发布 Tag 只有在这组测试全部通过后才算验收完成。
+
+同一套完整验收另外每天在主分支跑一次（UTC 18:41，北京时间次日 02:41），也可手动触发，避免问题拖到发版当天才暴露；README 的 nightly acceptance 徽章只反映定时运行，Rust CI 徽章只反映主分支推送。`security` 工作流每周一跑 `cargo audit`，改动 `Cargo.lock` 或 crate 清单时也跑：有漏洞才失败，无人维护与 yank 只作为警告。
 
 本机启动 PostgreSQL 和 Redis：
 

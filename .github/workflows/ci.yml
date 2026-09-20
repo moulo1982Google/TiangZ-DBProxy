@@ -8,6 +8,12 @@ on:
   pull_request:
   release:
     types: [published]
+  # 完整验收（真实 PG/Redis 与故障矩阵）此前只在打标签时跑，问题要拖到发版才暴露；每晚在主分支跑一次。
+  # The full acceptance (real PostgreSQL/Redis and the fault matrix) used to run only on tags, so problems surfaced at
+  # release time; run it nightly on main as well.
+  schedule:
+    - cron: "41 18 * * *"
+  workflow_dispatch:
 
 jobs:
   check:
@@ -39,7 +45,7 @@ jobs:
 
   release:
     name: 发布前完整验收
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v'))
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v'))
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 20

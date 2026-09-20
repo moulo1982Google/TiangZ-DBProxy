@@ -1,0 +1,37 @@
+name: security
+
+# 依赖公告随公告库更新出现，不只在改依赖时出现，因此按周定时跑，并在改动锁文件时跑。
+# Advisories appear as the database updates, not only when dependencies change, so run weekly and on lockfile changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**/Cargo.toml"
+      - ".github/workflows/security.yml"
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-audit:
+    name: 依赖公告审计
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: 安装 cargo-audit
+        run: cargo install cargo-audit --locked
+      # 有漏洞才失败；无人维护与 yank 只作为警告输出，不当作门禁。
+      # Fail on vulnerabilities only; unmaintained and yanked crates are reported as warnings, not gates.
+      - name: 审计 Cargo 依赖
+        run: cargo audit
