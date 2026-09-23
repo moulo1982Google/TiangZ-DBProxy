@@ -6,8 +6,8 @@ use std::{
 };
 
 use tiangz_dbproxy_server::{
-    DbProxyBackend, DbProxyMetrics, DbProxyServer, MemoryBackend, ObservabilityServer,
-    RetryWorkerPolicy, ServerConfig, StorageBackend, StorageBackendConfig,
+    DbProxyBackend, DbProxyMetrics, DbProxyServer, MAINTENANCE_POSTGRES_CONNECTIONS, MemoryBackend,
+    ObservabilityServer, RetryWorkerPolicy, ServerConfig, StorageBackend, StorageBackendConfig,
     config::{ResolvedDbProxyConfig, ResolvedStorage, config_path_from_args, load_config},
     run_backlog_worker_observed, run_cache_repair_worker_observed, run_outbox_worker_observed,
     run_storage_metrics_poller,
@@ -98,6 +98,8 @@ async fn prepare_backend(config: &ResolvedDbProxyConfig) -> Result<BackendPair, 
             cache_redis_url,
             authoritative_read_namespaces,
             shards,
+            postgres_read_connections,
+            receipt_retention_hours: _,
             cache_fallback_concurrency,
             cache_fallback_timeout_ms,
             cache_operation_timeout_ms,
@@ -113,56 +115,61 @@ async fn prepare_backend(config: &ResolvedDbProxyConfig) -> Result<BackendPair, 
             cache_negative_ttl_ms,
             cache_stale_while_revalidate_ms,
         } => {
+            let storage_config = StorageBackendConfig {
+                shard_count: shards,
+                read_connection_count: usize::from(postgres_read_connections),
+                tiered: tiangz_dbproxy_storage::TieredSnapshotStoreConfig {
+                    postgres: tiangz_dbproxy_storage::PostgresRequestConfig {
+                        connection_wait_timeout: Duration::from_millis(
+                            postgres_connection_wait_timeout_ms,
+                        ),
+                        reconnect_cooldown: Duration::from_millis(postgres_reconnect_cooldown_ms),
+                    },
+                    cache_operation_timeout: Duration::from_millis(cache_operation_timeout_ms),
+                    fallback: tiangz_dbproxy_storage::CacheFallbackConfig {
+                        max_concurrent: cache_fallback_concurrency,
+                        timeout: Duration::from_millis(cache_fallback_timeout_ms),
+                    },
+                    circuit: tiangz_dbproxy_storage::CacheFallbackCircuitConfig {
+                        failure_threshold: cache_fallback_circuit_failure_threshold,
+                        cooldown: Duration::from_millis(cache_fallback_circuit_cooldown_ms),
+                    },
+                    lock: tiangz_dbproxy_storage::CacheFallbackLockConfig {
+                        lease: Duration::from_millis(cache_fallback_lock_lease_ms),
+                        wait: Duration::from_millis(cache_fallback_lock_wait_ms),
+                        poll_interval: Duration::from_millis(cache_fallback_lock_poll_ms),
+                    },
+                    cache: tiangz_dbproxy_storage::SnapshotCacheConfig {
+                        ttl: Duration::from_millis(cache_ttl_ms),
+                        ttl_jitter: Duration::from_millis(cache_ttl_jitter_ms),
+                        negative_ttl: Duration::from_millis(cache_negative_ttl_ms),
+                        stale_while_revalidate: Duration::from_millis(
+                            cache_stale_while_revalidate_ms,
+                        ),
+                    },
+                },
+                enqueue: tiangz_dbproxy_storage::EnqueueBatchConfig {
+                    ack: config.backlog_enqueue_ack,
+                    ..Default::default()
+                },
+            };
             let backend = Arc::new(
                 StorageBackend::connect_with_outbox(
                     &postgres_url,
                     &redis_url,
                     &cache_redis_url,
-                    StorageBackendConfig {
-                        shard_count: shards,
-                        tiered: tiangz_dbproxy_storage::TieredSnapshotStoreConfig {
-                            postgres: tiangz_dbproxy_storage::PostgresRequestConfig {
-                                connection_wait_timeout: Duration::from_millis(
-                                    postgres_connection_wait_timeout_ms,
-                                ),
-                                reconnect_cooldown: Duration::from_millis(
-                                    postgres_reconnect_cooldown_ms,
-                                ),
-                            },
-                            cache_operation_timeout: Duration::from_millis(
-                                cache_operation_timeout_ms,
-                            ),
-                            fallback: tiangz_dbproxy_storage::CacheFallbackConfig {
-                                max_concurrent: cache_fallback_concurrency,
-                                timeout: Duration::from_millis(cache_fallback_timeout_ms),
-                            },
-                            circuit: tiangz_dbproxy_storage::CacheFallbackCircuitConfig {
-                                failure_threshold: cache_fallback_circuit_failure_threshold,
-                                cooldown: Duration::from_millis(cache_fallback_circuit_cooldown_ms),
-                            },
-                            lock: tiangz_dbproxy_storage::CacheFallbackLockConfig {
-                                lease: Duration::from_millis(cache_fallback_lock_lease_ms),
-                                wait: Duration::from_millis(cache_fallback_lock_wait_ms),
-                                poll_interval: Duration::from_millis(cache_fallback_lock_poll_ms),
-                            },
-                            cache: tiangz_dbproxy_storage::SnapshotCacheConfig {
-                                ttl: Duration::from_millis(cache_ttl_ms),
-                                ttl_jitter: Duration::from_millis(cache_ttl_jitter_ms),
-                                negative_ttl: Duration::from_millis(cache_negative_ttl_ms),
-                                stale_while_revalidate: Duration::from_millis(
-                                    cache_stale_while_revalidate_ms,
-                                ),
-                            },
-                        },
-                        enqueue: tiangz_dbproxy_storage::EnqueueBatchConfig {
-                            ack: config.backlog_enqueue_ack,
-                            ..Default::default()
-                        },
-                    },
+                    storage_config,
                     &config.outbox_relay,
                 )
                 .await?
                 .with_authoritative_read_namespaces(authoritative_read_namespaces.into_vec())?,
+            );
+            tracing::info!(
+                write_connections = storage_config.shard_count,
+                read_connections = storage_config.read_connection_count,
+                maintenance_connections = MAINTENANCE_POSTGRES_CONNECTIONS,
+                total_postgres_connections = storage_config.postgres_connection_budget(),
+                "PostgreSQL connection budget for this tenant"
             );
             let server_backend: Arc<dyn DbProxyBackend> = backend.clone();
             Ok((server_backend, Some(backend)))
@@ -260,6 +267,16 @@ async fn run_servers(
     for ((id, config, _, durable_backend), metrics) in tenants.iter().zip(&tenant_metrics) {
         let durable_backend = durable_backend.clone();
         if let Some(backend) = durable_backend {
+            workers.spawn(tiangz_dbproxy_server::run_receipt_cleanup_worker(
+                Arc::clone(&backend),
+                id.clone().unwrap_or_else(|| "legacy".to_string()),
+                config
+                    .storage
+                    .receipt_retention()
+                    .expect("a durable backend always comes from postgresRedis storage"),
+                Arc::clone(metrics),
+                shutdown_rx.clone(),
+            ));
             workers.spawn(run_storage_metrics_poller(
                 Arc::clone(&backend),
                 Arc::clone(metrics),

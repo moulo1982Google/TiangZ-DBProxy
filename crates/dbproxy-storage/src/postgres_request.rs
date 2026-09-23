@@ -9,8 +9,9 @@ use crate::{ReconnectingPostgresClient, SharedPostgresClient, StorageError, dura
 pub const DEFAULT_POSTGRES_CONNECTION_WAIT_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_POSTGRES_RECONNECT_COOLDOWN_MS: u64 = 500;
 
-/// 仅供请求分片使用；独立维护连接沿用原有等待与重连策略。
-/// Request-shard policy; dedicated maintenance connections retain their existing behavior.
+/// 供请求分片写连接和租户读池共用；独立维护连接沿用原有等待与重连策略。
+/// Shared by request-shard write connections and the tenant read pool; dedicated maintenance
+/// connections retain their existing behavior.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PostgresRequestConfig {
     /// 等待连接锁的单次预算，不含重连或 SQL。

@@ -99,6 +99,17 @@ pub enum StorageSection {
         #[serde(default = "default_storage_shards")]
         shards: usize,
         #[serde(
+            rename = "postgresReadConnections",
+            default = "default_postgres_read_connections"
+        )]
+        postgres_read_connections: u8,
+        /// 普通回执保留小时数，1..=8760，默认 24。 / Ordinary receipt retention hours, 1..=8760, default 24.
+        #[serde(
+            rename = "receiptRetentionHours",
+            default = "default_receipt_retention_hours"
+        )]
+        receipt_retention_hours: u16,
+        #[serde(
             rename = "cacheFallbackConcurrency",
             default = "default_cache_fallback_concurrency"
         )]
@@ -322,6 +333,8 @@ pub enum ResolvedStorage {
         cache_redis_url: String,
         authoritative_read_namespaces: Box<[String]>,
         shards: usize,
+        postgres_read_connections: u8,
+        receipt_retention_hours: u16,
         cache_fallback_concurrency: usize,
         cache_fallback_timeout_ms: u64,
         cache_operation_timeout_ms: u64,
@@ -340,6 +353,21 @@ pub enum ResolvedStorage {
     Memory {
         shards: usize,
     },
+}
+
+impl ResolvedStorage {
+    /// 普通回执保留时长；内存后端没有回执清理。 / Ordinary receipt retention; the memory backend has no cleanup.
+    pub fn receipt_retention(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::PostgresRedis {
+                receipt_retention_hours,
+                ..
+            } => Some(std::time::Duration::from_secs(
+                u64::from(*receipt_retention_hours) * 3600,
+            )),
+            Self::Memory { .. } => None,
+        }
+    }
 }
 
 impl ResolvedStorage {
@@ -516,6 +544,8 @@ impl DbProxyConfig {
                 cache_redis_url_env,
                 authoritative_read_namespaces,
                 shards,
+                postgres_read_connections,
+                receipt_retention_hours,
                 cache_fallback_concurrency,
                 cache_fallback_timeout_ms,
                 cache_operation_timeout_ms,
@@ -531,12 +561,28 @@ impl DbProxyConfig {
                 cache_negative_ttl_ms,
                 cache_stale_while_revalidate_ms,
             } => {
+                let retention_hours_max =
+                    tiangz_dbproxy_storage::MAX_RECEIPT_RETENTION.as_secs() / 3600;
+                let retention_hours_min =
+                    tiangz_dbproxy_storage::MIN_RECEIPT_RETENTION.as_secs() / 3600;
+                if !(retention_hours_min..=retention_hours_max)
+                    .contains(&u64::from(receipt_retention_hours))
+                {
+                    return Err(ConfigError(format!(
+                        "storage.receiptRetentionHours must be between {retention_hours_min} and {retention_hours_max}"
+                    )));
+                }
                 if authoritative_read_namespaces.len() > 64
                     || authoritative_read_namespaces
                         .iter()
                         .any(|n| n.is_empty() || n.trim() != n || n.len() > 256)
                 {
                     return Err(ConfigError("storage.authoritativeReadNamespaces requires at most 64 nonempty exact namespaces of at most 256 bytes without surrounding whitespace".into()));
+                }
+                if postgres_read_connections > 64 {
+                    return Err(ConfigError(
+                        "storage.postgresReadConnections must be between 0 and 64".into(),
+                    ));
                 }
                 require_positive("storage.shards", shards)?;
                 require_positive(
@@ -588,6 +634,8 @@ impl DbProxyConfig {
                     cache_redis_url,
                     authoritative_read_namespaces,
                     shards,
+                    postgres_read_connections,
+                    receipt_retention_hours,
                     cache_fallback_concurrency,
                     cache_fallback_timeout_ms,
                     cache_operation_timeout_ms,
@@ -710,6 +758,13 @@ const fn default_handshake_timeout_ms() -> u64 {
 const fn default_shutdown_grace_ms() -> u64 {
     5_000
 }
+const fn default_postgres_read_connections() -> u8 {
+    2
+}
+const fn default_receipt_retention_hours() -> u16 {
+    (tiangz_dbproxy_storage::DEFAULT_RECEIPT_RETENTION.as_secs() / 3600) as u16
+}
+
 const fn default_storage_shards() -> usize {
     4
 }
@@ -1529,6 +1584,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn read_connections_default_override_and_bound() {
+        for (extra, expected) in [
+            ("", Some(2)),
+            (",\"postgresReadConnections\":0", Some(0)),
+            (",\"postgresReadConnections\":4", Some(4)),
+            (",\"postgresReadConnections\":65", None),
+        ] {
+            let path = write_config(&format!(
+                r#"{{"configVersion":1,"server":{{"listenAddr":"127.0.0.1:7800","authTokenEnv":"AUTH"}},"storage":{{"backend":"postgresRedis","postgresUrlEnv":"PG","redisUrlEnv":"REDIS"{extra}}}}}"#
+            ));
+            let result = load_config_with(&path, |_| Some("0123456789abcdef".into()));
+            fs::remove_file(path).unwrap();
+            if let Some(expected) = expected {
+                let ResolvedStorage::PostgresRedis {
+                    postgres_read_connections,
+                    ..
+                } = result.unwrap().storage
+                else {
+                    panic!("wrong backend")
+                };
+                assert_eq!(postgres_read_connections, expected);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("postgresReadConnections")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn receipt_retention_default_override_and_bounds() {
+        for (extra, expected) in [
+            ("", Some(24)),
+            (",\"receiptRetentionHours\":1", Some(1)),
+            (",\"receiptRetentionHours\":168", Some(168)),
+            (",\"receiptRetentionHours\":8760", Some(8760)),
+            (",\"receiptRetentionHours\":0", None),
+            (",\"receiptRetentionHours\":8761", None),
+        ] {
+            let path = write_config(&format!(
+                r#"{{"configVersion":1,"server":{{"listenAddr":"127.0.0.1:7800","authTokenEnv":"AUTH"}},"storage":{{"backend":"postgresRedis","postgresUrlEnv":"PG","redisUrlEnv":"REDIS"{extra}}}}}"#
+            ));
+            let result = load_config_with(&path, |_| Some("0123456789abcdef".into()));
+            fs::remove_file(path).unwrap();
+            if let Some(expected) = expected {
+                let storage = result.unwrap().storage;
+                assert_eq!(
+                    storage.receipt_retention(),
+                    Some(std::time::Duration::from_secs(expected * 3600))
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("storage.receiptRetentionHours must be between 1 and 8760"),
+                    "{error}"
+                );
+            }
+        }
+        let memory = write_config(
+            r#"{"configVersion":1,"server":{"listenAddr":"127.0.0.1:7800","authTokenEnv":"AUTH"},"storage":{"backend":"memory","shards":1}}"#,
+        );
+        let result = load_config_with(&memory, |_| Some("0123456789abcdef".into()));
+        fs::remove_file(memory).unwrap();
+        assert_eq!(result.unwrap().storage.receipt_retention(), None);
     }
 
     #[test]

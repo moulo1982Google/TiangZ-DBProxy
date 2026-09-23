@@ -17,6 +17,8 @@
     "postgresUrlEnv": "DBPROXY_POSTGRES_URL",
     "redisUrlEnv": "DBPROXY_REDIS_URL",
     "shards": 4,
+    "postgresReadConnections": 2,
+    "receiptRetentionHours": 24,
     "cacheFallbackConcurrency": 16,
     "cacheFallbackTimeoutMs": 2000,
     "cacheOperationTimeoutMs": 200,

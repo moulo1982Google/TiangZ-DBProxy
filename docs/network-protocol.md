@@ -8,6 +8,8 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 
 网络失败不会改变幂等规则：重试必须携带原 `request_id` 或 `operation_id` 和完全相同的请求内容。SDK/Transport 禁止在重连或 Endpoint 切换时替换 ID。
 
+PostgreSQL 普通快照 `request_id` 回执至少保留配置的时长（`storage.receiptRetentionHours`，默认 24 小时，下限 1 小时），后台之后分批清理。回执删除后不再保证返回旧结果：带版本检查的请求仍检查版本，无版本检查的请求可能再次执行。事务 `operation_id` 回执不参与这次清理。详见[回执保留规则](record-deletion-and-receipt-retention.md)。
+
 ## 帧、大小与握手
 
 ```text

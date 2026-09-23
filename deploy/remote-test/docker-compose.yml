@@ -1,0 +1,108 @@
+# Dependencies for the container-only acceptance runs on a shared Linux host.
+# Same PostgreSQL budget as the laptop performance overlay (4 CPU, 8 GiB, shared_buffers 2 GiB,
+# max_connections 30). Everything is pinned to NUMA node 1 so the box's other workloads on
+# node 0 interfere less; ports are not published, only the workbench on this network connects.
+# Data and logs live under DBPROXY_TEST_DATA (default /data/dbproxy-test) on the host.
+name: dbproxy-test
+
+services:
+  postgres:
+    image: postgres:18.6-bookworm
+    container_name: dbproxy-test-postgres
+    restart: "no"
+    cpuset: "14-17,42-45"
+    cpus: 4.0
+    mem_limit: 8g
+    mem_reservation: 2g
+    memswap_limit: 8g
+    shm_size: 1g
+    environment:
+      POSTGRES_USER: tiangz
+      POSTGRES_PASSWORD: tiangz_dev
+      POSTGRES_DB: tiangz
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - autovacuum_work_mem=32MB
+      - -c
+      - max_connections=30
+      - -c
+      - wal_buffers=8MB
+      - -c
+      - jit=off
+      - -c
+      - logging_collector=on
+      - -c
+      - log_directory=/pglog
+      - -c
+      - log_filename=postgresql.log
+      - -c
+      - log_line_prefix=%m [%p]
+      - -c
+      - log_checkpoints=on
+      - -c
+      - log_file_mode=0644
+    volumes:
+      - ${DBPROXY_TEST_DATA:-/data/dbproxy-test}/pgdata:/var/lib/postgresql
+      - ${DBPROXY_TEST_DATA:-/data/dbproxy-test}/pglog:/pglog
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tiangz -d tiangz"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:8.8.1-trixie
+    container_name: dbproxy-test-redis
+    restart: "no"
+    cpuset: "18,46"
+    mem_limit: 2g
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - tiangz_dev
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - ${DBPROXY_TEST_DATA:-/data/dbproxy-test}/redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a tiangz_dev ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  cache:
+    image: redis:8.8.1-trixie
+    container_name: dbproxy-test-cache
+    restart: "no"
+    cpuset: "19,47"
+    mem_limit: 2g
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --requirepass
+      - tiangz_dev
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - ${DBPROXY_TEST_DATA:-/data/dbproxy-test}/cache:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a tiangz_dev ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 12

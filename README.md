@@ -1,4 +1,7 @@
 # TiangZ DBProxy
+
+> 本地未提交工作接续：请先读[索引与验收交接（2026-09-22）](docs/handoff-index-acceptance-20260922.md)。包含代码状态、测试证据、未解决问题、环境及下一步；综合验收和两小时测试尚未完成。
+
 [![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)
 [![nightly acceptance](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml?query=event%3Aschedule)
 [![security](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/security.yml)
@@ -15,7 +18,7 @@ TiangZ DBProxy 是独立的 Rust 持久化服务项目。
 
 - 玩家、Item、任务等快照的读取与写入
 - Revision 和 Compare-And-Swap 版本校验
-- 重试幂等与请求去重
+- 重试幂等与请求去重（PG 普通回执至少保留 `storage.receiptRetentionHours`，默认 24 小时、下限 1 小时；事务回执不随之清理）
 - Redis 缓存、PostgreSQL/MySQL/MongoDB 等存储适配
 - 监控、故障恢复和部署协议
 
@@ -75,6 +78,16 @@ TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transpor
 
 PG 请求分片现使用独立的连接排队预算与重连失败冷却：`storage.postgresConnectionWaitTimeoutMs` 默认 2,000 ms，`storage.postgresReconnectCooldownMs` 默认 500 ms。只限制取得连接前的等待，不缩短已发送 SQL/事务的执行时间；提交后修复 ACK 排队失败保留修复目标。范围、兼容和验证见[PG 请求预算](docs/postgres-request-budget.md)，后续演练安排见[交接记录](docs/handoff-2026-09-07.md)。
 
+PG 主库读取现使用每租户共享的小连接池，`storage.postgresReadConnections` 默认 2，写连接仍由 `storage.shards` 控制；读取不再固定排在写分片后面。每租户总连接数为 `shards + postgresReadConnections + 2`，部署前须合计所有租户和实例。配置、读取一致性、取消边界见[PG 读取连接池](docs/postgres-read-pool.md)，本轮实测及未通过项见[实施验证报告](docs/acceptance-read-pool-20260922.md)。独立读池功能通过不代表短测达标；保留尖峰漏发和测试夹具冲突的原始失败证据。
+
+后续[读取分段定位报告](docs/acceptance-read-stage-diagnosis-20260922.md)记录了三轮自然短测及两次主动刷盘实验：本轮无漏发、40,000 次写入核对一致，但此前的偶发尖峰尚未复现，未进入两小时验收。
+
+[Rust 压测定时定位](docs/acceptance-pacing-diagnosis-20260922.md)进一步确认当前 Windows 上的定时迟到；可选 `-PacingTimer std` 后，两轮发送迟到 P99 降至约 0.9 ms。原有上百毫秒尖峰仍待捕获，不据此宣布验收完成。
+
+[校准后三分钟短测](docs/acceptance-calibrated-short-20260922.md)：38,000 请求无漏发或错误，19,000 次写入核对一致；读取 P99 2.525 ms。该轮未出现慢提交条件，旧尖峰仍未定位完成。
+
+[SDK/TCP 故障验证](docs/acceptance-tcp-fault-20260922.md)：慢写隔离与三轮请求中断、回滚、重连、同号重试通过；尚未覆盖持续负载中的注入及提交后响应丢失，不代替两小时验收。2026-09-22 评审轮已补齐这两项的测试工具（`read_write_contention.rs` 的响应丢失用例、[持续负载中的单项故障注入](docs/acceptance-fault-under-load.md)），真实库运行结果见[评审轮验证结果](docs/acceptance-fault-under-load-20260922.md)：响应丢失四轮、卡写一轮、杀连接两轮均按预先规则通过，旧尖峰仍未定位；同时新增读池在用/容量指标与请求三阶段直方图，见[存储指标](docs/dbproxy-metrics.md)。
+
 通用 Outbox Relay 的 Redis 路由、禁用的未来 MQ 声明、离线检查和审计管理命令见[Outbox Relay](docs/outbox-relay.md)与[配置示例](configs/outbox-relay.example.json)。旧配置及旧 Stream 地址保持兼容；新来源不能在所有 worker 升级前启用。
 
 DBProxy使用带`configVersion: 1`的严格JSON保存普通启动参数，默认读取`configs/local.json`，并由`configs/dbproxy.schema.json`提供编辑器提示。`runtime.workerThreads`可以固定Tokio Runtime工作线程数，省略时沿用Tokio按逻辑CPU选择的行为；它与只负责Redis积压消费的`backlog.workers`不是同一个参数。连接串和认证令牌不能写进JSON；配置文件只记录环境变量名，由部署环境注入实际密钥：
@@ -110,6 +123,10 @@ DBProxy-2: 127.0.0.1:7801 ─┘                    + 可选易失缓存 Redis
 
 ## 开发
 
+索引与回执清理的综合验收见[测试计划](docs/acceptance-performance-fault-test-plan.md)、[执行记录](docs/acceptance-run-20260922.md)、[定速校准工具](docs/acceptance-fixed-rate-probe.md)、[短测尖峰诊断](docs/acceptance-stall-diagnosis-20260922.md)、[客户端读写分离补测](docs/acceptance-client-split-20260922.md)和[相同连接数与受控阻塞](docs/acceptance-equal-connections-20260922.md)。定速测试发生漏发或延迟尖峰时，必须保留失败轮并单列发送等待；不得提高在途上限、丢弃失败轮或以短测代替两小时验收来宣布通过。
+
+**真实数据库测试前先确认环境。** 先完成代码、测试用例及不依赖外部服务的检查，再说明“代码和测试用例已准备好，下一步准备用真实 PG、Redis 测试”，列出所需环境，等待用户确认。用户说“继续”“推进开发”不等于授权下载数据库、安装 Docker、拉取镜像或启动服务。缺少环境时不得自行下载便携版或换用其他版本。确认后按 DP 手册的 PostgreSQL 18.6、Redis 8.8.1 镜像执行；已有明确授权的同一范围无需重复确认。完整约定见[本机测试环境与授权](deploy/local/README.md#测试环境与授权约定)。
+
 `v0.6.0` 标签发布时已统一审查锁文件、版本、协议指纹与完整测试。标签之后继续开发时，`Cargo.toml`、`Cargo.lock`和工作区版本号仍不作为冻结契约；日常修改依赖时允许Cargo重新解析，CI也不使用`--locked`。下一次发布正式Tag前，同样要统一执行锁文件、版本、协议指纹和完整测试审查。
 
 ```powershell
@@ -119,7 +136,7 @@ cargo clippy --workspace --all-targets
 npm run test:typescript
 ```
 
-GitHub Actions 的普通分支和 Pull Request 只运行开发门禁；推送 `v*` Tag 或发布对应的 GitHub Release 时会自动进入发布验收门，使用 `npm ci`、`cargo ... --locked`，并启动 PostgreSQL/Redis 完成真实存储、网络闭环和故障矩阵测试。发布 Tag 只有在这组测试全部通过后才算验收完成。
+GitHub Actions 的普通分支和 Pull Request 运行开发门禁，以及独立 PostgreSQL 库的索引结构、批量读取和队列查询回归；推送 `v*` Tag 或发布对应的 GitHub Release 时会自动进入发布验收门，使用 `npm ci`、`cargo ... --locked`，并启动 PostgreSQL/Redis 完成真实存储、网络闭环和故障矩阵测试。发布 Tag 只有在这组测试全部通过后才算验收完成。
 
 同一套完整验收另外每天在主分支跑一次（UTC 18:41，北京时间次日 02:41），也可手动触发，避免问题拖到发版当天才暴露；README 的 nightly acceptance 徽章只反映定时运行，Rust CI 徽章只反映主分支推送。`security` 工作流每周一跑 `cargo audit`，改动 `Cargo.lock` 或 crate 清单时也跑：有漏洞才失败，无人维护与 yank 只作为警告。
 
@@ -173,6 +190,18 @@ powershell -ExecutionPolicy Bypass -File tools/network_smoke.ps1
 ```
 
 ## 业务持久化性能
+
+第二批已改写批量快照读取和队列到期筛选，见[第二批查询验证](docs/index-query-validation-20260922.md)。第三批通过迁移 014 改善缓存修复队列的可领取/有效租约积压扫描，记录了新增索引的写入成本和升级维护窗口要求，见[缓存修复验证](docs/cache-repair-index-validation-20260922.md)。
+
+2026-09-22 Outbox 后续：已采用少量候选优先、按组查找兜底的领取查询，无新增表或索引；九种积压分布和顺序并发通过实测，成本及剩余限制见[Outbox 查询验证](docs/outbox-hybrid-validation-20260922.md)。普通回执保留已通过迁移 015 和独立后台任务实现；2026-09-23 起保留期可配置（`storage.receiptRetentionHours`，默认 24 小时、下限 1 小时），旧回执从升级起再保留一个保留期，见[清理与重试边界](docs/record-deletion-and-receipt-retention.md)。
+
+全库索引清单与首批修复见[索引审查](docs/database-index-audit-20260922.md)和[实际验证](docs/database-index-validation-20260922.md)。正常启动会检查 18 张表与 32 个快照分区的关键索引；已有库也会检查，不只看迁移版本。只读巡检使用已配置的 `DBPROXY_POSTGRES_URL`：
+
+```powershell
+cargo run -p tiangz-dbproxy-storage --example check_schema_indexes --locked
+```
+
+该命令不建表、不执行迁移、不读取业务记录；发现缺失或错误索引时返回失败。多个租户使用独立数据库时，应分别执行。
 
 登录相关测量须区分保活Actor复用与离线快照加载。先结合PG配置做并发阶梯，不以过载档位作为正常性能；本地工具、复测方法及完整登录尚未覆盖的部分见[登录容量测量](docs/login-capacity-method.md)与[存储阶段对比](docs/login-storage-comparison-20260917.md)。
 

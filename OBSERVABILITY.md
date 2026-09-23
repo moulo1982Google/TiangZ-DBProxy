@@ -121,3 +121,6 @@ Dashboard新增缓存修复/Outbox状态与worker结果面板。它展示的是D
 `/live` 只回答进程事件循环是否存活；`/ready` 用于接流量，真实存储模式要求生命周期就绪且两个必要依赖最近一次采样均成功；`/dependencies` 在降级时返回 503，并给出 `postgresql`、`redis` 的 `up/down`。检测存在最长约一个 5 秒采样周期，容器刚停机的瞬间不保证立即摘流。MemoryBackend 没有外部依赖，`/dependencies` 返回 `not-configured`。
 
 本地Prometheus还会抓取TiangZ all-in-one的`7600`以及`cluster-dbproxy`中启用持久化的Process健康端口。未启动的开发拓扑会显示为Down，但不会触发`tiangz-dbproxy`实例告警；正式部署应通过服务发现或独立静态目标清单替换这些本机示例端口。
+
+
+PG 独立读池等待使用存储阶段标签 `postgres_read_pool_wait`，同时包含在原有 `postgres_connection_wait` 中，不应把两者相加。SQL/重连仍计入 `postgres_operation`；启动日志逐租户列出写、读、维护连接及总量。详见[读取连接池](docs/postgres-read-pool.md)。

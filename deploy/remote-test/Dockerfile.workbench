@@ -1,0 +1,24 @@
+# Workbench for running the acceptance probes entirely inside containers on a shared Linux host.
+# Contains the Rust toolchain, the source tree, prebuilt release examples/bins, psql, node.
+# Nothing from this image is installed on the host; evidence goes to a bind mount.
+FROM rust:1.91-bookworm
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        ca-certificates postgresql-client nodejs procps jq \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+# The source tree is the full working tree (tracked + untracked, non-ignored), not a git checkout.
+COPY . /src
+
+# Release binaries used by the probes, plus warm test-binary caches for the ignored real-DB tests.
+RUN cargo build --release --examples --bins --locked -p tiangz-dbproxy-server \
+    && cargo test --no-run --locked -p tiangz-dbproxy-server --test read_write_contention \
+    && cargo test --no-run --locked -p tiangz-dbproxy-storage --lib
+
+RUN chmod +x /src/deploy/remote-test/*.sh
+ENV EVIDENCE_ROOT=/evidence \
+    PGLOG_FILE=/pglog/postgresql.log \
+    DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION=1
+CMD ["bash"]

@@ -131,26 +131,7 @@ WHERE repair.namespace = cached.namespace
         client.ensure_connected().await?;
         let row = client
             .query_opt(
-                r#"
-WITH candidate AS (
-    SELECT namespace, record_key
-    FROM dbproxy_cache_repairs
-    WHERE dead_lettered_at IS NULL
-      AND available_at <= clock_timestamp()
-      AND (lease_until IS NULL OR lease_until <= clock_timestamp())
-    ORDER BY requested_at, namespace, record_key
-    FOR UPDATE SKIP LOCKED
-    LIMIT 1
-)
-UPDATE dbproxy_cache_repairs AS repair
-SET lease_owner = $1,
-    lease_token = nextval('dbproxy_cache_repair_lease_seq'),
-    lease_until = clock_timestamp() + ($2::BIGINT * interval '1 millisecond')
-FROM candidate
-WHERE repair.namespace = candidate.namespace
-  AND repair.record_key = candidate.record_key
-RETURNING repair.namespace, repair.record_key, repair.target_revision, repair.attempt_count, repair.lease_token
-"#,
+                include_str!("cache_repair_claim.sql"),
                 &[&worker_id, &lease_ms],
             )
             .await?;

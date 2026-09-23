@@ -60,6 +60,8 @@
             "cacheFallbackConcurrency": { "type": "integer", "minimum": 1, "default": 16 },
             "cacheFallbackTimeoutMs": { "type": "integer", "minimum": 1, "default": 2000 },
             "cacheOperationTimeoutMs": { "type": "integer", "minimum": 1, "default": 200 },
+            "postgresReadConnections": { "type": "integer", "minimum": 0, "maximum": 64, "default": 2 },
+            "receiptRetentionHours": { "type": "integer", "minimum": 1, "maximum": 8760, "default": 24, "description": "Hours an ordinary snapshot receipt (request ID) is kept for same-ID retries; transaction receipts are never cleaned by this rule." },
             "postgresConnectionWaitTimeoutMs": { "type": "integer", "minimum": 1, "default": 2000 },
             "postgresReconnectCooldownMs": { "type": "integer", "minimum": 1, "default": 500 },
             "cacheFallbackCircuitFailureThreshold": { "type": "integer", "minimum": 1, "default": 5 },

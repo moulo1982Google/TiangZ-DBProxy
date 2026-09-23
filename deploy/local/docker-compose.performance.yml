@@ -1,0 +1,25 @@
+# Apply after docker-compose.yml and docker-compose.laptop.yml.
+# Fixed PostgreSQL test budget; keep other settings unchanged for comparison.
+services:
+  postgres:
+    cpus: 4.0
+    mem_limit: 8g
+    mem_reservation: 2g
+    memswap_limit: 8g
+    shm_size: 1g
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - autovacuum_work_mem=32MB
+      - -c
+      - max_connections=30
+      - -c
+      - wal_buffers=8MB
+      - -c
+      - jit=off

@@ -27,7 +27,7 @@ try {
   const binary = path.join(root, 'target/release/login_storage_compare' + (process.platform === 'win32' ? '.exe' : ''));
   report.binarySha256 = createHash('sha256').update(fs.readFileSync(binary)).digest('hex');
   report.databaseStorage = 'tmpfs; warm read comparison only, not durability or cold-disk performance';
-  run('docker', ['run', '-d', '--name', names[0], '--cpus', '2', '--memory', '1g', '--tmpfs', '/var/lib/postgresql:rw,size=512m', '-e', 'POSTGRES_PASSWORD=compare_local_only', '-p', '127.0.0.1::5432', 'postgres:18.4-bookworm', '-c', `max_connections=${report.profile.maxConnections}`]);
+  run('docker', ['run', '-d', '--name', names[0], '--cpus', '2', '--memory', '1g', '--tmpfs', '/var/lib/postgresql:rw,size=512m', '-e', 'POSTGRES_PASSWORD=compare_local_only', '-p', '127.0.0.1::5432', 'postgres:18.6-bookworm', '-c', `max_connections=${report.profile.maxConnections}`]);
   run('docker', ['run', '-d', '--name', names[1], '--cpus', '2', '--memory', '1g', '-p', '127.0.0.1::6379', 'redis:8.8.1-trixie', 'redis-server', '--save', '', '--appendonly', 'no']);
   report.images = names.map(n => JSON.parse(run('docker', ['inspect', n]))[0].Image);
   const pgPort = run('docker', ['port', names[0], '5432/tcp']).split(':').at(-1);

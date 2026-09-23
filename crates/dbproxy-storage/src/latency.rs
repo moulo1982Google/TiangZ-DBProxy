@@ -20,21 +20,27 @@ pub(crate) enum Stage {
     FallbackKey,
     FallbackLease,
     PostgresQueue,
+    PostgresReadQueue,
     PostgresOperation,
+    PostgresReadOperation,
+    PostgresWriteOperation,
     CommittedCacheSync,
     RepairAck,
     FallbackRelease,
 }
 
 impl Stage {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 13] = [
         Self::CacheLookup,
         Self::CacheWrite,
         Self::FallbackCapacity,
         Self::FallbackKey,
         Self::FallbackLease,
         Self::PostgresQueue,
+        Self::PostgresReadQueue,
         Self::PostgresOperation,
+        Self::PostgresReadOperation,
+        Self::PostgresWriteOperation,
         Self::CommittedCacheSync,
         Self::RepairAck,
         Self::FallbackRelease,
@@ -47,7 +53,10 @@ impl Stage {
             Self::FallbackCapacity => "fallback_capacity_wait",
             Self::FallbackKey => "fallback_key_wait",
             Self::FallbackLease => "fallback_distributed_lease",
+            Self::PostgresReadQueue => "postgres_read_pool_wait",
             Self::PostgresQueue => "postgres_connection_wait",
+            Self::PostgresReadOperation => "postgres_read_operation",
+            Self::PostgresWriteOperation => "postgres_write_operation",
             Self::PostgresOperation => "postgres_operation",
             Self::CommittedCacheSync => "committed_cache_sync",
             Self::RepairAck => "cache_repair_ack",
@@ -177,14 +186,14 @@ mod tests {
         });
         for _ in 0..2 {
             let snapshot = metrics.snapshot();
-            assert_eq!(snapshot.len(), 10);
+            assert_eq!(snapshot.len(), Stage::ALL.len());
             assert_eq!(
                 snapshot
                     .iter()
                     .map(|sample| sample.stage)
                     .collect::<std::collections::HashSet<_>>()
                     .len(),
-                10
+                Stage::ALL.len()
             );
             assert_eq!(
                 snapshot[Stage::CacheLookup as usize]

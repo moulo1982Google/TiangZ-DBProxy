@@ -475,3 +475,90 @@ async fn simultaneous_admin_retry_has_one_winner_and_one_audit_record() {
         assert_eq!(state.destination, lease.destination);
     }).await;
 }
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL test URL and explicit migration opt-in"]
+async fn blocked_heads_never_allow_followers_to_overtake() {
+    bounded(async {
+        for mode in ["backoff", "leased", "locked", "dead"] {
+            let mut fixture = Fixture::new().await;
+            let mut messages = vec![("head".to_string(), "ordered")];
+            messages.extend((0..40).map(|n| (format!("follower-{n}"), "ordered")));
+            messages.push(("free".to_string(), "independent"));
+            for (name, partition) in messages {
+                let (request, effects) = fixture.request(&name, partition);
+                fixture.store.commit_records(request, effects).await.unwrap();
+            }
+            let head = format!("{}-head", fixture.id);
+            let queue = fixture.store.outbox_queue();
+            match mode {
+                "backoff" => {
+                    fixture.sql.execute("UPDATE dbproxy_outbox SET available_at=clock_timestamp()+interval '1 hour' WHERE event_id=$1", &[&head]).await.unwrap();
+                }
+                "leased" | "dead" => {
+                    let lease = queue.claim_for_publisher("head-worker", 300_000, Some(&fixture.id)).await.unwrap().unwrap();
+                    assert_eq!(lease.event.event_id, head);
+                    if mode == "dead" {
+                        assert!(queue.fail(&lease, "test dead head", 1, 1).await.unwrap());
+                    }
+                }
+                _ => {}
+            }
+            let lock = fixture.sql.transaction().await.unwrap();
+            if mode == "locked" {
+                lock.query_one("SELECT event_id FROM dbproxy_outbox WHERE event_id=$1 FOR UPDATE", &[&head]).await.unwrap();
+            }
+            let free = queue.claim_for_publisher("free-worker", 300_000, Some(&fixture.id)).await.unwrap().unwrap();
+            assert_eq!(free.event.partition_key, "independent", "{mode}");
+            assert!(queue.acknowledge(&free).await.unwrap());
+            assert!(queue.claim_for_publisher("follower-worker", 300_000, Some(&fixture.id)).await.unwrap().is_none(), "{mode}");
+            assert!(queue.claim_for_publisher("unknown-worker", 300_000, Some("missing-publisher")).await.unwrap().is_none());
+            lock.rollback().await.unwrap();
+        }
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL test URL and explicit migration opt-in"]
+async fn locked_prefix_falls_back_and_continuous_claims_preserve_order() {
+    bounded(async {
+        for prefix in [31_i64, 32, 33, 40] {
+        let mut fixture = Fixture::new().await;
+        for n in 1..=70 {
+            let (request, effects) = fixture.request(&format!("event-{n:03}"), &format!("partition-{n:03}"));
+            fixture.store.commit_records(request, effects).await.unwrap();
+        }
+        let queue = fixture.store.outbox_queue();
+        let lock = fixture.sql.transaction().await.unwrap();
+        let rows = lock.query("SELECT event_id FROM dbproxy_outbox WHERE publisher_id=$1 ORDER BY enqueue_order LIMIT $2 FOR UPDATE", &[&fixture.id, &prefix]).await.unwrap();
+        assert_eq!(rows.len(), prefix as usize);
+        let barrier = Arc::new(Barrier::new(8));
+        let mut tasks = JoinSet::new();
+        for n in 0..8 {
+            let store = PostgresSnapshotStore::connect_existing(&fixture.url).await.unwrap();
+            let barrier = barrier.clone();
+            let publisher = fixture.id.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                store.outbox_queue().claim_for_publisher(&format!("prefix-worker-{n}"), 300_000, Some(&publisher)).await.unwrap().unwrap()
+            });
+        }
+        let mut claimed = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            claimed.push(result.unwrap());
+        }
+        let mut ids: Vec<_> = claimed.iter().map(|lease| lease.event.event_id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, ((prefix+1)..=(prefix+8)).map(|n| format!("{}-event-{n:03}", fixture.id)).collect::<Vec<_>>());
+        for lease in claimed {
+            assert!(queue.acknowledge(&lease).await.unwrap());
+        }
+        lock.rollback().await.unwrap();
+        for n in (1..=70).filter(|n| !((prefix+1)..=(prefix+8)).contains(n)) {
+            let lease = queue.claim_for_publisher("prefix-worker", 300_000, Some(&fixture.id)).await.unwrap().unwrap();
+            assert_eq!(lease.event.event_id, format!("{}-event-{n:03}", fixture.id));
+            assert!(queue.acknowledge(&lease).await.unwrap());
+        }
+        assert!(queue.claim_for_publisher("prefix-worker", 300_000, Some(&fixture.id)).await.unwrap().is_none());
+        }
+    }).await;
+}

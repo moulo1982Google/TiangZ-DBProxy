@@ -36,10 +36,18 @@ mod cache_ack;
 pub use cache_ack::CacheRepairAcknowledgements;
 mod cache_repair;
 mod latency;
+mod postgres_read_pool;
 mod postgres_request;
+pub use postgres_read_pool::{PostgresReadPool, ReadPoolUsage};
+mod receipt_retention;
+mod schema_indexes;
 pub use postgres_request::{
     DEFAULT_POSTGRES_CONNECTION_WAIT_TIMEOUT_MS, DEFAULT_POSTGRES_RECONNECT_COOLDOWN_MS,
     PostgresRequestConfig,
+};
+pub use receipt_retention::{
+    DEFAULT_RECEIPT_RETENTION, MAX_RECEIPT_RETENTION, MIN_RECEIPT_RETENTION,
+    RECEIPT_CLEANUP_BATCH_SIZE, validate_receipt_retention,
 };
 #[cfg(test)]
 mod latency_path_tests;
@@ -422,6 +430,12 @@ pub enum StorageError {
         "PostgreSQL connection wait timeout must be representable and at least one millisecond"
     )]
     InvalidPostgresConnectionWaitTimeout,
+    #[error(
+        "PostgreSQL read pool size must be between 1 and 64; configure 0 read connections to share write connections instead of creating a pool"
+    )]
+    InvalidPostgresReadConnections,
+    #[error("ordinary receipt retention must be between 1 and 8760 hours; got {seconds} seconds")]
+    InvalidReceiptRetention { seconds: u64 },
     #[error("PostgreSQL reconnect cooldown must be representable and at least one millisecond")]
     InvalidPostgresReconnectCooldown,
     #[error(
@@ -477,6 +491,8 @@ pub enum StorageError {
     TradeVersionTooLarge { trade_id: String },
     #[error("snapshot partition layout is invalid: {0}")]
     InvalidSnapshotPartitionLayout(String),
+    #[error("required database index is invalid: {0}")]
+    InvalidSchemaIndex(String),
     #[error("schema migration {version} is registered as {actual:?}, expected {expected:?}")]
     SchemaMigrationConflict {
         version: i32,
@@ -1198,6 +1214,7 @@ pub(crate) type SharedPostgresClient = Arc<Mutex<ReconnectingPostgresClient>>;
 #[derive(Clone)]
 pub struct PostgresSnapshotStore {
     client: SharedPostgresClient,
+    read_pool: Option<PostgresReadPool>,
     metrics: Arc<StorageMetrics>,
     connection_wait_timeout: Option<Duration>,
 }
@@ -1216,6 +1233,7 @@ impl PostgresSnapshotStore {
     pub async fn connect_existing(url: &str) -> Result<Self, StorageError> {
         Ok(Self {
             client: Arc::new(Mutex::new(ReconnectingPostgresClient::connect(url).await?)),
+            read_pool: None,
             metrics: Arc::new(StorageMetrics::default()),
             connection_wait_timeout: None,
         })
@@ -1252,6 +1270,33 @@ impl PostgresSnapshotStore {
                 postgres_request::lock_client(&self.client, self.connection_wait_timeout),
             )
             .await
+    }
+
+    /// Attach one shared primary read pool before publishing this store.
+    pub fn with_read_pool(mut self, pool: PostgresReadPool) -> Self {
+        self.read_pool = Some(pool);
+        self
+    }
+
+    async fn read_client(&self) -> Result<postgres_read_pool::ReadClient<'_>, StorageError> {
+        match &self.read_pool {
+            Some(pool) => {
+                self.metrics
+                    .latency
+                    .measure(Stage::PostgresQueue, async {
+                        self.metrics
+                            .latency
+                            .measure(Stage::PostgresReadQueue, pool.acquire())
+                            .await
+                            .map(postgres_read_pool::ReadClient::Pooled)
+                    })
+                    .await
+            }
+            None => self
+                .request_client()
+                .await
+                .map(postgres_read_pool::ReadClient::Shared),
+        }
     }
 
     /// 在全局迁移锁下仅执行尚未登记的 schema migration。
@@ -1337,8 +1382,38 @@ impl PostgresSnapshotStore {
             include_str!("../migrations/012_queued_fence.sql"),
         )
         .await?;
+        apply_schema_migration(
+            &transaction,
+            13,
+            "query-indexes",
+            include_str!("../migrations/013_query_indexes.sql"),
+        )
+        .await?;
+        apply_schema_migration(
+            &transaction,
+            14,
+            "cache-repair-claim-indexes",
+            include_str!("../migrations/014_cache_repair_claim_indexes.sql"),
+        )
+        .await?;
+        apply_schema_migration(
+            &transaction,
+            15,
+            "receipt-retention",
+            include_str!("../migrations/015_receipt_retention.sql"),
+        )
+        .await?;
+        schema_indexes::validate(&transaction).await?;
         transaction.commit().await?;
         Ok(())
+    }
+
+    /// 只读核对全库关键索引，供巡检使用；不会执行迁移或重建索引。
+    /// Read-only verification for diagnostics; never migrates or rebuilds indexes.
+    pub async fn validate_schema_indexes(&self) -> Result<(), StorageError> {
+        let mut client = self.client.lock().await;
+        client.ensure_connected().await?;
+        schema_indexes::validate(client.as_client()).await
     }
 
     pub fn cache_repair_queue(&self) -> PostgresCacheRepairQueue {
@@ -1366,12 +1441,13 @@ impl PostgresSnapshotStore {
             .iter()
             .map(|record| record.key.clone())
             .collect::<Vec<_>>();
-        let mut client = self.request_client().await?;
+        let mut client = self.read_client().await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresReadOperation);
         client.ensure_connected().await?;
         let rows = client
             .query(
-                "SELECT namespace, record_key, schema_name, schema_version, revision, payload, updated_at_unix_ms FROM dbproxy_snapshots WHERE (namespace, record_key) IN (SELECT * FROM unnest($1::TEXT[], $2::TEXT[]))",
+                include_str!("snapshot_load_multi.sql"),
                 &[&namespaces, &keys],
             )
             .await?;
@@ -1472,6 +1548,7 @@ impl PostgresSnapshotStore {
 
         let mut client = self.request_client().await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresWriteOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         if fence_sequences.is_some() {
@@ -1525,8 +1602,10 @@ async fn save_snapshot_in_transaction(
     updated_at: i64,
     fence: Option<i64>,
 ) -> Result<SnapshotWriteOutcome, StorageError> {
-    // Claim first so concurrent retries wait on the unique key and observe the first result.
-    let claimed = transaction
+    // Cleanup can win between ON CONFLICT DO NOTHING and the receipt read.
+    // Lock a visible receipt until commit, or reclaim the now absent key and retry.
+    let receipt = loop {
+        let claimed = transaction
         .query_opt(
             "INSERT INTO dbproxy_idempotency (request_id, namespace, record_key, schema_name, schema_version, payload, expected_revision, revision, updated_at_unix_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8) ON CONFLICT (request_id) DO NOTHING RETURNING request_id",
             &[
@@ -1542,13 +1621,20 @@ async fn save_snapshot_in_transaction(
         )
         .await?;
 
-    if claimed.is_none() {
+        if claimed.is_some() {
+            break None;
+        }
         let receipt = transaction
-            .query_one(
-                "SELECT namespace, record_key, schema_name, schema_version, payload, expected_revision, revision, updated_at_unix_ms FROM dbproxy_idempotency WHERE request_id = $1",
+            .query_opt(
+                "SELECT namespace, record_key, schema_name, schema_version, payload, expected_revision, revision, updated_at_unix_ms FROM dbproxy_idempotency WHERE request_id = $1 FOR KEY SHARE",
                 &[&request.request_id],
             )
             .await?;
+        if receipt.is_some() {
+            break receipt;
+        }
+    };
+    if let Some(receipt) = receipt {
         if !idempotency_matches(&receipt, request, schema_version, expected, updated_at) {
             return Err(StoreError::IdempotencyConflict {
                 request_id: request.request_id.clone(),
@@ -1750,8 +1836,9 @@ impl AsyncSnapshotStore for PostgresSnapshotStore {
     type Error = StorageError;
 
     async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, Self::Error> {
-        let mut client = self.request_client().await?;
+        let mut client = self.read_client().await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresReadOperation);
         client.ensure_connected().await?;
         let row = client
             .query_opt(
@@ -1782,8 +1869,9 @@ impl AsyncTransactionalStore for PostgresSnapshotStore {
         record: &RecordKey,
     ) -> Result<Option<TransactionReceipt>, Self::Error> {
         validate_receipt_lookup(operation_id, record)?;
-        let mut client = self.request_client().await?;
+        let mut client = self.read_client().await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresReadOperation);
         client.ensure_connected().await?;
         let receipt = client
             .query_opt(
@@ -1822,6 +1910,7 @@ impl AsyncTransactionalStore for PostgresSnapshotStore {
 
         let mut client = self.request_client().await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresWriteOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         claim_operation(&transaction, &request.operation_id, "single").await?;
@@ -1986,8 +2075,9 @@ impl AsyncMultiRecordTransactionStore for PostgresSnapshotStore {
             return Err(StoreError::EmptyTransactionRecords.into());
         }
         let expected_records = sorted_unique_records(records)?;
-        let mut client = self.request_client().await?;
+        let mut client = self.read_client().await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresReadOperation);
         client.ensure_connected().await?;
         let header = client
             .query_opt(
@@ -2064,6 +2154,7 @@ impl PostgresSnapshotStore {
 
         let mut client = self.request_client().await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresWriteOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         let operation_id = request.operation_id.clone();
@@ -2981,6 +3072,12 @@ impl TieredSnapshotStore {
         })
     }
 
+    /// Share the tenant read pool across every write shard and cache fallback path.
+    pub fn with_read_pool(mut self, pool: PostgresReadPool) -> Self {
+        self.postgres = self.postgres.with_read_pool(pool);
+        self
+    }
+
     /// 把缓存成功后的清理交给共享维护 worker；调用方必须驱动 flush 或持久修复。
     /// Hand successful-cache cleanup to a shared maintenance worker. The owner must drive
     /// flush or durable repair; standalone stores retain synchronous cleanup by default.
@@ -3065,6 +3162,12 @@ impl TieredSnapshotStore {
         }
 
         if !duplicate_indexes.is_empty() {
+            // 重复写的事务已提交并释放写连接；这里的回读走读池（或无读池时的分片连接），
+            // 新连接必能看到已提交版本。读池满时该回读会返回连接等待错误，不影响已提交数据。
+            // The duplicate's transaction has committed and released the write connection; this
+            // re-read uses the read pool (or the shard connection without a pool), where the
+            // committed revision is always visible. A saturated pool surfaces a wait error here
+            // without affecting the committed data.
             let records = duplicate_indexes
                 .iter()
                 .map(|index| requests[*index].record.clone())
@@ -3545,8 +3648,9 @@ impl TieredSnapshotStore {
         &self,
         records: &[RecordKey],
     ) -> Result<Vec<Option<SnapshotEnvelope>>, StorageError> {
-        // 复用请求分片的连接锁与排队预算；外层预算还覆盖重连和查询。
-        // Reuse the shard connection gate; the outer budget also covers reconnect/query.
+        // 读取连接来自租户读池（未配置读池时才退回请求分片连接锁）；外层预算还覆盖重连和查询。
+        // Reads use the tenant read pool (the shard connection gate only without a pool); the
+        // outer budget also covers reconnect/query.
         match timeout(
             self.read_coordinator.timeout(),
             self.postgres.load_multi(records),
