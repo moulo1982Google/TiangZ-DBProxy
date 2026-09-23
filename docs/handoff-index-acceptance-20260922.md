@@ -154,6 +154,10 @@ cargo test -p tiangz-dbproxy-server --test read_write_contention --locked -- --i
 
 服务器容器环境跑满两小时（`long_p08_a`）：144 万请求零错误、零漏发，72.1 万写入逐条核对零差异，每分钟都无错误；DBProxy 内存、PG 匿名内存、连接、Redis、缓存、回执清理积压都无持续增长；7.2 万条运行中陆续到期的回执全部清完。慢写 132 次（0.018%），归因于 WAL 新段与检查点。**缺口**：测试宿主只启动回执清理任务，没启动缓存修复、积压落库、Outbox 任务，缓存修复队列因此涨到 72 万行，P08 暂记“部分”。另发现回执保存完整写入内容（约 1.5 KB/条）。详见 `docs/acceptance-p08-2h-20260923.md`。长时运行工具：`deploy/remote-test/{run_long_round,launch_long,sample_containers,finish_long_round}.sh`、`pg_periodic.sql`、`tools/analyze_long_run.mjs`。
 
+### P08 第二轮通过（2026-09-23）
+
+测试宿主新增 `ACCEPT_BACKGROUND=all`，按服务端默认配置启动积压落库、缓存修复、Outbox 任务；长时脚本默认启用。`long_p08_b` 两小时：144 万请求零错误零漏发，72.1 万写入零差异，缓存修复队列最多 134 行、结束为 0，内存与连接稳定，读 P99 3.99 ms、写 P99 5.22 ms。慢写 52 次，全在后一小时的三段、都在检查点之后（两段由 WAL 写满 1 GB 的 `max_wal_size` 触发）。P08 记为通过（本环境、单实例单租户、普通读写）。已提交到分支 `acceptance/index-retention-p08-20260923`（`8fb39e1`、`939e32b`），未推送。
+
 ### 普通回执保留期改为可配置（2026-09-23）
 
 用户决定：默认 24 小时、下限 1 小时，做成配置。新增 `storage.receiptRetentionHours`（1–8760，默认 24，schema 与 `configs/local.json` 已加）；存储层 `cleanup_expired_receipts(retention)` 改为必传保留时长，越界返回 `InvalidReceiptRetention`，清理 SQL 用绑定参数 `make_interval(secs => $1)`，不再写死 168 小时；`run_receipt_cleanup_worker` 增加保留时长参数，`main.rs` 从配置传入并在启动时打日志。测试：边界改为 23/25 小时与 24 小时、1 小时精确截止，新增配置与校验单测；测试宿主读 `ACCEPT_RECEIPT_RETENTION_HOURS`，两套编排脚本和 `pg_periodic.sql` 跟随保留时长。依据与存储测算见 `docs/record-deletion-and-receipt-retention.md` 的“保留期如何选择”。迁移 015 未改。
