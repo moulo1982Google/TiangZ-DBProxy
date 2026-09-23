@@ -80,6 +80,8 @@ PG 请求分片现使用独立的连接排队预算与重连失败冷却：`stor
 
 PG 主库读取现使用每租户共享的小连接池，`storage.postgresReadConnections` 默认 2，写连接仍由 `storage.shards` 控制；读取不再固定排在写分片后面。每租户总连接数为 `shards + postgresReadConnections + 2`，部署前须合计所有租户和实例。配置、读取一致性、取消边界见[PG 读取连接池](docs/postgres-read-pool.md)，本轮实测及未通过项见[实施验证报告](docs/acceptance-read-pool-20260922.md)。独立读池功能通过不代表短测达标；保留尖峰漏发和测试夹具冲突的原始失败证据。
 
+PostgreSQL 的 WAL 与检查点参数（`max_wal_size`、`min_wal_size` 等）属于部署配置，DBProxy 不设置它们。实测它们不影响正确性和 P99，只影响约 0.01% 的偶发几十毫秒慢写；推荐值、监控方法和云 PG 服务的注意事项见[WAL 与检查点参数](docs/postgres-wal-checkpoint-tuning.md)。
+
 后续[读取分段定位报告](docs/acceptance-read-stage-diagnosis-20260922.md)记录了三轮自然短测及两次主动刷盘实验：本轮无漏发、40,000 次写入核对一致，但此前的偶发尖峰尚未复现，未进入两小时验收。
 
 [Rust 压测定时定位](docs/acceptance-pacing-diagnosis-20260922.md)进一步确认当前 Windows 上的定时迟到；可选 `-PacingTimer std` 后，两轮发送迟到 P99 降至约 0.9 ms。原有上百毫秒尖峰仍待捕获，不据此宣布验收完成。
