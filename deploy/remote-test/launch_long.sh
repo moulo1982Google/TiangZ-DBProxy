@@ -12,6 +12,7 @@ docker run -d --name "$NAME" --network dbproxy-test \
     -e REDIS_URL="redis://:tiangz_dev@redis:6379/$REDIS_DB" \
     -e CACHE_REDIS_URL="redis://:tiangz_dev@cache:6379/$REDIS_DB" \
     -e PG_SAMPLE_SECONDS="${PG_SAMPLE_SECONDS:-30}" -e RETENTION_HOURS="${RETENTION_HOURS:-24}" \
+    -e BACKGROUND="${BACKGROUND:-all}" \
     -v "$DATA/evidence:/evidence" -v "$DATA/pglog:/pglog:ro" \
     -v "$DATA/src/deploy/remote-test:/src/deploy/remote-test:ro" \
     -v "$DATA/src/tools:/src/tools:ro" \

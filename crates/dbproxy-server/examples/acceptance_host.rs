@@ -5,8 +5,9 @@ use tiangz_dbproxy_core::{
     TransactionReceipt, TransactionalWrite, TransactionalWriteOutcome,
 };
 use tiangz_dbproxy_server::{
-    BackendError, DbProxyBackend, DbProxyMetrics, DbProxyServer, ServerConfig, StorageBackend,
-    StorageBackendConfig, run_receipt_cleanup_worker,
+    BackendError, DbProxyBackend, DbProxyMetrics, DbProxyServer, RetryWorkerPolicy, ServerConfig,
+    StorageBackend, StorageBackendConfig, run_backlog_worker_observed,
+    run_cache_repair_worker_observed, run_outbox_worker_observed, run_receipt_cleanup_worker,
 };
 use tokio::sync::watch;
 
@@ -113,8 +114,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             shutdown.clone(),
         ))
     });
+    // ACCEPT_BACKGROUND=all also runs the production background workers (one each, with the
+    // server config defaults); `cleanup` (default) keeps the historical receipt-cleanup-only host
+    // so older runs stay comparable. Without the cache repair worker, dbproxy_cache_repairs only
+    // grows, and its PostgreSQL load is missing from the measurement (long_p08_a).
+    let background = std::env::var("ACCEPT_BACKGROUND").unwrap_or_else(|_| "cleanup".into());
+    if background != "cleanup" && background != "all" {
+        return Err("ACCEPT_BACKGROUND must be cleanup or all".into());
+    }
+    let mut background_workers = Vec::new();
+    if background == "all" {
+        // Same values as config.rs default_retry_queue_* and default_backlog_* (1 worker each).
+        let queue_policy = RetryWorkerPolicy {
+            lease_ms: 30_000,
+            base_retry_delay_ms: 1_000,
+            max_retry_delay_ms: 60_000,
+            max_attempts: 20,
+        };
+        let queue_idle = Duration::from_millis(250);
+        background_workers.push(tokio::spawn(run_backlog_worker_observed(
+            backend.clone(),
+            30_000,
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+            shutdown.clone(),
+            None,
+        )));
+        background_workers.push(tokio::spawn(run_cache_repair_worker_observed(
+            backend.clone(),
+            "acceptance-cache-repair-0".into(),
+            queue_policy,
+            queue_idle,
+            shutdown.clone(),
+            None,
+        )));
+        background_workers.push(tokio::spawn(run_outbox_worker_observed(
+            backend.clone(),
+            "acceptance-outbox-0".into(),
+            queue_policy,
+            queue_idle,
+            shutdown.clone(),
+            None,
+        )));
+    }
     println!(
-        "READY cleanup={mode} reads={read_mode} workers={} endpoint={}",
+        "READY cleanup={mode} reads={read_mode} background={background} workers={} endpoint={}",
         tokio::runtime::Handle::current().metrics().num_workers(),
         server.local_addr()?
     );
@@ -168,6 +212,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::timeout(Duration::from_secs(15), serving).await???;
     if let Some(cleanup) = cleanup {
         tokio::time::timeout(Duration::from_secs(5), cleanup).await??;
+    }
+    for worker in background_workers {
+        tokio::time::timeout(Duration::from_secs(35), worker).await??;
     }
     Ok(())
 }

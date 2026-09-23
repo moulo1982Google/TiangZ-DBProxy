@@ -12,6 +12,10 @@ mkdir -p "$STAGING"
 ROUND_DB="${RUN_ID}_1_on"
 PG_SAMPLE_SECONDS=${PG_SAMPLE_SECONDS:-30}
 RETENTION_HOURS=${RETENTION_HOURS:-24}
+# Long runs include the production background workers unless BACKGROUND=cleanup is set.
+BACKGROUND=${BACKGROUND:-all}
+# Long runs include the production background workers unless BACKGROUND=cleanup is set.
+BACKGROUND=${BACKGROUND:-all}
 
 pg_stats() {
     pg_sql -At -c "SELECT json_build_object(
@@ -47,7 +51,7 @@ WAL_SAMPLER=$!
 PG_SAMPLER=$!
 status=0
 "$HERE/run_receipt_probe.sh" --run-id "$RUN_ID" --rate 200 --seconds "$SECONDS_" --warmup 10 --rounds 1 \
-    --cleanup on --sql-log-ms 5 --read pooled --client split4 --pacing std --retention-hours "$RETENTION_HOURS" "$@" || status=$?
+    --cleanup on --sql-log-ms 5 --read pooled --client split4 --pacing std --retention-hours "$RETENTION_HOURS" --background "$BACKGROUND" "$@" || status=$?
 # common.sh enables errexit; a sampler without children makes pkill return 1, which once aborted
 # this cleanup before the final statistics were taken (long_p08_a). Never let cleanup fail.
 for p in "$HOST_SAMPLER" "$WAL_SAMPLER" "$PG_SAMPLER"; do pkill -P "$p" 2>/dev/null || true; kill "$p" 2>/dev/null || true; done

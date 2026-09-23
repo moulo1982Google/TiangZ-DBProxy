@@ -4,19 +4,19 @@
 #        [--payload 1024] [--concurrency 32] [--host-workers 4] [--load-workers 32]
 #        [--cleanup both|on|off] [--sql-log-ms -1] [--read shared|dedicated|pooled]
 #        [--client shared4|shared8|split2|split4] [--pacing tokio|std] [--retention-hours 24]
-#        [--reconcile-budget 180] [--trickle N --trickle-span S [--trickle-lead 60]]
+#        [--reconcile-budget 180] [--trickle N --trickle-span S [--trickle-lead 60]] [--background cleanup|all]
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 RUN_ID=""; RATE=200; SECONDS_=30; WARMUP=10; ROUNDS=3; PAYLOAD=1024; CONCURRENCY=32
 HOST_WORKERS=4; LOAD_WORKERS=32; CLEANUP=both; SQL_LOG_MS=-1; READ=shared; CLIENT=shared4; PACING=tokio
-RECONCILE_BUDGET=180; TRICKLE=0; TRICKLE_SPAN=0; TRICKLE_LEAD=60; RETENTION_HOURS=24
+RECONCILE_BUDGET=180; TRICKLE=0; TRICKLE_SPAN=0; TRICKLE_LEAD=60; RETENTION_HOURS=24; BACKGROUND=cleanup
 while [[ $# -gt 0 ]]; do
     case $1 in
         --run-id) RUN_ID=$2;; --rate) RATE=$2;; --seconds) SECONDS_=$2;; --warmup) WARMUP=$2;;
         --rounds) ROUNDS=$2;; --payload) PAYLOAD=$2;; --concurrency) CONCURRENCY=$2;;
         --host-workers) HOST_WORKERS=$2;; --load-workers) LOAD_WORKERS=$2;; --cleanup) CLEANUP=$2;;
         --sql-log-ms) SQL_LOG_MS=$2;; --read) READ=$2;; --client) CLIENT=$2;; --pacing) PACING=$2;;
-        --reconcile-budget) RECONCILE_BUDGET=$2;; --trickle) TRICKLE=$2;; --trickle-span) TRICKLE_SPAN=$2;; --trickle-lead) TRICKLE_LEAD=$2;; --retention-hours) RETENTION_HOURS=$2;;
+        --reconcile-budget) RECONCILE_BUDGET=$2;; --trickle) TRICKLE=$2;; --trickle-span) TRICKLE_SPAN=$2;; --trickle-lead) TRICKLE_LEAD=$2;; --retention-hours) RETENTION_HOURS=$2;; --background) BACKGROUND=$2;;
         *) echo "unknown argument $1" >&2; exit 2;;
     esac
     shift 2
@@ -36,6 +36,9 @@ export ACCEPT_PAYLOAD_BYTES=$PAYLOAD ACCEPT_CONCURRENCY=$CONCURRENCY ACCEPT_READ
 export ACCEPT_CLIENT_CONNECTIONS=$CLIENT ACCEPT_PACING_TIMER=$PACING
 # The host cleanup worker and every fixture/audit below use the same retention.
 export ACCEPT_RECEIPT_RETENTION_HOURS=$RETENTION_HOURS
+# cleanup: receipt cleanup only (historical host); all: also backlog, cache repair and outbox workers.
+[[ $BACKGROUND =~ ^(cleanup|all)$ ]] || { echo "invalid --background" >&2; exit 2; }
+export ACCEPT_BACKGROUND=$BACKGROUND
 
 TEMPLATE="${RUN_ID}_base"
 pg_createdb "$TEMPLATE"
@@ -60,7 +63,7 @@ ANALYZE dbproxy_idempotency;
 SQL
 fi
 cat >"$ARTIFACTS/manifest.json" <<EOF
-{"RunId":"$RUN_ID","Rate":$RATE,"Seconds":$SECONDS_,"WarmupSeconds":$WARMUP,"Rounds":$ROUNDS,"PayloadBytes":$PAYLOAD,"Concurrency":$CONCURRENCY,"HostWorkers":$HOST_WORKERS,"LoadWorkers":$LOAD_WORKERS,"CleanupMode":"$CLEANUP","SqlLogThresholdMs":$SQL_LOG_MS,"ReadConnection":"$READ","ClientConnections":"$CLIENT","PacingTimer":"$PACING","FixtureRecent":100000,"FixtureExpired":100000,"FixtureTrickle":$TRICKLE,"FixtureTrickleSpanSeconds":$TRICKLE_SPAN,"FixtureTrickleLeadSeconds":$TRICKLE_LEAD,"ReconcileBudgetSeconds":$RECONCILE_BUDGET,"ReceiptRetentionHours":$RETENTION_HOURS,"FullAcceptance":false,"Environment":"container-only workbench on $(hostname), cpuset $(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || echo unknown)"}
+{"RunId":"$RUN_ID","Rate":$RATE,"Seconds":$SECONDS_,"WarmupSeconds":$WARMUP,"Rounds":$ROUNDS,"PayloadBytes":$PAYLOAD,"Concurrency":$CONCURRENCY,"HostWorkers":$HOST_WORKERS,"LoadWorkers":$LOAD_WORKERS,"CleanupMode":"$CLEANUP","SqlLogThresholdMs":$SQL_LOG_MS,"ReadConnection":"$READ","ClientConnections":"$CLIENT","PacingTimer":"$PACING","FixtureRecent":100000,"FixtureExpired":100000,"FixtureTrickle":$TRICKLE,"FixtureTrickleSpanSeconds":$TRICKLE_SPAN,"FixtureTrickleLeadSeconds":$TRICKLE_LEAD,"ReconcileBudgetSeconds":$RECONCILE_BUDGET,"ReceiptRetentionHours":$RETENTION_HOURS,"BackgroundWorkers":"$BACKGROUND","FullAcceptance":false,"Environment":"container-only workbench on $(hostname), cpuset $(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || echo unknown)"}
 EOF
 json_sha256 "$HOST_EXE" "$LOAD_EXE" >"$ARTIFACTS/binaries.json"
 
