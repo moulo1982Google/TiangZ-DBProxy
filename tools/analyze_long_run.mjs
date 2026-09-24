@@ -9,7 +9,8 @@ import { join } from "node:path";
 
 const [runDir, containersArg, thresholdArg] = process.argv.slice(2);
 if (!runDir) throw new Error("usage: analyze_long_run.mjs <run folder> [containers.jsonl] [threshold ms]");
-const round = join(runDir, "1_on");
+// One round per long run; its folder is 1_on or 1_off depending on the cleanup mode.
+const round = existsSync(join(runDir, "1_on")) ? join(runDir, "1_on") : join(runDir, "1_off");
 const slowUs = Number(thresholdArg ?? 15) * 1000;
 const lines = async function* (path) {
   if (!existsSync(path)) return;
