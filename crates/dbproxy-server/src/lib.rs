@@ -64,6 +64,7 @@ use tokio::{
     task::JoinSet,
     time::{sleep, timeout},
 };
+use tracing::Instrument;
 
 use observability::{
     BacklogMetricResult, DurableQueueMetricKind, DurableQueueMetricResult, HandshakeRejection,
@@ -1529,6 +1530,7 @@ async fn handle_connection(
         (backend, Arc::clone(&config.metrics))
     };
     let _tenant_slot = tenant_slot;
+    let span = tenant_span(selected.map(|tenant| tenant.id.as_str()));
     let accepted = wire::ServerFrame {
         body: Some(wire::server_frame::Body::Hello(wire::ServerHello {
             supports_outbox_relay: true,
@@ -1542,7 +1544,20 @@ async fn handle_connection(
     tracing::debug!(client_name = %hello.client_name, "DBProxy client authenticated");
 
     let (reader, writer) = stream.into_split();
-    serve_requests(reader, writer, config, backend, request_metrics, shutdown).await
+    serve_requests(reader, writer, config, backend, request_metrics, shutdown)
+        .instrument(span)
+        .await
+}
+
+/// 多租户时给请求处理与后台任务的日志加上租户名；单租户不加。
+/// Span that tags every log line of one tenant's request handling and background workers. ERROR
+/// level so it stays enabled whenever any event is: a span disabled by the filter would drop the
+/// tenant from WARN/ERROR lines inside it. Single-tenant deployments get no span.
+pub fn tenant_span(tenant: Option<&str>) -> tracing::Span {
+    match tenant {
+        Some(tenant) => tracing::error_span!("tenant", tenant = %tenant),
+        None => tracing::Span::none(),
+    }
 }
 
 /// 一条连接上并发处理多个请求，响应按完成顺序返回并以 rpc_id 对应；
@@ -1560,7 +1575,8 @@ async fn serve_requests(
     let limit = config.max_in_flight_per_connection;
     let permits = Arc::new(Semaphore::new(limit));
     let (responses, outgoing) = mpsc::channel(limit);
-    let responder = tokio::spawn(write_responses(writer, outgoing, config.max_frame_bytes));
+    let responder =
+        tokio::spawn(write_responses(writer, outgoing, config.max_frame_bytes).in_current_span());
     let mut requests = JoinSet::new();
     let mut ordering = RequestOrdering::default();
     let read_result = loop {
@@ -1602,35 +1618,38 @@ async fn serve_requests(
         let metrics = Arc::clone(&metrics);
         let responses = responses.clone();
         let max_payload_bytes = config.max_payload_bytes;
-        requests.spawn(async move {
-            let _permit = permit;
-            metrics.request_timings.record(
-                operation,
-                request_timing::RequestStage::Schedule,
-                admitted_at.elapsed(),
-            );
-            let ordered_at = std::time::Instant::now();
-            for mut predecessor in predecessors {
-                // 前序请求结束时丢弃发送端，changed 随即返回错误。 / A finished predecessor drops its sender.
-                while predecessor.changed().await.is_ok() {}
+        requests.spawn(
+            async move {
+                let _permit = permit;
+                metrics.request_timings.record(
+                    operation,
+                    request_timing::RequestStage::Schedule,
+                    admitted_at.elapsed(),
+                );
+                let ordered_at = std::time::Instant::now();
+                for mut predecessor in predecessors {
+                    // 前序请求结束时丢弃发送端，changed 随即返回错误。 / A finished predecessor drops its sender.
+                    while predecessor.changed().await.is_ok() {}
+                }
+                metrics.request_timings.record(
+                    operation,
+                    request_timing::RequestStage::Order,
+                    ordered_at.elapsed(),
+                );
+                let handler_at = std::time::Instant::now();
+                let response =
+                    dispatch_isolated(request, backend.as_ref(), &metrics, max_payload_bytes).await;
+                metrics.request_timings.record(
+                    operation,
+                    request_timing::RequestStage::Handler,
+                    handler_at.elapsed(),
+                );
+                drop(completion);
+                // 写出任务已退出时连接已失效，丢弃响应。 / The writer has failed, so the connection is gone.
+                let _ = responses.send(response).await;
             }
-            metrics.request_timings.record(
-                operation,
-                request_timing::RequestStage::Order,
-                ordered_at.elapsed(),
-            );
-            let handler_at = std::time::Instant::now();
-            let response =
-                dispatch_isolated(request, backend.as_ref(), &metrics, max_payload_bytes).await;
-            metrics.request_timings.record(
-                operation,
-                request_timing::RequestStage::Handler,
-                handler_at.elapsed(),
-            );
-            drop(completion);
-            // 写出任务已退出时连接已失效，丢弃响应。 / The writer has failed, so the connection is gone.
-            let _ = responses.send(response).await;
-        });
+            .in_current_span(),
+        );
     };
     // 已接收的请求都执行完并尽量写回响应，与逐个处理时收尾一致。
     // Finish every accepted request and try to write its response, as the sequential loop did.

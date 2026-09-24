@@ -10,9 +10,10 @@ use tiangz_dbproxy_server::{
     ObservabilityServer, RetryWorkerPolicy, ServerConfig, StorageBackend, StorageBackendConfig,
     config::{ResolvedDbProxyConfig, ResolvedStorage, config_path_from_args, load_config},
     run_backlog_worker_observed, run_cache_repair_worker_observed, run_outbox_worker_observed,
-    run_storage_metrics_poller,
+    run_storage_metrics_poller, tenant_span,
 };
 use tokio::{sync::watch, task::JoinSet};
+use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -54,7 +55,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         return runtime.block_on(async move {
             let mut tenants = Vec::new();
             for (declaration, config) in deployment.tenants.into_iter().zip(configs) {
-                let (backend, durable) = prepare_backend(&config).await?;
+                // Tasks the backend spawns while connecting keep this tenant's log span.
+                let (backend, durable) = prepare_backend(&config)
+                    .instrument(tenant_span(Some(&declaration.id)))
+                    .await?;
                 tenants.push((Some(declaration.id), config, backend, durable));
             }
             run_servers(
@@ -266,32 +270,43 @@ async fn run_servers(
     }
     for ((id, config, _, durable_backend), metrics) in tenants.iter().zip(&tenant_metrics) {
         let durable_backend = durable_backend.clone();
+        // Every worker of this tenant logs inside its span (none for a single-tenant process).
+        let span = tenant_span(id.as_deref());
         if let Some(backend) = durable_backend {
-            workers.spawn(tiangz_dbproxy_server::run_receipt_cleanup_worker(
-                Arc::clone(&backend),
-                id.clone().unwrap_or_else(|| "legacy".to_string()),
-                config
-                    .storage
-                    .receipt_retention()
-                    .expect("a durable backend always comes from postgresRedis storage"),
-                Arc::clone(metrics),
-                shutdown_rx.clone(),
-            ));
-            workers.spawn(run_storage_metrics_poller(
-                Arc::clone(&backend),
-                Arc::clone(metrics),
-                Duration::from_secs(5),
-                shutdown_rx.clone(),
-            ));
-            for _ in 0..config.backlog_workers {
-                workers.spawn(run_backlog_worker_observed(
+            workers.spawn(
+                tiangz_dbproxy_server::run_receipt_cleanup_worker(
                     Arc::clone(&backend),
-                    config.backlog_lease_ms,
-                    config.backlog_idle_delay,
-                    config.backlog_failure_delay,
+                    id.clone().unwrap_or_else(|| "legacy".to_string()),
+                    config
+                        .storage
+                        .receipt_retention()
+                        .expect("a durable backend always comes from postgresRedis storage"),
+                    Arc::clone(metrics),
                     shutdown_rx.clone(),
-                    Some(Arc::clone(metrics)),
-                ));
+                )
+                .instrument(span.clone()),
+            );
+            workers.spawn(
+                run_storage_metrics_poller(
+                    Arc::clone(&backend),
+                    Arc::clone(metrics),
+                    Duration::from_secs(5),
+                    shutdown_rx.clone(),
+                )
+                .instrument(span.clone()),
+            );
+            for _ in 0..config.backlog_workers {
+                workers.spawn(
+                    run_backlog_worker_observed(
+                        Arc::clone(&backend),
+                        config.backlog_lease_ms,
+                        config.backlog_idle_delay,
+                        config.backlog_failure_delay,
+                        shutdown_rx.clone(),
+                        Some(Arc::clone(metrics)),
+                    )
+                    .instrument(span.clone()),
+                );
             }
             let instance = worker_instance_id();
             let cache_repair_policy = RetryWorkerPolicy {
@@ -301,14 +316,17 @@ async fn run_servers(
                 max_attempts: config.cache_repair.max_attempts,
             };
             for index in 0..config.cache_repair.workers {
-                workers.spawn(run_cache_repair_worker_observed(
-                    Arc::clone(&backend),
-                    format!("cache-repair-{instance}-{index}"),
-                    cache_repair_policy,
-                    config.cache_repair.idle_delay,
-                    shutdown_rx.clone(),
-                    Some(Arc::clone(metrics)),
-                ));
+                workers.spawn(
+                    run_cache_repair_worker_observed(
+                        Arc::clone(&backend),
+                        format!("cache-repair-{instance}-{index}"),
+                        cache_repair_policy,
+                        config.cache_repair.idle_delay,
+                        shutdown_rx.clone(),
+                        Some(Arc::clone(metrics)),
+                    )
+                    .instrument(span.clone()),
+                );
             }
             let outbox_policy = RetryWorkerPolicy {
                 lease_ms: config.outbox.lease_ms,
@@ -317,14 +335,17 @@ async fn run_servers(
                 max_attempts: config.outbox.max_attempts,
             };
             for index in 0..config.outbox.workers {
-                workers.spawn(run_outbox_worker_observed(
-                    Arc::clone(&backend),
-                    format!("outbox-{instance}-{index}"),
-                    outbox_policy,
-                    config.outbox.idle_delay,
-                    shutdown_rx.clone(),
-                    Some(Arc::clone(metrics)),
-                ));
+                workers.spawn(
+                    run_outbox_worker_observed(
+                        Arc::clone(&backend),
+                        format!("outbox-{instance}-{index}"),
+                        outbox_policy,
+                        config.outbox.idle_delay,
+                        shutdown_rx.clone(),
+                        Some(Arc::clone(metrics)),
+                    )
+                    .instrument(span.clone()),
+                );
             }
         }
 

@@ -371,7 +371,10 @@ struct EnqueueBatcher {
 impl EnqueueBatcher {
     fn spawn<S: EnqueueSink>(sink: S, config: EnqueueBatchConfig) -> Self {
         let (sender, receiver) = mpsc::channel(config.queue_capacity);
-        tokio::spawn(run_enqueue_batcher(receiver, sink, config));
+        // Created while the tenant's backend connects; keep that span for its log lines.
+        tokio::spawn(tracing::Instrument::in_current_span(run_enqueue_batcher(
+            receiver, sink, config,
+        )));
         Self {
             sender,
             capacity: config.queue_capacity,

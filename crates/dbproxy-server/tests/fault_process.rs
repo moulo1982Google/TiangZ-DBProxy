@@ -663,17 +663,36 @@ async fn f15_tenant_a_postgres_fault_leaves_tenant_b_serving() {
     );
     assert_eq!(b_rpc, 0.0, "tenant B metrics recorded errors");
     let log = server_log(&dir, "run");
-    let warn_b = log
+    let problems: Vec<&str> = log
         .lines()
-        .filter(|line| line.contains("WARN") && line.contains("tenant=b"))
+        .filter(|line| line.contains(" WARN ") || line.contains(" ERROR "))
+        .collect();
+    let warn_b = problems
+        .iter()
+        .filter(|line| line.contains("tenant=b"))
         .count();
-    let warn_a = log
-        .lines()
-        .filter(|line| line.contains("WARN") && line.contains("tenant=a"))
+    let warn_a = problems
+        .iter()
+        .filter(|line| line.contains("tenant=a"))
         .count();
+    let untagged: Vec<_> = problems
+        .iter()
+        .filter(|line| !line.contains("tenant="))
+        .collect();
     assert_eq!(
         warn_b, 0,
         "tenant B logged warnings during tenant A's fault"
+    );
+    // fp_a found 392 of 393 fault lines without a tenant and every cause printed as "db error".
+    assert!(
+        untagged.is_empty(),
+        "{} warn/error lines name no tenant, e.g. {:?}",
+        untagged.len(),
+        untagged.first()
+    );
+    assert!(
+        problems.iter().any(|line| line.contains("53300")),
+        "no log line carries PostgreSQL's SQLSTATE for the refused connection"
     );
     for (name, text) in [
         ("a-before", &before_a),
@@ -692,7 +711,7 @@ async fn f15_tenant_a_postgres_fault_leaves_tenant_b_serving() {
             "a_cleanup_failures": cleanup_failures(&before_a, &during_a), "b_cleanup_failures": cleanup_failures(&before_b, &during_b)},
         "recovery": {"a_first_write_ms": recovered.as_millis() as u64, "a_cleanup_drained_ms": a_drained.as_millis() as u64},
         "tenant_b": {"iterations": b_requests, "requests": latencies.len(), "errors": 0, "p99_ms": p99_us as f64 / 1000.0, "max_ms": max_us as f64 / 1000.0, "rpc_errors": b_rpc},
-        "log_warnings": {"tenant_a": warn_a, "tenant_b": warn_b},
+        "log_warnings": {"total": problems.len(), "tenant_a": warn_a, "tenant_b": warn_b, "untagged": untagged.len()},
         "cross_tenant_rows": 0,
     });
     std::fs::write(

@@ -30,6 +30,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_postgres::{Client, NoTls, Row, Transaction};
+use tracing::Instrument;
 
 mod backlog;
 mod cache_ack;
@@ -385,7 +386,7 @@ return 0
 pub enum StorageError {
     #[error(transparent)]
     Core(#[from] StoreError),
-    #[error("postgres error: {0}")]
+    #[error("postgres error: {}", postgres_error_text(.0))]
     Postgres(#[from] tokio_postgres::Error),
     #[error("PostgreSQL connection attempt timed out after {timeout_ms}ms")]
     PostgresConnectTimeout { timeout_ms: u64 },
@@ -1102,12 +1103,36 @@ async fn open_postgres(url: &str) -> Result<Client, StorageError> {
         .map_err(|_| StorageError::PostgresConnectTimeout {
             timeout_ms: DEFAULT_POSTGRES_RECONNECT_TIMEOUT_MS,
         })??;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::warn!(%error, "postgres connection stopped; the next operation will reconnect");
+    // The driver task inherits the caller's span, so its log line names the tenant.
+    tokio::spawn(
+        async move {
+            if let Err(error) = connection.await {
+                let error = postgres_error_text(&error);
+                tracing::warn!(%error, "postgres connection stopped; the next operation will reconnect");
+            }
         }
-    });
+        .in_current_span(),
+    );
     Ok(client)
+}
+
+/// 错误原因写入日志：数据库错误取级别、SQLSTATE 与消息，不含可能带键值的 detail；
+/// 其他错误逐层展开来源。`tokio_postgres::Error` 自身只显示 "db error"。
+/// Log text for a PostgreSQL error: severity, SQLSTATE and message for server errors (never the
+/// `detail`, which can carry key values); otherwise the source chain. The error's own Display is
+/// only "db error", which hid every cause in the 2026-09-24 fault runs.
+pub fn postgres_error_text(error: &tokio_postgres::Error) -> String {
+    if let Some(db) = error.as_db_error() {
+        return format!("{} {}: {}", db.severity(), db.code().code(), db.message());
+    }
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 async fn apply_schema_migration(
@@ -3531,21 +3556,24 @@ impl TieredSnapshotStore {
         self.metrics.cache_refresh_started();
         let store = self.clone();
         let record = record.clone();
-        tokio::spawn(async move {
-            let _refresh_slot = refresh_slot;
-            match store.refresh_cache(&record).await {
-                Ok(()) => store.metrics.cache_refresh_completed(),
-                Err(error) => {
-                    store.metrics.cache_refresh_error();
-                    tracing::debug!(%error, namespace = %record.namespace, key = %record.key, "stale snapshot refresh failed")
+        tokio::spawn(
+            async move {
+                let _refresh_slot = refresh_slot;
+                match store.refresh_cache(&record).await {
+                    Ok(()) => store.metrics.cache_refresh_completed(),
+                    Err(error) => {
+                        store.metrics.cache_refresh_error();
+                        tracing::debug!(%error, namespace = %record.namespace, key = %record.key, "stale snapshot refresh failed")
+                    }
                 }
+                let mut refreshing = store
+                    .refreshing
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                refreshing.remove(&record);
             }
-            let mut refreshing = store
-                .refreshing
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            refreshing.remove(&record);
-        });
+            .in_current_span(),
+        );
     }
 
     async fn refresh_cache(&self, record: &RecordKey) -> Result<(), StorageError> {
