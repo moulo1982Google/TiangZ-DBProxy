@@ -40,6 +40,20 @@ REDIS_URL=redis://:tiangz_dev@redis:6379/9 CACHE_REDIS_URL=redis://:tiangz_dev@c
 - `launch_long.sh <run-id> <seconds> <redis-db> [probe 参数]`：在主机上运行，以脱离 SSH 的方式启动工作台容器，并启动主机侧 `sample_containers.sh`（每 10 秒各容器 cgroup 内存、CPU、IO 与两个 Redis 的 INFO）。结果用 `tools/analyze_long_run.mjs` 流式分析。
 - `run_receipt_probe.sh` 新增 `--reconcile-budget`（核对时限）与 `--trickle N --trickle-span S`（在运行期间陆续到期的 N 条回执，让清理全程有活干）。核对改为 32 路并发。
 
+## 故障项（2026-09-24）
+
+- `run_fault_load.sh --fault` 在原有两种故障外，新增四种：
+  - `pg_pause` / `pg_delay`（F06）：宿主经注入器里的 TCP 转发层连接 PG，故障期间停止转发或加延迟，连接保持打开。
+  - `read_only`（F10）：本轮测试库改为只读，再切断连接，让 DBProxy 重连进只读状态。
+  - `disk_full`（F10）：必须配合下面的 `run_f10_disk_full.sh` 使用。
+- `run_fault_series.sh <日志> "<参数1>" "<参数2>" …`：在一个工作台容器里依次跑多轮故障，某轮失败时记录下来，继续跑下一轮。
+- `run_f10_disk_full.sh <run-id> [1g] [参数…]`：在主机上运行。另起一个一次性 PG，数据目录放在指定大小的内存盘卷上；工作台挂同一个卷，用占位文件写满。占位目录不是 tmpfs 时拒绝运行。结束后删除这个 PG 容器和内存盘卷，日志保留在 `pglog-f10-<run-id>/`。
+- `run_fault_process.sh <run-id>`：以 root 身份在工作台里用 cargo 跑 `tests/fault_process.rs`，包括 F09、F15、F04。
+  - F09 和 F15 需要受 `CONNECTION LIMIT` 约束的非超级用户，脚本会在测试 PG 里建一次性角色 `dbproxy_fault_limited`。
+  - 用 `FAULT_TESTS` 可以只跑其中几项。
+  - 如果测试没有真正运行（被过滤掉），脚本判为失败。
+  - 挂载新版测试文件时，要先 `touch` 一下，保证 cargo 会重新编译。
+
 **PG 日志必须可读**：PostgreSQL 默认以 0600 创建日志文件，工作台以普通用户运行时读不到，早期几轮因此得到空日志。现在依赖容器以 `log_file_mode=0644` 启动，脚本在日志不可读时直接失败。已存在的容器需要 `ALTER SYSTEM SET log_file_mode='0644'`、重载，并对现有文件 `chmod 644`。`recover_pglog.mjs` 用于从完整日志补回空窗口。
 
 ## 边界

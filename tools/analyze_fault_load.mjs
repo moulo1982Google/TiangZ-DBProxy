@@ -99,6 +99,13 @@ if (reconciliation.mismatches > 0) violations.push("write reconciliation found h
 if (summary.client_timing_dropped > 0) violations.push("client diagnostics were dropped");
 if (plan.fault_kind === "blocked_write" && released.target_was_blocked !== true) violations.push("blocked_write fault was never observed at the barrier");
 if (plan.fault_kind === "kill_connections" && !(released.killed > 0)) violations.push("kill_connections terminated no backend");
+// Relay faults (F06): the host must have been connected through the relay, and held traffic must
+// have drained once forwarding resumed.
+if (plan.fault_kind?.startsWith("pg_") && !(released.relay_connections_before > 0)) violations.push("the host never connected through the relay");
+if (plan.fault_kind?.startsWith("pg_") && released.buffered_bytes_left !== 0) violations.push("relay still held traffic 10 s after release");
+const relayStopped = events.find((e) => e.kind === "relay_stopped");
+// F10: the fault must actually reach the clients, otherwise the run proves nothing.
+if (["read_only", "disk_full"].includes(plan.fault_kind) && phases.during.errors === 0) violations.push(`${plan.fault_kind} produced no client-visible error`);
 const recoveryUs = lastDisturbanceUs === null || lastDisturbanceUs < releasedUs ? 0n : lastDisturbanceUs - releasedUs;
 const analysis = {
   rule_version: 2,
@@ -109,6 +116,15 @@ const analysis = {
   fault_window_seconds: Number(releasedUs - injectedUs) / 1e6,
   recovery_grace_seconds: plan.recovery_grace_seconds,
   last_disturbance_after_release_seconds: Number(recoveryUs) / 1e6,
+  relay: plan.fault_kind?.startsWith("pg_")
+    ? {
+        connections_before: released.relay_connections_before,
+        connections_opened_during_fault: released.relay_connections_opened_during_fault,
+        connections_opened_after_release: relayStopped?.relay_connections_after_release ?? null,
+        peak_buffered_bytes: released.peak_buffered_bytes,
+        buffer_drained_after_ms: released.buffer_drained_after_us / 1000,
+      }
+    : undefined,
   phases,
   reconciliation,
   error_samples: errorSamples,
