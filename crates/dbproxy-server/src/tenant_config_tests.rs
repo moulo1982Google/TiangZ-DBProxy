@@ -29,6 +29,29 @@ fn configs() -> Vec<ResolvedDbProxyConfig> {
 fn shared_servers_with_separate_databases_are_valid() {
     validate_isolation(&configs()).unwrap();
 }
+
+#[test]
+fn reject_conflicting_connection_in_flight_limits_in_either_tenant_order() {
+    let mut configs = configs();
+    configs[0].max_in_flight_per_connection = 8;
+    configs[1].max_in_flight_per_connection = 16;
+    for _ in 0..2 {
+        let error = validate_isolation(&configs).unwrap_err().to_string();
+        assert!(error.contains("maxInFlightPerConnection"), "{error}");
+        assert!(!error.contains(&configs[0].auth_token));
+        assert!(!error.contains(&configs[1].auth_token));
+        configs.reverse();
+    }
+}
+
+#[test]
+fn equal_non_default_connection_in_flight_limits_are_valid() {
+    let mut configs = configs();
+    for config in &mut configs {
+        config.max_in_flight_per_connection = 8;
+    }
+    validate_isolation(&configs).unwrap();
+}
 #[test]
 fn offline_example_checks_without_secrets_or_network() {
     check_deployment(

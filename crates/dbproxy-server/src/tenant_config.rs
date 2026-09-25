@@ -71,7 +71,15 @@ pub fn load_deployment(
         .iter()
         .map(|tenant| load_config(&tenant.config))
         .collect::<Result<Vec<_>, _>>()?;
-    validate_isolation(&configs)?;
+    validate_isolation(&configs).map_err(|error| {
+        let ids = deployment
+            .tenants
+            .iter()
+            .map(|tenant| tenant.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ConfigError(format!("tenant deployment [{ids}]: {error}"))
+    })?;
     Ok((deployment, configs))
 }
 
@@ -86,13 +94,19 @@ pub fn validate_isolation(configs: &[ResolvedDbProxyConfig]) -> Result<(), Confi
     let mut databases = HashSet::new();
     let mut redis_databases = HashSet::new();
     let mut monitoring = HashSet::new();
-    for config in configs {
+    for (index, config) in configs.iter().enumerate() {
         if !(16..=tiangz_dbproxy_protocol::MAX_AUTH_TOKEN_BYTES).contains(&config.auth_token.len())
         {
             return Err(ConfigError("invalid tenant token length".into()));
         }
         if !tokens.insert(&config.auth_token) {
             return Err(ConfigError("tenant credentials must differ".into()));
+        }
+        if config.max_in_flight_per_connection != first.max_in_flight_per_connection {
+            return Err(ConfigError(format!(
+                "server.maxInFlightPerConnection must agree: tenants[0]={}, tenants[{index}]={}",
+                first.max_in_flight_per_connection, config.max_in_flight_per_connection
+            )));
         }
         if config.max_frame_bytes != first.max_frame_bytes
             || config.max_payload_bytes != first.max_payload_bytes

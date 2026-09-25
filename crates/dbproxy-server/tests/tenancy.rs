@@ -21,7 +21,7 @@ impl Drop for OwnedProcess {
 }
 
 #[tokio::test]
-async fn executable_loads_static_tenant_deployment_without_database_services() {
+async fn executable_validates_and_loads_static_tenants_without_database_services() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -35,7 +35,7 @@ async fn executable_loads_static_tenant_deployment_without_database_services() {
     let endpoint = listener.local_addr().unwrap().to_string();
     drop(listener);
     for (id, token_env) in [("a", "TEST_TENANT_A_TOKEN"), ("b", "TEST_TENANT_B_TOKEN")] {
-        let value = serde_json::json!({"configVersion":1,"server":{"listenAddr":endpoint,"authTokenEnv":token_env,"maxConnections":4},
+        let value = serde_json::json!({"configVersion":1,"server":{"listenAddr":endpoint,"authTokenEnv":token_env,"maxConnections":4,"maxInFlightPerConnection":if id == "a" {8} else {16}},
             "runtime":{"workerThreads":2},"storage":{"backend":"memory","shards":2}});
         std::fs::write(
             root.join(format!("{id}.json")),
@@ -53,6 +53,53 @@ async fn executable_loads_static_tenant_deployment_without_database_services() {
         .unwrap(),
     )
     .unwrap();
+    for reversed in [false, true] {
+        if reversed {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&deployment).unwrap()).unwrap();
+            value["tenants"].as_array_mut().unwrap().reverse();
+            std::fs::write(&deployment, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_tiangz-dbproxy-server"))
+            .arg("--tenants")
+            .arg(&deployment)
+            .env("TEST_TENANT_A_TOKEN", A)
+            .env("TEST_TENANT_B_TOKEN", B)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut owned = OwnedProcess(child);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = owned.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "conflicting tenant limits must fail at startup"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(!status.success());
+        let mut diagnostic = String::new();
+        std::io::Read::read_to_string(&mut owned.0.stderr.take().unwrap(), &mut diagnostic)
+            .unwrap();
+        assert!(
+            diagnostic.contains("maxInFlightPerConnection"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(if reversed { "[b, a]" } else { "[a, b]" }),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains(A) && !diagnostic.contains(B));
+    }
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("b.json")).unwrap()).unwrap();
+    value["server"]["maxInFlightPerConnection"] = 8.into();
+    std::fs::write(root.join("b.json"), serde_json::to_vec(&value).unwrap()).unwrap();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_tiangz-dbproxy-server"))
         .arg("--tenants")
         .arg(&deployment)
