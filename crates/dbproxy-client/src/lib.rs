@@ -23,6 +23,8 @@ use std::{
 
 use async_trait::async_trait;
 use thiserror::Error;
+mod request_budget;
+use request_budget::RequestBudget;
 use tiangz_dbproxy_core::{
     AsyncMultiRecordTransactionStore, AsyncSnapshotStore, AsyncTradeStore, AsyncTransactionalStore,
     MultiRecordTransactionReceipt, MultiRecordTransactionalWrite,
@@ -36,6 +38,7 @@ use tiangz_dbproxy_protocol::{
     PROTOCOL_FINGERPRINT, PROTOCOL_VERSION, ProtocolError, read_message, wire, write_message,
 };
 use tokio::{
+    io::AsyncWrite,
     net::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -125,6 +128,8 @@ pub struct ClientConfig {
     pub client_name: String,
     pub max_frame_bytes: usize,
     pub connect_timeout: Duration,
+    /// 从 API 开始执行起的逻辑请求总预算，包含排队、重连和自动重试。
+    /// Total logical request budget from API execution, including queues, reconnects and automatic retries.
     pub request_timeout: Duration,
     /// 每条连接同时在途的请求上限；超出时在客户端排队。
     /// In-flight requests per connection; excess requests queue in the client.
@@ -219,6 +224,8 @@ pub enum ClientError {
     ConnectTimeout,
     #[error("DBProxy request timed out; its outcome is unknown")]
     RequestTimeout,
+    #[error("DBProxy request timed out before sending; no request was submitted")]
+    RequestNotSentTimeout,
     #[error("DBProxy connection can no longer be used")]
     ConnectionUnusable,
     #[error(transparent)]
@@ -353,7 +360,6 @@ struct ClientConnection {
     next_rpc_id: AtomicU64,
     in_flight: Semaphore,
     max_frame_bytes: usize,
-    request_timeout: Duration,
     reader: JoinHandle<()>,
 }
 
@@ -366,18 +372,47 @@ impl Drop for ClientConnection {
 /// 写入中途失败或被取消时，帧可能只写了一半：关闭写端，服务端据此结束连接。
 /// A write that fails or is cancelled midway may leave half a frame: close the write side so the server ends
 /// the connection.
-struct WriteAttempt<'a> {
-    writer: MutexGuard<'a, Option<OwnedWriteHalf>>,
+struct WriteAttempt<'a, W> {
+    writer: MutexGuard<'a, Option<W>>,
     shared: &'a ConnectionShared,
     finished: bool,
 }
 
-impl Drop for WriteAttempt<'_> {
+impl<W> Drop for WriteAttempt<'_, W> {
     fn drop(&mut self) {
         if !self.finished {
             self.shared.mark_unusable();
             self.writer.take();
         }
+    }
+}
+
+/// 在同一预算内写完整帧；部分写失败或取消时释放写端，禁止复用截断流。 / Writes one frame within the shared budget and drops the write side after partial failure or cancellation.
+async fn write_request<W: AsyncWrite + Unpin>(
+    writer: MutexGuard<'_, Option<W>>,
+    shared: &ConnectionShared,
+    frame: &wire::ClientFrame,
+    maximum: usize,
+    budget: &mut RequestBudget,
+) -> Result<(), ClientError> {
+    budget.check()?;
+    let mut attempt = WriteAttempt {
+        writer,
+        shared,
+        finished: false,
+    };
+    let Some(writer) = attempt.writer.as_mut() else {
+        attempt.finished = true;
+        return Err(ClientError::ConnectionUnusable);
+    };
+    budget.start_write();
+    match tokio::time::timeout_at(budget.deadline, write_message(writer, frame, maximum)).await {
+        Ok(Ok(())) => {
+            attempt.finished = true;
+            Ok(())
+        }
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Err(ClientError::RequestTimeout),
     }
 }
 
@@ -410,7 +445,6 @@ impl ClientConnection {
             next_rpc_id: AtomicU64::new(1),
             in_flight: Semaphore::new(config.max_in_flight),
             max_frame_bytes: config.max_frame_bytes,
-            request_timeout: config.request_timeout,
             reader,
         }
     }
@@ -422,15 +456,27 @@ impl ClientConnection {
         body: wire::request_envelope::Body,
         started_at: Instant,
         queue_wait: &mut Duration,
+        budget: &mut RequestBudget,
     ) -> Result<wire::ResponseEnvelope, ClientError> {
+        budget.check()?;
         if !self.shared.usable() {
             return Err(ClientError::ConnectionUnusable);
         }
-        let _slot = self
-            .in_flight
-            .acquire()
-            .await
-            .map_err(|_| ClientError::ConnectionUnusable)?;
+        let queued = tokio::time::timeout_at(budget.deadline, async {
+            let slot = self
+                .in_flight
+                .acquire()
+                .await
+                .map_err(|_| ClientError::ConnectionUnusable)?;
+            Ok::<_, ClientError>((slot, self.writer.lock().await))
+        })
+        .await;
+        *queue_wait = started_at.elapsed();
+        let (_slot, writer) = queued.map_err(|_| budget.timeout_error())??;
+        budget.check()?;
+        if !self.shared.usable() || writer.is_none() {
+            return Err(ClientError::ConnectionUnusable);
+        }
         let rpc_id = self.next_rpc_id.fetch_add(1, Ordering::Relaxed);
         let response = self.shared.register(rpc_id)?;
         let _registration = Registration {
@@ -443,34 +489,9 @@ impl ClientConnection {
                 body: Some(body),
             })),
         };
-        let mut attempt = WriteAttempt {
-            writer: self.writer.lock().await,
-            shared: &self.shared,
-            finished: false,
-        };
-        *queue_wait = started_at.elapsed();
-        if !self.shared.usable() {
-            attempt.finished = true;
-            return Err(ClientError::ConnectionUnusable);
-        }
-        let deadline = tokio::time::Instant::now() + self.request_timeout;
-        let Some(writer) = attempt.writer.as_mut() else {
-            attempt.finished = true;
-            return Err(ClientError::ConnectionUnusable);
-        };
-        match tokio::time::timeout_at(
-            deadline,
-            write_message(writer, &frame, self.max_frame_bytes),
-        )
-        .await
-        {
-            Ok(Ok(())) => attempt.finished = true,
-            Ok(Err(error)) => return Err(error.into()),
-            Err(_) => return Err(ClientError::RequestTimeout),
-        }
-        drop(attempt);
+        write_request(writer, &self.shared, &frame, self.max_frame_bytes, budget).await?;
         let sent_at = self.shared.now_micros();
-        match tokio::time::timeout_at(deadline, response).await {
+        match tokio::time::timeout_at(budget.deadline, response).await {
             Ok(Ok(Ok(response))) if response.error.is_some() => {
                 Err(ClientError::Remote(remote_error(response.error)))
             }
@@ -852,6 +873,7 @@ impl DbProxyClient {
                 "max in-flight requests is outside the supported range",
             ));
         }
+        RequestBudget::new(config.request_timeout)?;
 
         let mut stream = timeout(config.connect_timeout, TcpStream::connect(endpoint))
             .await
@@ -912,15 +934,28 @@ impl DbProxyClient {
         )
     }
 
+    #[cfg(test)]
     async fn call_once(
         &self,
         body: wire::request_envelope::Body,
+    ) -> Result<wire::ResponseEnvelope, ClientError> {
+        self.call_attempt(body, &mut RequestBudget::new(self.config.request_timeout)?)
+            .await
+    }
+
+    /// 一次物理尝试复用逻辑预算，并为已结束尝试记录原有观测字段。 / Reuses the logical budget and records compatible timing for one completed attempt.
+    async fn call_attempt(
+        &self,
+        body: wire::request_envelope::Body,
+        budget: &mut RequestBudget,
     ) -> Result<wire::ResponseEnvelope, ClientError> {
         let operation = request_operation(&body);
         let started_at = Instant::now();
         let connection = self.current();
         let mut queue_wait = Duration::ZERO;
-        let result = connection.exchange(body, started_at, &mut queue_wait).await;
+        let result = connection
+            .exchange(body, started_at, &mut queue_wait, budget)
+            .await;
         if let Some(observer) = &self.config.observer {
             observer.request_attempt_timed(
                 connection.endpoint_index,
@@ -937,13 +972,17 @@ impl DbProxyClient {
 
     async fn call(
         &self,
+        mut budget: RequestBudget,
         body: wire::request_envelope::Body,
     ) -> Result<wire::ResponseEnvelope, ClientError> {
-        match self.call_once(body.clone()).await {
+        match self.call_attempt(body.clone(), &mut budget).await {
             Ok(response) => Ok(response),
             Err(error) if is_reconnectable(&error) => {
-                self.reconnect_next().await?;
-                self.call_once(body).await
+                budget.check()?;
+                tokio::time::timeout_at(budget.deadline, self.reconnect_next())
+                    .await
+                    .map_err(|_| budget.timeout_error())??;
+                self.call_attempt(body, &mut budget).await
             }
             Err(error) => Err(error),
         }
@@ -1011,14 +1050,16 @@ impl DbProxyClient {
         allow_stale: bool,
         min_revision: Option<Revision>,
     ) -> Result<Option<SnapshotEnvelope>, ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         let response = self
-            .call(wire::request_envelope::Body::LoadSnapshot(
-                wire::LoadSnapshotRequest {
+            .call(
+                budget,
+                wire::request_envelope::Body::LoadSnapshot(wire::LoadSnapshotRequest {
                     record: Some(record.into()),
                     allow_stale,
                     min_revision: min_revision.map(|r| r.0),
-                },
-            ))
+                }),
+            )
             .await?;
         let Some(wire::response_envelope::Body::LoadSnapshot(result)) = response.body else {
             return Err(ClientError::UnexpectedResponse(
@@ -1056,6 +1097,7 @@ impl DbProxyClient {
         allow_stale: bool,
         min_revisions: &[Revision],
     ) -> Result<Vec<Option<SnapshotEnvelope>>, ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         if !min_revisions.is_empty() && min_revisions.len() != records.len() {
             return Err(ClientError::InvalidConfig(
                 "revision fences must match records",
@@ -1072,13 +1114,14 @@ impl DbProxyClient {
             ));
         }
         let response = self
-            .call(wire::request_envelope::Body::LoadMultiSnapshot(
-                wire::LoadMultiSnapshotRequest {
+            .call(
+                budget,
+                wire::request_envelope::Body::LoadMultiSnapshot(wire::LoadMultiSnapshotRequest {
                     records: records.iter().map(Into::into).collect(),
                     allow_stale,
                     min_revisions: min_revisions.iter().map(|r| r.0).collect(),
-                },
-            ))
+                }),
+            )
             .await?;
         let Some(wire::response_envelope::Body::LoadMultiSnapshot(result)) = response.body else {
             return Err(ClientError::UnexpectedResponse(
@@ -1114,10 +1157,12 @@ impl DbProxyClient {
     }
 
     pub async fn save(&self, request: SnapshotWrite) -> Result<SnapshotWriteOutcome, ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         let response = self
-            .call(wire::request_envelope::Body::SaveSnapshot(
-                (&request).into(),
-            ))
+            .call(
+                budget,
+                wire::request_envelope::Body::SaveSnapshot((&request).into()),
+            )
             .await?;
         let Some(wire::response_envelope::Body::SaveSnapshot(result)) = response.body else {
             return Err(ClientError::UnexpectedResponse(
@@ -1131,13 +1176,15 @@ impl DbProxyClient {
         &self,
         requests: &[SnapshotWrite],
     ) -> Result<Vec<BatchSnapshotWriteOutcome>, ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         validate_snapshot_write_batch(requests)?;
         let response = self
-            .call(wire::request_envelope::Body::SaveMultiSnapshot(
-                wire::SaveMultiSnapshotRequest {
+            .call(
+                budget,
+                wire::request_envelope::Body::SaveMultiSnapshot(wire::SaveMultiSnapshotRequest {
                     writes: requests.iter().map(Into::into).collect(),
-                },
-            ))
+                }),
+            )
             .await?;
         let Some(wire::response_envelope::Body::SaveMultiSnapshot(result)) = response.body else {
             return Err(ClientError::UnexpectedResponse(
@@ -1166,12 +1213,14 @@ impl DbProxyClient {
     /// 不表示 PostgreSQL 已完成。Enqueue a rollback-tolerant snapshot. Success means the durable
     /// backlog accepted it, not that PostgreSQL has already committed it.
     pub async fn enqueue_snapshot(&self, request: SnapshotWrite) -> Result<(), ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         let response = self
-            .call(wire::request_envelope::Body::EnqueueSnapshot(
-                wire::EnqueueSnapshotRequest {
+            .call(
+                budget,
+                wire::request_envelope::Body::EnqueueSnapshot(wire::EnqueueSnapshotRequest {
                     write: Some((&request).into()),
-                },
-            ))
+                }),
+            )
             .await?;
         let Some(wire::response_envelope::Body::EnqueueSnapshot(result)) = response.body else {
             return Err(ClientError::UnexpectedResponse(
@@ -1190,13 +1239,17 @@ impl DbProxyClient {
         &self,
         requests: &[SnapshotWrite],
     ) -> Result<Vec<BatchSnapshotEnqueueOutcome>, ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         validate_snapshot_write_batch(requests)?;
         let response = self
-            .call(wire::request_envelope::Body::EnqueueMultiSnapshot(
-                wire::EnqueueMultiSnapshotRequest {
-                    writes: requests.iter().map(Into::into).collect(),
-                },
-            ))
+            .call(
+                budget,
+                wire::request_envelope::Body::EnqueueMultiSnapshot(
+                    wire::EnqueueMultiSnapshotRequest {
+                        writes: requests.iter().map(Into::into).collect(),
+                    },
+                ),
+            )
             .await?;
         let Some(wire::response_envelope::Body::EnqueueMultiSnapshot(result)) = response.body
         else {
@@ -1226,10 +1279,12 @@ impl DbProxyClient {
         &self,
         request: TransactionalWrite,
     ) -> Result<TransactionalWriteOutcome, ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         let response = self
-            .call(wire::request_envelope::Body::ApplyTransaction(
-                (&request).into(),
-            ))
+            .call(
+                budget,
+                wire::request_envelope::Body::ApplyTransaction((&request).into()),
+            )
             .await?;
         let Some(wire::response_envelope::Body::ApplyTransaction(result)) = response.body else {
             return Err(ClientError::UnexpectedResponse(
@@ -1259,13 +1314,15 @@ impl DbProxyClient {
         operation_id: &str,
         record: &RecordKey,
     ) -> Result<Option<TransactionReceipt>, ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         let response = self
-            .call(wire::request_envelope::Body::LoadTransaction(
-                wire::LoadTransactionRequest {
+            .call(
+                budget,
+                wire::request_envelope::Body::LoadTransaction(wire::LoadTransactionRequest {
                     operation_id: operation_id.to_string(),
                     record: Some(record.into()),
-                },
-            ))
+                }),
+            )
             .await?;
         let Some(wire::response_envelope::Body::LoadTransaction(result)) = response.body else {
             return Err(ClientError::UnexpectedResponse(
@@ -1314,6 +1371,7 @@ impl DbProxyClient {
         request: MultiRecordTransactionalWrite,
         effects: Option<tiangz_dbproxy_core::CommitEffects>,
     ) -> Result<MultiRecordTransactionalWriteOutcome, ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         if request.writes.is_empty() || request.writes.len() > MAX_TRANSACTION_RECORDS {
             return Err(ClientError::InvalidConfig(
                 "multi-record transaction size is outside the protocol limit",
@@ -1342,7 +1400,7 @@ impl DbProxyClient {
                 },
             )
         };
-        let response = self.call(body).await?;
+        let response = self.call(budget, body).await?;
         let result = match response.body {
             Some(wire::response_envelope::Body::ApplyMultiTransaction(r)) if !is_commit => r,
             Some(wire::response_envelope::Body::CommitRecords(r)) if is_commit => r,
@@ -1393,6 +1451,7 @@ impl DbProxyClient {
         operation_id: &str,
         records: &[RecordKey],
     ) -> Result<Option<MultiRecordTransactionReceipt>, ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         if operation_id.trim().is_empty()
             || records.is_empty()
             || records.len() > MAX_TRANSACTION_RECORDS
@@ -1402,12 +1461,15 @@ impl DbProxyClient {
             ));
         }
         let response = self
-            .call(wire::request_envelope::Body::LoadMultiTransaction(
-                wire::LoadMultiTransactionRequest {
-                    operation_id: operation_id.to_string(),
-                    records: records.iter().map(Into::into).collect(),
-                },
-            ))
+            .call(
+                budget,
+                wire::request_envelope::Body::LoadMultiTransaction(
+                    wire::LoadMultiTransactionRequest {
+                        operation_id: operation_id.to_string(),
+                        records: records.iter().map(Into::into).collect(),
+                    },
+                ),
+            )
             .await?;
         let Some(wire::response_envelope::Body::LoadMultiTransaction(result)) = response.body
         else {
@@ -1446,12 +1508,14 @@ impl DbProxyClient {
     }
 
     pub async fn load_trade(&self, trade_id: &str) -> Result<Option<TradeEnvelope>, ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         let response = self
-            .call(wire::request_envelope::Body::LoadTrade(
-                wire::LoadTradeRequest {
+            .call(
+                budget,
+                wire::request_envelope::Body::LoadTrade(wire::LoadTradeRequest {
                     trade_id: trade_id.to_string(),
-                },
-            ))
+                }),
+            )
             .await?;
         let Some(wire::response_envelope::Body::LoadTrade(result)) = response.body else {
             return Err(ClientError::UnexpectedResponse(
@@ -1469,12 +1533,14 @@ impl DbProxyClient {
         &self,
         request: TradeTransaction,
     ) -> Result<TradeTransactionOutcome, ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         let operation_id = request.operation_id.clone();
         let trade_id = request.transition.trade_id.clone();
         let response = self
-            .call(wire::request_envelope::Body::ApplyTradeTransaction(
-                (&request).into(),
-            ))
+            .call(
+                budget,
+                wire::request_envelope::Body::ApplyTradeTransaction((&request).into()),
+            )
             .await?;
         let Some(wire::response_envelope::Body::ApplyTradeTransaction(result)) = response.body
         else {
@@ -1512,13 +1578,17 @@ impl DbProxyClient {
         operation_id: &str,
         trade_id: &str,
     ) -> Result<Option<TradeReceipt>, ClientError> {
+        let budget = RequestBudget::new(self.config.request_timeout)?;
         let response = self
-            .call(wire::request_envelope::Body::LoadTradeTransaction(
-                wire::LoadTradeTransactionRequest {
-                    operation_id: operation_id.to_string(),
-                    trade_id: trade_id.to_string(),
-                },
-            ))
+            .call(
+                budget,
+                wire::request_envelope::Body::LoadTradeTransaction(
+                    wire::LoadTradeTransactionRequest {
+                        operation_id: operation_id.to_string(),
+                        trade_id: trade_id.to_string(),
+                    },
+                ),
+            )
             .await?;
         let Some(wire::response_envelope::Body::LoadTradeTransaction(result)) = response.body
         else {
@@ -1893,7 +1963,9 @@ fn connection_outcome<T>(result: &Result<T, ClientError>) -> ClientConnectionOut
 fn request_outcome(result: &Result<wire::ResponseEnvelope, ClientError>) -> ClientRequestOutcome {
     match result {
         Ok(_) => ClientRequestOutcome::Success,
-        Err(ClientError::RequestTimeout) => ClientRequestOutcome::Timeout,
+        Err(ClientError::RequestTimeout | ClientError::RequestNotSentTimeout) => {
+            ClientRequestOutcome::Timeout
+        }
         Err(ClientError::ConnectionUnusable | ClientError::ConnectionClosed) => {
             ClientRequestOutcome::Unavailable
         }
@@ -1932,6 +2004,12 @@ mod timing_tests;
 
 #[cfg(test)]
 mod multiplex_tests;
+
+#[cfg(test)]
+mod budget_tests;
+
+#[cfg(test)]
+mod write_budget_tests;
 
 #[cfg(test)]
 mod tests {

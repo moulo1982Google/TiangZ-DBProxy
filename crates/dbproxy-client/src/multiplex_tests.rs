@@ -3,7 +3,7 @@ use tokio::{net::TcpListener, sync::mpsc};
 
 /// 握手后把收到的请求交给测试，由测试决定按什么顺序、回不回复。
 /// After the handshake, hands every request to the test, which decides whether and in which order to answer.
-async fn scripted_server() -> (
+pub(super) async fn scripted_server() -> (
     String,
     mpsc::UnboundedReceiver<wire::RequestEnvelope>,
     mpsc::UnboundedSender<u64>,
@@ -73,7 +73,7 @@ async fn scripted_server() -> (
     (endpoint, received, answer, task)
 }
 
-fn load(record: &str) -> wire::request_envelope::Body {
+pub(super) fn load(record: &str) -> wire::request_envelope::Body {
     wire::request_envelope::Body::LoadSnapshot(wire::LoadSnapshotRequest {
         allow_stale: false,
         min_revision: None,

@@ -1,4 +1,7 @@
 # TiangZ DBProxy
+
+0.7 开发中的 Rust SDK 已补齐排队、重连和重试共享的[请求总预算](docs/client-request-budget.md)；新增“确定未发送”超时分类，默认值仍为 5 秒。宿主配套与发布验证状态见该记录。
+
 [![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)
 [![nightly acceptance](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml?query=event%3Aschedule)
 [![security](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/security.yml)
