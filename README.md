@@ -2,6 +2,8 @@
 
 0.7 开发中的 Rust SDK 已补齐排队、重连和重试共享的[请求总预算](docs/client-request-budget.md)；新增“确定未发送”超时分类，默认值仍为 5 秒。TS SDK 的 [WithRequestBudget 作用域](docs/typescript-sdk.md)让 Repository 读取/重试共用期限，旧 Transport 不会被默默当作支持超时。宿主候选与发布验证状态见上述记录。
 
+0.7 增加独立[只读容量命令](docs/capacity-observation.md)，观察分区表/回执/事实/Outbox 的估算行数和物理字节，可显式开启有期限的服务器时间扫描；不执行迁移或自动清理。真实恢复契约与本轮隔离验证见[恢复验收记录](docs/v0.7-recovery-acceptance.md)。
+
 [![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)
 [![nightly acceptance](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml?query=event%3Aschedule)
 [![security](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/security.yml)

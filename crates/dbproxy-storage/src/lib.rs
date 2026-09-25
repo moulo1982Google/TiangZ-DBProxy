@@ -35,6 +35,7 @@ mod backlog;
 mod cache_ack;
 pub use cache_ack::CacheRepairAcknowledgements;
 mod cache_repair;
+pub mod capacity;
 mod latency;
 mod postgres_request;
 pub use postgres_request::{
