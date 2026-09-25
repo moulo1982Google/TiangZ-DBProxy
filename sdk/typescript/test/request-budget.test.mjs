@@ -57,7 +57,10 @@ test("payload ownership and the idempotency identity survive retry within a budg
 });
 
 test("old transports keep normal calls but cannot silently claim bounded scopes", async () => {
-  const client = new DbProxyClient({ load: async () => undefined });
+  const client = new DbProxyClient({ load: async (...args) => {
+    assert.deepEqual(args, [record]); // An omitted option must not add an observable undefined argument.
+    return undefined;
+  } });
   assert.equal(await client.Load(record), undefined);
   assert.throws(() => client.WithRequestBudget(), /request timeout/i);
 });

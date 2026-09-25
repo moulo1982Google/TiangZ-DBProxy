@@ -43,6 +43,8 @@ SDK 的校验和防御性复制也消耗预算；旧调用不自动产生幂等�
 
 验证：`npm run test:typescript` 29 条通过，新增 8 条包含并发/嵌套、16 类调用传递、过期拒绝、单调时钟及防御性副本；6 个初始接口红测与绿色输出在 `target/test-results/v0.7-ts-budget-api-{red,green}.log`。版本号暂未发布为 0.7；候选由 npm pack 正规构建供明确选择的宿主联调，不能将此状态写成已经发布。
 
+兼容性补充：未创建预算范围时，Transport 的参数个数也保持原状，不附加一个可观察的 undefined 参数；宿主 CommitRecords 的既有断言在联合测试中检出了该差异。原断言保留，增加普通 SDK 调用参数形状检查，29 条复测通过（`target/test-results/v0.7-ts-budget-legacy-args.log`）。
+
 SDK不会自动生成或替换`requestId`、`operationId`。超时表示请求结果未知，重试必须复用原ID和完全相同的Payload。Transport可以重连后重放同一个请求，但不能创建新幂等ID。
 
 如果调用方进程在事务提交后、应用内存状态或返回RPC前崩溃，恢复路径可以用`LoadTransaction(operationId, record)`或`LoadMultiTransaction(operationId, records)`读取第一次提交保存的`newRevision/result`。多记录查询必须提供原始完整记录集合；同一个operationId不能换一组记录读取，也不能用回执查询替代正常的业务校验。
