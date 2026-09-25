@@ -22,6 +22,6 @@
 
 部分写的取消/超时使用 64 字节 Tokio duplex 流，先读取编码帧头并确认仍持有写锁，再验证截断、EOF 和写端不可复用。最初尝试本机 TCP 配置小缓冲，在该 Windows 环境中仍观察到整段写入已完成、进入响应等待，故不能把那次超时记为“部分写”；失败日志 `target/test-results/v0.7-write-budget-fixture.log`、`v0.7-write-budget-controlled.log` 保留。这个夹具修正不改变 Socket 默认值，也不放宽断言；它证明通用写路径的 RAII，不替代操作系统慢写验收。
 
-当前 TS SDK 是可插拔 Transport 的校验/复制层。TiangZ Host、Repository 的外层预算和重试责任仍需配套收口；不能把本 Rust SDK 结果称为完整宿主端到端验收。没有运行真实 PostgreSQL/Redis、服务故障或长稳，没有改变网络协议、Generated 或依赖锁。
+后续 TS 候选已补充独立预算作用域、单调时钟与可选 Transport 剩余预算参数，29 条通过，详见 [TS SDK](typescript-sdk.md)。TiangZ 候选 Repository 的读取/迁移/同 ID 重试共享范围；Host 已验证裸 V8 + 隔离 TCP 的超时回收。其 npm 候选与默认已发布 tag 分开记录，Rust SDK 联合链接及发布依赖仍需最终冻结；不能把本 SDK 结果称为真实存储端到端验收。没有运行真实 PostgreSQL/Redis、服务故障或长稳，没有改变网络协议、Generated 或依赖锁。
 
 同轮完整工作区复跑 `cargo test --workspace --locked` 为 200 条通过、47 条 ignored，`cargo clippy --workspace --all-targets --locked -- -D warnings` 通过；日志分别为 `target/test-results/v0.7-budget-workspace.log`、`target/test-results/v0.7-budget-clippy.log`。

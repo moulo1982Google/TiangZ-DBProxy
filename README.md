@@ -1,6 +1,6 @@
 # TiangZ DBProxy
 
-0.7 开发中的 Rust SDK 已补齐排队、重连和重试共享的[请求总预算](docs/client-request-budget.md)；新增“确定未发送”超时分类，默认值仍为 5 秒。宿主配套与发布验证状态见该记录。
+0.7 开发中的 Rust SDK 已补齐排队、重连和重试共享的[请求总预算](docs/client-request-budget.md)；新增“确定未发送”超时分类，默认值仍为 5 秒。TS SDK 的 [WithRequestBudget 作用域](docs/typescript-sdk.md)让 Repository 读取/重试共用期限，旧 Transport 不会被默默当作支持超时。宿主候选与发布验证状态见上述记录。
 
 [![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)
 [![nightly acceptance](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml?query=event%3Aschedule)
