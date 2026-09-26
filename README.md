@@ -1,5 +1,7 @@
 # TiangZ DBProxy
 
+当前开发候选为 `0.7.0-rc.1`，服务与 Rust/TypeScript SDK 使用相同版本。本地候选尚未 push 或发布；此前正式版本与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题，协议和数据库迁移不因候选编号额外改变。
+
 0.7 开发中的 Rust SDK 已补齐排队、重连和重试共享的[请求总预算](docs/client-request-budget.md)；新增“确定未发送”超时分类，默认值仍为 5 秒。TS SDK 的 [WithRequestBudget 作用域](docs/typescript-sdk.md)让 Repository 读取/重试共用期限，旧 Transport 不会被默默当作支持超时。宿主候选与发布验证状态见上述记录。
 
 0.7 增加独立[只读容量命令](docs/capacity-observation.md)，观察分区表/回执/事实/Outbox 的估算行数和物理字节，可显式开启有期限的服务器时间扫描；不执行迁移或自动清理。真实恢复契约与本轮隔离验证见[恢复验收记录](docs/v0.7-recovery-acceptance.md)。
