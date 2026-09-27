@@ -665,6 +665,7 @@ fn retryable_operation_error(error: &ClientError) -> bool {
         error,
         ClientError::ConnectTimeout
             | ClientError::RequestTimeout
+            | ClientError::RequestNotSentTimeout
             | ClientError::ConnectionUnusable
             | ClientError::ConnectionClosed
     ) || matches!(error, ClientError::Protocol(ProtocolError::Io(error)) if matches!(error.kind(),
@@ -943,6 +944,7 @@ mod tests {
         let counters = Counters::default();
         for error in [
             ClientError::RequestTimeout,
+            ClientError::RequestNotSentTimeout,
             ClientError::ConnectionClosed,
             ClientError::Protocol(ProtocolError::Io(
                 std::io::ErrorKind::ConnectionReset.into(),

@@ -18,6 +18,10 @@
 
 ## 实际验证与限制
 
+2026-09-27 联合故障长稳在暂停两个 DBProxy 写入者、取证 AOF 积压时，验收客户端收到 `RequestNotSentTimeout`。SDK 按上表返回确定未发送，旧 `dbproxy_fault_soak` 却只匹配 `RequestTimeout`，将合法预算到期误计为永久契约错误并终止整轮；`dbproxy_relay_soak` 有相同遗漏。修复仅为两个验收程序补齐此分支，没有增大五秒预算、吞掉冲突/协议错误、重置操作号或修改服务端。故障窗口外的可用性错误、旧读/缺失、账本与最终对账门槛保持原样。
+
+先在旧实现补入两个回归断言，分别实际失败（`temp/v0.7-soak-budget-red.log`、`temp/v0.7-relay-budget-red.log`）；修复后五条验收程序测试通过，完整 `cargo test --workspace --locked` 为 204 通过、48 ignored，格式和全目标 Clippy 通过，TS SDK 29 条通过。命令分别为 `cargo test --locked --bin dbproxy_fault_soak --bin dbproxy_relay_soak`、`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`npm run test:typescript`，对应日志前缀 `temp/v0.7-soak-budget-`。SDK 的 28 条预算/网络回归包含在工作区结果中。Rust 验收客户端必须重新构建后才可复跑；不能用原二进制或把这次约 22 分 40 秒的失败拼接为完整 30 分钟。原始联合失败及清理后只读积压证据在 TiangZ 工程 `temp/v0.7-joint-soak-r2/joint-uOk7T5/` 与 `temp/v0.7-joint-review-30-r2/`；40 条积压前后相同只作补充证据，不替代中断的故障窗口、最终对账或完整时长。
+
 2026-09-26：最初 5 个隔离 TCP 反例全部在旧实现失败，证据 `target/test-results/v0.7-budget-red.log`。完成修复和补充验证后，`cargo test --locked -p tiangz-dbproxy-client` 共 28 条通过，证据 `target/test-results/v0.7-budget-green-complete.log`，包含排队、写锁、共享响应预算、重连锁、候选握手、过期 ready 路径、结果未知保留及既有多路复用/连接恢复测试。
 
 部分写的取消/超时使用 64 字节 Tokio duplex 流，先读取编码帧头并确认仍持有写锁，再验证截断、EOF 和写端不可复用。最初尝试本机 TCP 配置小缓冲，在该 Windows 环境中仍观察到整段写入已完成、进入响应等待，故不能把那次超时记为“部分写”；失败日志 `target/test-results/v0.7-write-budget-fixture.log`、`v0.7-write-budget-controlled.log` 保留。这个夹具修正不改变 Socket 默认值，也不放宽断言；它证明通用写路径的 RAII，不替代操作系统慢写验收。
