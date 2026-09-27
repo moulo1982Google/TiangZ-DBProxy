@@ -24,6 +24,10 @@ use tiangz_dbproxy_storage::{
 
 const DEFAULT_CONFIG_PATH: &str = "configs/local.json";
 
+#[cfg(test)]
+#[path = "config_durability_tests.rs"]
+mod durability_tests;
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DbProxyConfig {
@@ -185,6 +189,46 @@ pub struct BacklogSection {
     /// crash may lose about one second of acknowledged enqueues.
     #[serde(default)]
     pub enqueue_ack: EnqueueAckSetting,
+    #[serde(default = "default_enqueue_queue_wait_timeout_ms")]
+    pub enqueue_queue_wait_timeout_ms: u64,
+    #[serde(default = "default_enqueue_timeout_ms")]
+    pub enqueue_timeout_ms: u64,
+    #[serde(default = "default_aof_ack_timeout_ms")]
+    pub aof_ack_timeout_ms: u64,
+    #[serde(default = "default_redis_response_timeout_ms")]
+    pub redis_response_timeout_ms: u64,
+}
+
+fn default_enqueue_queue_wait_timeout_ms() -> u64 {
+    2_000
+}
+fn default_enqueue_timeout_ms() -> u64 {
+    4_500
+}
+pub(crate) fn default_aof_ack_timeout_ms() -> u64 {
+    tiangz_dbproxy_storage::DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS
+}
+pub(crate) fn default_redis_response_timeout_ms() -> u64 {
+    tiangz_dbproxy_storage::DEFAULT_REDIS_RESPONSE_TIMEOUT_MS
+}
+
+impl BacklogSection {
+    fn enqueue_config(&self) -> Result<tiangz_dbproxy_storage::EnqueueBatchConfig, ConfigError> {
+        let config = tiangz_dbproxy_storage::EnqueueBatchConfig {
+            ack: self.enqueue_ack.into(),
+            max_queue_wait: Duration::from_millis(self.enqueue_queue_wait_timeout_ms),
+            total_timeout: Duration::from_millis(self.enqueue_timeout_ms),
+            durability: tiangz_dbproxy_storage::RedisDurabilityConfig {
+                aof_ack_timeout: Duration::from_millis(self.aof_ack_timeout_ms),
+                response_timeout: Duration::from_millis(self.redis_response_timeout_ms),
+            },
+            ..Default::default()
+        };
+        config
+            .validate()
+            .map_err(|error| ConfigError(format!("backlog: {error}")))?;
+        Ok(config)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -212,6 +256,10 @@ impl Default for BacklogSection {
             idle_delay_ms: default_backlog_idle_delay_ms(),
             failure_delay_ms: default_backlog_failure_delay_ms(),
             enqueue_ack: EnqueueAckSetting::default(),
+            enqueue_queue_wait_timeout_ms: default_enqueue_queue_wait_timeout_ms(),
+            enqueue_timeout_ms: default_enqueue_timeout_ms(),
+            aof_ack_timeout_ms: default_aof_ack_timeout_ms(),
+            redis_response_timeout_ms: default_redis_response_timeout_ms(),
         }
     }
 }
@@ -296,6 +344,7 @@ pub struct ResolvedDbProxyConfig {
     pub backlog_idle_delay: Duration,
     pub backlog_failure_delay: Duration,
     pub backlog_enqueue_ack: tiangz_dbproxy_storage::EnqueueAck,
+    pub backlog_enqueue_config: tiangz_dbproxy_storage::EnqueueBatchConfig,
     pub cache_repair: ResolvedRetryQueue,
     pub outbox: ResolvedRetryQueue,
     pub outbox_relay: crate::relay_config::ResolvedOutboxRelay,
@@ -376,6 +425,7 @@ impl fmt::Debug for ResolvedDbProxyConfig {
             .field("storage_shards", &self.storage.shards())
             .field("backlog_workers", &self.backlog_workers)
             .field("backlog_enqueue_ack", &self.backlog_enqueue_ack)
+            .field("backlog_enqueue_config", &self.backlog_enqueue_config)
             .field("cache_repair_workers", &self.cache_repair.workers)
             .field("outbox_workers", &self.outbox.workers)
             .field("observability_listen_addr", &self.observability_listen_addr)
@@ -504,6 +554,7 @@ impl DbProxyConfig {
         require_positive("backlog.leaseMs", self.backlog.lease_ms)?;
         require_positive("backlog.idleDelayMs", self.backlog.idle_delay_ms)?;
         require_positive("backlog.failureDelayMs", self.backlog.failure_delay_ms)?;
+        let backlog_enqueue_config = self.backlog.enqueue_config()?;
         let cache_repair = resolve_retry_queue("cacheRepair", self.cache_repair)?;
         let outbox = resolve_retry_queue("outbox", self.outbox)?;
         let outbox_relay = self.outbox_relay.resolve(outbox.lease_ms, &environment)?;
@@ -643,6 +694,7 @@ impl DbProxyConfig {
             backlog_idle_delay: Duration::from_millis(self.backlog.idle_delay_ms),
             backlog_failure_delay: Duration::from_millis(self.backlog.failure_delay_ms),
             backlog_enqueue_ack: self.backlog.enqueue_ack.into(),
+            backlog_enqueue_config,
             cache_repair,
             outbox,
             outbox_relay,

@@ -7,10 +7,10 @@
 | API/worker | 成功代表什么 |
 | --- | --- |
 | `SaveSnapshot` / `ApplyTransaction` / `ApplyMultiTransaction` / `ApplyTradeTransaction` | PostgreSQL 权威事务已经提交；Redis 缓存可以稍后由持久修复队列补齐 |
-| `EnqueueSnapshot` / `EnqueueMultiSnapshot` | Redis 已执行入队脚本，并通过 `WAITAOF 1 0 2000` 确认本机 AOF；尚不代表 PostgreSQL 已提交。部署配置 `backlog.enqueueAck: "memory"` 时不等待 `WAITAOF`，只代表已写入 Redis 内存，Redis 崩溃可能丢失约1秒已确认入队。落库带入队时的防护序号，迟到的旧值不会覆盖已落库的新值 |
+| `EnqueueSnapshot` / `EnqueueMultiSnapshot` | Redis 已执行入队脚本，并通过 `WAITAOF 1 0 timeout` 确认本机 AOF（默认上限 2000ms，受剩余总预算限制）；尚不代表 PostgreSQL 已提交。部署配置 `backlog.enqueueAck: "memory"` 时不等待 `WAITAOF`，只代表已写入 Redis 内存，Redis 崩溃可能丢失约1秒已确认入队。落库带入队时的防护序号，迟到的旧值不会覆盖已落库的新值 |
 | Outbox worker 的 PostgreSQL ACK | 事件已写入 Redis Stream，且本机 Redis AOF 已确认；仍可能至少一次重复投递 |
 
-如果 Redis 未启用 AOF，`WAITAOF` 会返回 Redis 错误；如果已启用但 2 秒内没有本机确认，则返回 `RedisAofNotDurable`。两种情况都拒绝可靠 ACK，不会把易失内存写入伪装成持久成功。连接管理器的响应窗口是 3 秒，刻意比 2 秒 AOF 判定多留 1 秒网络与调度余量。笔记本轻量模式默认关闭 AOF，因此测试这两个路径时必须使用 `-Aof`。
+如果 Redis 未启用 AOF，`WAITAOF` 会返回 Redis 错误；如果已启用但配置的等待期限内没有本机确认，则返回 `RedisAofNotDurable`。两种情况都拒绝可靠 ACK，不会把易失内存写入伪装成持久成功。0.7 的入队与 Outbox 分别配置 AOF/I/O 等待并消费各自原总期限，默认仍为 2 秒/3 秒，详见[可靠 Redis 预算](redis-durability-budget.md)。增加 AOF 等待必须一起评估总预算和 SDK 配置。笔记本轻量模式默认关闭 AOF，因此测试这两个路径时必须使用 `-Aof`。
 
 ## 自动恢复机制
 
@@ -26,7 +26,7 @@ Redis 保存 Payload、pending 索引和 processing lease。worker 领取后写 
 
 交易事务把事件写入 `dbproxy_outbox`。同一 `topic + partition_key` 的交易先取得事务级分区锁，队列只领取该分区最早的未发布事件；前序死信会阻塞后序。worker 使用短租约、`SKIP LOCKED`、指数退避和死信；发布成功但 ACK 丢失会重复投递，消费者必须按 `event_id` 去重。
 
-Redis backlog、缓存和 Outbox publisher 使用 Redis `ConnectionManager`，Redis 重启后会自动重连。Backlog 的 AOF 入队、worker lease/ACK 和指标采样使用三条独立连接，某一角色的 `WAITAOF` 或重连不会持有另外两条连接的 mutex。PostgreSQL 分片与维护连接也会在发现旧连接关闭后进行最多 2 秒的有界重连；正在执行的请求仍明确失败，调用方必须用原幂等 ID 重试，下一次请求才使用新连接。这样不会在提交结果未知时由底层偷偷重放写操作。
+缓存、backlog worker 与统计连接使用 Redis `ConnectionManager`。入队与 Outbox publisher 则独占写入连接，失败/超时后丢弃，下一次提交重新连接，不在新连接确认旧写入。Backlog 的 AOF 入队、worker lease/ACK 和指标采样使用三条独立连接，某一角色的 `WAITAOF` 或重连不会持有另外两条连接的 mutex。PostgreSQL 分片与维护连接也会在发现旧连接关闭后进行最多 2 秒的有界重连；正在执行的请求仍明确失败，调用方必须用原幂等 ID 重试，下一次请求才使用新连接。这样不会在提交结果未知时由底层偷偷重放写操作。
 
 ## 本机演练
 

@@ -38,9 +38,15 @@ mod cache_repair;
 pub mod capacity;
 mod latency;
 mod postgres_request;
+mod redis_durability;
+#[cfg(test)]
+mod redis_durability_fixture;
 pub use postgres_request::{
     DEFAULT_POSTGRES_CONNECTION_WAIT_TIMEOUT_MS, DEFAULT_POSTGRES_RECONNECT_COOLDOWN_MS,
     PostgresRequestConfig,
+};
+pub use redis_durability::{
+    DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS, DEFAULT_REDIS_RESPONSE_TIMEOUT_MS, RedisDurabilityConfig,
 };
 #[cfg(test)]
 mod latency_path_tests;
@@ -90,8 +96,6 @@ pub const DEFAULT_CACHE_TTL_JITTER_MS: u64 = 30_000;
 pub const DEFAULT_CACHE_NEGATIVE_TTL_MS: u64 = 5_000;
 pub const DEFAULT_CACHE_STALE_WHILE_REVALIDATE_MS: u64 = 30_000;
 pub const DEFAULT_OUTBOX_STREAM_PREFIX: &str = "dbproxy:outbox:";
-pub const DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS: u64 = 2_000;
-pub const DEFAULT_REDIS_RESPONSE_TIMEOUT_MS: u64 = DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS + 1_000;
 pub const DEFAULT_POSTGRES_RECONNECT_TIMEOUT_MS: u64 = 2_000;
 
 static CACHE_FALLBACK_LOCK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -386,6 +390,10 @@ pub enum StorageError {
     Redis(#[from] redis::RedisError),
     #[error("Redis AOF did not acknowledge the write within {timeout_ms}ms")]
     RedisAofNotDurable { timeout_ms: u64 },
+    #[error("invalid reliable Redis budget: {0}")]
+    InvalidRedisDurabilityBudget(&'static str),
+    #[error("reliable Redis total deadline exceeded; write outcome may be unknown")]
+    RedisDurabilityDeadlineExceeded,
     #[error("snapshot cache codec error: {0}")]
     Codec(String),
     #[error("snapshot cache protocol error: {0}")]

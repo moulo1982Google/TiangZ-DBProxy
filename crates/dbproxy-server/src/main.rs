@@ -154,10 +154,7 @@ async fn prepare_backend(config: &ResolvedDbProxyConfig) -> Result<BackendPair, 
                                 ),
                             },
                         },
-                        enqueue: tiangz_dbproxy_storage::EnqueueBatchConfig {
-                            ack: config.backlog_enqueue_ack,
-                            ..Default::default()
-                        },
+                        enqueue: config.backlog_enqueue_config,
                     },
                     &config.outbox_relay,
                 )

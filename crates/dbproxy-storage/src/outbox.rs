@@ -6,13 +6,14 @@ mod publisher_tests;
 
 use std::{sync::Arc, time::Duration};
 
+use crate::redis_durability::redis_result;
 use redis::aio::MultiplexedConnection;
 use tiangz_dbproxy_core::OutboxEvent;
 use tokio::sync::Mutex;
+use tokio::time::{Instant, timeout_at};
 
 use crate::{
-    DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS, DEFAULT_REDIS_RESPONSE_TIMEOUT_MS, SharedPostgresClient,
-    StorageError,
+    RedisDurabilityConfig, SharedPostgresClient, StorageError, StorageMetrics, latency::Stage,
 };
 
 const MAX_ERROR_CHARS: usize = 1_024;
@@ -246,10 +247,38 @@ pub struct RedisOutboxPublisher {
     connection: Arc<Mutex<Option<MultiplexedConnection>>>,
     client: redis::Client,
     stream_prefix: Arc<str>,
+    durability: RedisDurabilityConfig,
+    publish_timeout: Duration,
+    metrics: Arc<StorageMetrics>,
 }
 
 impl RedisOutboxPublisher {
     pub async fn connect(url: &str, stream_prefix: &str) -> Result<Self, StorageError> {
+        Self::connect_with_config(
+            url,
+            stream_prefix,
+            RedisDurabilityConfig::default(),
+            Duration::from_secs(5),
+            Arc::new(StorageMetrics::default()),
+        )
+        .await
+    }
+
+    pub async fn connect_with_config(
+        url: &str,
+        stream_prefix: &str,
+        durability: RedisDurabilityConfig,
+        publish_timeout: Duration,
+        metrics: Arc<StorageMetrics>,
+    ) -> Result<Self, StorageError> {
+        durability.validate()?;
+        if publish_timeout <= durability.response_timeout
+            || publish_timeout > Duration::from_secs(60)
+        {
+            return Err(StorageError::InvalidRedisDurabilityBudget(
+                "outbox requires Redis I/O < publish timeout <= 60000ms",
+            ));
+        }
         if stream_prefix.trim().is_empty() {
             return Err(StorageError::QueueProtocol(
                 "outbox stream prefix is empty".to_string(),
@@ -257,12 +286,15 @@ impl RedisOutboxPublisher {
         }
         let client = redis::Client::open(url)?;
         let connection = client
-            .get_multiplexed_async_connection_with_config(&publisher_connection_config())
+            .get_multiplexed_async_connection_with_config(&durability.connection_config())
             .await?;
         Ok(Self {
             connection: Arc::new(Mutex::new(Some(connection))),
             client,
             stream_prefix: Arc::from(stream_prefix),
+            durability,
+            publish_timeout,
+            metrics,
         })
     }
 
@@ -284,13 +316,46 @@ impl RedisOutboxPublisher {
         operation_id: &str,
         trade_id: &str,
     ) -> Result<String, StorageError> {
+        let _timer = self.metrics.latency.start(Stage::OutboxTotal);
+        let deadline = Instant::now() + self.publish_timeout;
+        let result = match timeout_at(
+            deadline,
+            self.publish_before(event, stream, operation_id, trade_id, deadline),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => Err(StorageError::RedisDurabilityDeadlineExceeded),
+        };
+        if matches!(result, Err(StorageError::RedisDurabilityDeadlineExceeded)) {
+            self.metrics.latency.timed_out(Stage::OutboxTotal);
+        }
+        result
+    }
+
+    async fn publish_before(
+        &self,
+        event: &OutboxEvent,
+        stream: &str,
+        operation_id: &str,
+        trade_id: &str,
+        deadline: Instant,
+    ) -> Result<String, StorageError> {
         let mut slot = self.connection.lock().await;
+        if Instant::now() >= deadline {
+            return Err(StorageError::RedisDurabilityDeadlineExceeded);
+        }
+        let timer = self.metrics.latency.start(Stage::OutboxWrite);
         if slot.is_none() {
-            *slot = Some(
+            *slot = Some(redis_result(
                 self.client
-                    .get_multiplexed_async_connection_with_config(&publisher_connection_config())
-                    .await?,
-            );
+                    .get_multiplexed_async_connection_with_config(
+                        &self.durability.connection_config(),
+                    )
+                    .await,
+                &self.metrics,
+                Stage::OutboxWrite,
+            )?);
         }
         // Take ownership before awaiting: cancellation discards the connection instead of
         // acknowledging XADD on a possibly reconnected, unrelated WAITAOF connection.
@@ -314,34 +379,21 @@ impl RedisOutboxPublisher {
         if tiangz_dbproxy_core::EventEnvelope::from_outbox(event)?.is_some() {
             command.arg("event").arg(&event.payload);
         }
-        let stream_id: String = command.query_async(&mut connection).await?;
-        let timeout_ms = i64::try_from(DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS).unwrap_or(i64::MAX);
-        let (local, _replicas): (i64, i64) = redis::cmd("WAITAOF")
-            .arg(1)
-            .arg(0)
-            .arg(timeout_ms)
-            .query_async(&mut connection)
-            .await?;
-        if local < 1 {
-            return Err(StorageError::RedisAofNotDurable {
-                timeout_ms: DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS,
-            });
+        if Instant::now() >= deadline {
+            return Err(StorageError::RedisDurabilityDeadlineExceeded);
         }
+        let stream_id: String = redis_result(
+            command.query_async(&mut connection).await,
+            &self.metrics,
+            Stage::OutboxWrite,
+        )?;
+        drop(timer);
+        self.durability
+            .wait_for_local_aof(&mut connection, deadline, &self.metrics, Stage::OutboxAof)
+            .await?;
         *slot = Some(connection);
         Ok(stream_id)
     }
-}
-
-// 客户端超时必须大于WAITAOF的服务端等待上限；首次连接和故障后重连使用同一配置。
-// The client deadline must exceed WAITAOF's server wait, including after reconnect.
-fn publisher_connection_config() -> redis::AsyncConnectionConfig {
-    redis::AsyncConnectionConfig::new()
-        .set_connection_timeout(Some(Duration::from_millis(
-            DEFAULT_REDIS_RESPONSE_TIMEOUT_MS,
-        )))
-        .set_response_timeout(Some(Duration::from_millis(
-            DEFAULT_REDIS_RESPONSE_TIMEOUT_MS,
-        )))
 }
 
 /// 首个内置 Publisher；旧类型名保留兼容，Relay 不依赖 Redis 的具体方法。

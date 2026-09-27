@@ -1,84 +1,24 @@
 use super::*;
-use crate::{PublishMessage, Publisher};
-use std::{
-    sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
+use crate::{
+    PublishMessage, Publisher,
+    redis_durability_fixture::{Failure, Fixture, Plan},
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::TcpListener,
-    task::JoinSet,
-};
-
-// A bounded RESP fixture tests our connection/cancellation behavior, not Redis durability.
-async fn fixture(stall: bool) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("redis://{}/", listener.local_addr().unwrap());
-    let sends = Arc::new(AtomicUsize::new(0));
-    let observed = sends.clone();
-    let task = tokio::spawn(async move {
-        let mut tasks = JoinSet::new();
-        for index in 0..2 {
-            let (socket, _) = listener.accept().await.unwrap();
-            let sends = observed.clone();
-            tasks.spawn(async move {
-                let (input, mut output) = socket.into_split();
-                let mut input = BufReader::new(input);
-                loop {
-                    let mut line = String::new();
-                    if input.read_line(&mut line).await.unwrap() == 0 {
-                        break;
-                    }
-                    let count: usize = line.trim().strip_prefix('*').unwrap().parse().unwrap();
-                    let mut args = Vec::new();
-                    for _ in 0..count {
-                        line.clear();
-                        input.read_line(&mut line).await.unwrap();
-                        let size: usize = line.trim().strip_prefix('$').unwrap().parse().unwrap();
-                        let mut value = vec![0; size + 2];
-                        input.read_exact(&mut value).await.unwrap();
-                        value.truncate(size);
-                        args.push(value);
-                    }
-                    match args[0].as_slice() {
-                        b"XADD" => {
-                            assert_eq!(args[1], b"fixture.destination");
-                            sends.fetch_add(1, Ordering::SeqCst);
-                            output.write_all(b"$3\r\n1-0\r\n").await.unwrap();
-                        }
-                        b"WAITAOF" if index == 0 && stall => {
-                            let mut probe = [0];
-                            let _ = input.read(&mut probe).await;
-                            break;
-                        }
-                        b"WAITAOF" => {
-                            if index > 0 {
-                                tokio::time::sleep(Duration::from_millis(750)).await;
-                            }
-                            output
-                                .write_all(if index == 0 {
-                                    b"*2\r\n:0\r\n:0\r\n"
-                                } else {
-                                    b"*2\r\n:1\r\n:0\r\n"
-                                })
-                                .await
-                                .unwrap();
-                        }
-                        _ => output.write_all(b"+OK\r\n").await.unwrap(),
-                    }
-                }
-            });
-        }
-        while let Some(result) = tasks.join_next().await {
-            result.unwrap()
-        }
-    });
-    (url, task, sends)
-}
+use std::time::Duration;
 
 async fn publication_case(stall: bool) {
-    let (url, task, sends) = fixture(stall).await;
-    let publisher = RedisStreamPublisher::connect(&url, "legacy-prefix:")
+    let fixture = Fixture::start(Plan {
+        write: b"XADD",
+        max_ack_ms: 2000,
+        failure: if stall {
+            Failure::Stall
+        } else {
+            Failure::Unconfirmed
+        },
+        first_write_delay: Duration::ZERO,
+        second_ack_delay: Duration::from_millis(750),
+    })
+    .await;
+    let publisher = RedisStreamPublisher::connect(&fixture.url, "legacy-prefix:")
         .await
         .unwrap();
     let event = OutboxEvent {
@@ -112,12 +52,9 @@ async fn publication_case(stall: bool) {
     .unwrap()
     .unwrap();
     assert_eq!(receipt.message_id, "1-0");
-    assert_eq!(sends.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.observed.lock().unwrap().writes, [0, 1]);
     drop(publisher);
-    tokio::time::timeout(Duration::from_secs(2), task)
-        .await
-        .unwrap()
-        .unwrap();
+    fixture.finish().await;
 }
 
 #[tokio::test]
@@ -127,6 +64,116 @@ async fn aof_failure_requires_a_new_connection_and_republication() {
 #[tokio::test]
 async fn publication_timeout_discards_the_in_flight_connection() {
     publication_case(true).await;
+}
+
+#[tokio::test]
+async fn custom_aof_and_io_budgets_survive_reconnect() {
+    let fixture = Fixture::start(Plan {
+        write: b"XADD",
+        max_ack_ms: 5000,
+        failure: Failure::Disconnect,
+        first_write_delay: Duration::ZERO,
+        second_ack_delay: Duration::from_millis(3250),
+    })
+    .await;
+    let metrics = Arc::new(StorageMetrics::default());
+    let publisher = RedisOutboxPublisher::connect_with_config(
+        &fixture.url,
+        "prefix:",
+        RedisDurabilityConfig {
+            aof_ack_timeout: Duration::from_secs(5),
+            response_timeout: Duration::from_secs(6),
+        },
+        Duration::from_millis(8500),
+        metrics.clone(),
+    )
+    .await
+    .unwrap();
+    let event = OutboxEvent {
+        event_id: "same-event".into(),
+        topic: "topic".into(),
+        partition_key: "key".into(),
+        payload: vec![1],
+        occurred_at_unix_ms: 1,
+    };
+    assert!(
+        publisher
+            .publish_to(&event, "fixture.destination", "same-operation", "")
+            .await
+            .is_err()
+    );
+    publisher
+        .publish_to(&event, "fixture.destination", "same-operation", "")
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.observed.lock().unwrap().ack_ms,
+        [(0, 5000), (1, 5000)]
+    );
+    let stage = metrics
+        .latency_snapshot()
+        .into_iter()
+        .find(|s| s.stage == "outbox_aof")
+        .unwrap();
+    assert_eq!(stage.buckets.iter().sum::<u64>(), 2);
+    assert_eq!(stage.timeouts, 0, "connection failure is not a timeout");
+    drop(publisher);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn outbox_write_consumes_ack_budget_and_total_timeout_discards_connection() {
+    let fixture = Fixture::start(Plan {
+        write: b"XADD",
+        max_ack_ms: 350,
+        failure: Failure::Stall,
+        first_write_delay: Duration::from_millis(350),
+        second_ack_delay: Duration::ZERO,
+    })
+    .await;
+    let metrics = Arc::new(StorageMetrics::default());
+    let publisher = RedisOutboxPublisher::connect_with_config(
+        &fixture.url,
+        "prefix:",
+        RedisDurabilityConfig {
+            aof_ack_timeout: Duration::from_millis(350),
+            response_timeout: Duration::from_millis(400),
+        },
+        Duration::from_millis(600),
+        metrics.clone(),
+    )
+    .await
+    .unwrap();
+    let event = OutboxEvent {
+        event_id: "same-event".into(),
+        topic: "topic".into(),
+        partition_key: "key".into(),
+        payload: vec![1],
+        occurred_at_unix_ms: 1,
+    };
+    assert!(matches!(
+        publisher
+            .publish_to(&event, "fixture.destination", "same-operation", "")
+            .await,
+        Err(StorageError::RedisDurabilityDeadlineExceeded)
+    ));
+    publisher
+        .publish_to(&event, "fixture.destination", "same-operation", "")
+        .await
+        .unwrap();
+    assert!(fixture.observed.lock().unwrap().ack_ms[0].1 <= 250);
+    assert_eq!(fixture.observed.lock().unwrap().writes, [0, 1]);
+    assert_eq!(
+        metrics
+            .latency_snapshot()
+            .into_iter()
+            .find(|s| s.stage == "outbox_total")
+            .unwrap()
+            .timeouts,
+        1
+    );
+    drop(publisher);
+    fixture.finish().await;
 }
 
 #[test]

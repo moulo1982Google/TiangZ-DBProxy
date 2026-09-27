@@ -34,7 +34,7 @@ DBProxy 负责版本化记录与事件的原子提交、固定投递目标、租
 - `connectionEnv` 只保存环境变量名。禁用 Publisher 不读取密钥，也不打开连接。未来 Kafka 的具体认证/确认等参数在驱动实现时再扩展，不接受任意透传配置。
 - Publisher ID/producer 为 1–64 个 ASCII 字母、数字、`_` 或 `-`；`legacy` 保留。最多 32 个 Publisher 声明、64 个来源版本。
 - 投递目标是完整 Stream 名称，不再临时拼接前缀。`dbproxy:outbox:` 保留给旧事件，不能用于新来源。
-- `publishTimeoutMs` 为 3000–60000，并至少比租约短 1000ms；它包含连接等待、发送与 AOF 确认。期限耗尽表示结果可能未知，不表示 MQ 一定没收到。
+- `publishTimeoutMs` 为 3000–60000，并至少比租约短 1000ms；它包含连接等待、发送与 AOF 确认。期限耗尽表示结果可能未知，不表示 MQ 一定没收到。0.7 新增独立 `aofAckTimeoutMs`（默认 2000）与 `redisResponseTimeoutMs`（默认 3000），要求 `AOF < Redis I/O < publishTimeoutMs`，首次连接和重连一致；参数关系与兼容边界见[可靠 Redis 预算](redis-durability-budget.md)。
 - Memory 后端不能激活 Publisher/来源；它只验证易失记录契约，不投递到 MQ。
 - 不开放 `table` 字段，避免把未实现的多表功能伪装为可用配置。
 
@@ -92,7 +92,7 @@ Publisher ID 固定连接协议、地址和 Redis DB 编号的摘要，不保存
 
 ## 可靠性和顺序
 
-Relay 核心负责领取/失败/死信；`Publisher` 只负责发送与确认。Redis 实现使用独立的受控连接：`XADD` 后在同一连接执行 `WAITAOF 1 0 2000`；只有本地 AOF 确认成功才尝试 PostgreSQL ACK。发送错误或取消会丢弃该连接，再次投递重新建立连接，避免在自动重连后的另一连接上确认旧写入。
+Relay 核心负责领取/失败/死信；`Publisher` 只负责发送与确认。Redis 实现使用独立的受控连接：`XADD` 后在同一连接执行 `WAITAOF 1 0 timeout`，上限为配置 AOF 等待与发布剩余预算的较小者；只有本地 AOF 确认成功才尝试 PostgreSQL ACK。发送错误或取消会丢弃该连接，再次投递重新建立连接，避免在自动重连后的另一连接上确认旧写入。
 
 这是至少一次，不是恰好一次：MQ 已收到而 PG ACK 丢失时会重复投递。本地 AOF 确认不是 Redis 多副本容灾保证，也不是消费者处理完成。
 

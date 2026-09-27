@@ -320,7 +320,16 @@ impl StorageBackend {
                 .await?;
             outbox_publishers.insert(
                 id.to_string(),
-                Arc::new(RedisOutboxPublisher::connect(url, DEFAULT_OUTBOX_STREAM_PREFIX).await?),
+                Arc::new(
+                    RedisOutboxPublisher::connect_with_config(
+                        url,
+                        DEFAULT_OUTBOX_STREAM_PREFIX,
+                        relay.durability,
+                        Duration::from_millis(relay.publish_timeout_ms),
+                        metrics.clone(),
+                    )
+                    .await?,
+                ),
             );
         }
         for route in &relay.routes {
@@ -339,7 +348,12 @@ impl StorageBackend {
         Ok(Self {
             shards,
             authoritative_read_namespaces: Vec::new(),
-            backlog: RedisSnapshotBacklog::connect_with_config(redis_url, config.enqueue).await?,
+            backlog: RedisSnapshotBacklog::connect_with_metrics(
+                redis_url,
+                config.enqueue,
+                metrics.clone(),
+            )
+            .await?,
             cache_repairs,
             cache_acknowledgements,
             outbox,

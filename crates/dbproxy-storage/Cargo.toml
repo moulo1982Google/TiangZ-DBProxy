@@ -1,6 +1,6 @@
 [package]
 name = "tiangz-dbproxy-storage"
-version = "0.7.0-rc.1"
+version = "0.7.0-rc.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,3 +19,6 @@ tokio.workspace = true
 tokio-postgres.workspace = true
 tracing.workspace = true
 tiangz-dbproxy-core = { path = "../dbproxy-core" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

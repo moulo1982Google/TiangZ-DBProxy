@@ -92,6 +92,10 @@
         "leaseMs": { "type": "integer", "minimum": 1, "default": 30000 },
         "idleDelayMs": { "type": "integer", "minimum": 1, "default": 20 },
         "failureDelayMs": { "type": "integer", "minimum": 1, "default": 1000 },
+        "enqueueQueueWaitTimeoutMs": { "type": "integer", "minimum": 1, "maximum": 59999, "default": 2000, "description": "组提交入口到开始写入的排队上限；过期且尚未开始的请求不写入。" },
+        "enqueueTimeoutMs": { "type": "integer", "minimum": 1, "maximum": 60000, "default": 4500, "description": "组提交入口起排队、连接、写入、AOF 共享的总预算；必须大于 Redis I/O，且大于排队与 AOF 上限之和。SDK 总预算须另留网络和准入余量。" },
+        "aofAckTimeoutMs": { "type": "integer", "minimum": 1, "maximum": 59999, "default": 2000, "description": "WAITAOF 本地确认上限；实际等待受入队剩余总预算限制。不会降低 AOF 确认等级。" },
+        "redisResponseTimeoutMs": { "type": "integer", "minimum": 2, "maximum": 60000, "default": 3000, "description": "入队连接和单次 Redis I/O 上限；必须大于 aofAckTimeoutMs。" },
         "enqueueAck": {
           "enum": ["aof", "memory"],
           "default": "aof",
@@ -111,6 +115,8 @@
       "type": "object", "additionalProperties": false,
       "properties": {
         "publishTimeoutMs": { "type": "integer", "minimum": 3000, "maximum": 60000, "default": 5000, "description": "必须比 outbox.leaseMs 至少少 1000ms。" },
+        "aofAckTimeoutMs": { "type": "integer", "minimum": 1, "maximum": 59999, "default": 2000, "description": "Outbox 独立的本地 AOF 确认上限，受发布剩余总预算限制。" },
+        "redisResponseTimeoutMs": { "type": "integer", "minimum": 2, "maximum": 59999, "default": 3000, "description": "必须大于 aofAckTimeoutMs 且小于 publishTimeoutMs；首次连接与重连一致。" },
         "defaultPublisher": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
         "publishers": {
           "type": "array", "maxItems": 32,
