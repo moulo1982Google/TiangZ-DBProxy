@@ -19,6 +19,10 @@ use tiangz_dbproxy_core::{
 use tiangz_dbproxy_protocol::{MAX_BATCH_SNAPSHOT_WRITES, ProtocolError, wire};
 use tokio::{task::JoinSet, time::Instant};
 
+#[path = "fault_soak/seed.rs"]
+mod seed;
+use seed::seed_and_warm_players;
+
 type DynError = Box<dyn Error + Send + Sync>;
 
 #[derive(Clone)]
@@ -310,86 +314,6 @@ fn validate_observed_consistency(counters: CounterSnapshot) -> Result<(), DynErr
         )
         .into())
     }
-}
-
-async fn seed_and_warm_players(
-    pool: &DbProxyClientPool,
-    players: usize,
-    run_id: u128,
-) -> Result<Vec<PlayerState>, DynError> {
-    let mut tasks = JoinSet::new();
-    for index in 0..players {
-        let pool = pool.clone();
-        tasks.spawn(async move {
-            let direct_record =
-                RecordKey::new("fault-soak-player", format!("{run_id}:{index}:direct"))?;
-            let queued_record =
-                RecordKey::new("fault-soak-player", format!("{run_id}:{index}:queued"))?;
-            let direct_revision = seed_snapshot(
-                &pool,
-                format!("soak:seed:{run_id}:{index}:direct"),
-                direct_record.clone(),
-                payload(index, 0, "direct"),
-                run_id as u64,
-            )
-            .await?;
-            seed_snapshot(
-                &pool,
-                format!("soak:seed:{run_id}:{index}:queued"),
-                queued_record.clone(),
-                payload(index, 0, "queued"),
-                run_id as u64,
-            )
-            .await?;
-            if pool.load(&direct_record).await?.is_none()
-                || pool.load(&queued_record).await?.is_none()
-            {
-                return Err::<_, DynError>(
-                    "seeded snapshot disappeared during cache warmup".into(),
-                );
-            }
-            Ok::<_, DynError>(PlayerState {
-                index,
-                direct_record,
-                queued_record,
-                direct_revision,
-                transaction_sequence: 0,
-                trade_sequence: 0,
-                pending_transaction: None,
-                pending_trade: None,
-            })
-        });
-    }
-    let mut states = Vec::with_capacity(players);
-    while let Some(joined) = tasks.join_next().await {
-        states.push(joined??);
-    }
-    states.sort_unstable_by_key(|state| state.index);
-    Ok(states)
-}
-
-async fn seed_snapshot(
-    pool: &DbProxyClientPool,
-    request_id: String,
-    record: RecordKey,
-    payload: Vec<u8>,
-    updated_at_unix_ms: u64,
-) -> Result<Revision, DynError> {
-    let outcome = pool
-        .save(SnapshotWrite {
-            request_id,
-            record,
-            schema: "tiangz.fault-soak.player".to_string(),
-            schema_version: 1,
-            payload,
-            expected_revision: Some(Revision::ZERO),
-            updated_at_unix_ms,
-        })
-        .await?;
-    Ok(match outcome {
-        tiangz_dbproxy_core::SnapshotWriteOutcome::Applied { revision }
-        | tiangz_dbproxy_core::SnapshotWriteOutcome::Duplicate { revision } => revision,
-    })
 }
 
 async fn run_player(

@@ -18,6 +18,10 @@
 
 ## 实际验证与限制
 
+同日上午，第一次重建后的复跑在 `SOAK_READY` 前的并发预置阶段收到 `StorageUnavailable`：服务端两秒 PostgreSQL 连接排队预算到期，日志明确本次操作尚未发送 SQL，旧预置函数却直接退出。将预置/预热集中到 `src/bin/fault_soak/seed.rs`，所有玩家共享 90 秒绝对期限；只对既有暂时错误重试，写入请求在循环外构造，ID、记录和完整载荷保持不变。请求中的预算不调大；外层到期取消尚未完成的初始化 future，永久错误与预热读到缺失仍立即失败。正式负载在预置全部成功后才起表，负载计数/故障窗口/数据断言不变，初始化失败不记任何长稳时间。日志保留有限 `SOAK_SEED_RETRY` 及恢复记录。
+
+新增三条初始化回归覆盖暂时错误恢复、永久错误不重试、过期不再发起、在途取消和同一截止时间不续期；工具合计八条通过，工作区 207 通过/48 ignored，格式与全目标 Clippy 通过。日志 `temp/v0.7-soak-seed-{green,workspace,fmt,clippy}.log`。首次 Clippy 拒绝测试模块后再定义生产项，已将测试模块移至文件末尾，没有关闭 lint，初次日志另存 `temp/v0.7-soak-seed-clippy-layout-failure.log`。真实失败记录在 TiangZ 的 `temp/v0.7-joint-soak-r3/joint-fXDpZh/`；仍须重新编译 Rust 工具并完整复跑，不能把初始化重试算作故障容错或正式时长。
+
 2026-09-27 联合故障长稳在暂停两个 DBProxy 写入者、取证 AOF 积压时，验收客户端收到 `RequestNotSentTimeout`。SDK 按上表返回确定未发送，旧 `dbproxy_fault_soak` 却只匹配 `RequestTimeout`，将合法预算到期误计为永久契约错误并终止整轮；`dbproxy_relay_soak` 有相同遗漏。修复仅为两个验收程序补齐此分支，没有增大五秒预算、吞掉冲突/协议错误、重置操作号或修改服务端。故障窗口外的可用性错误、旧读/缺失、账本与最终对账门槛保持原样。
 
 先在旧实现补入两个回归断言，分别实际失败（`temp/v0.7-soak-budget-red.log`、`temp/v0.7-relay-budget-red.log`）；修复后五条验收程序测试通过，完整 `cargo test --workspace --locked` 为 204 通过、48 ignored，格式和全目标 Clippy 通过，TS SDK 29 条通过。命令分别为 `cargo test --locked --bin dbproxy_fault_soak --bin dbproxy_relay_soak`、`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`npm run test:typescript`，对应日志前缀 `temp/v0.7-soak-budget-`。SDK 的 28 条预算/网络回归包含在工作区结果中。Rust 验收客户端必须重新构建后才可复跑；不能用原二进制或把这次约 22 分 40 秒的失败拼接为完整 30 分钟。原始联合失败及清理后只读积压证据在 TiangZ 工程 `temp/v0.7-joint-soak-r2/joint-uOk7T5/` 与 `temp/v0.7-joint-review-30-r2/`；40 条积压前后相同只作补充证据，不替代中断的故障窗口、最终对账或完整时长。
