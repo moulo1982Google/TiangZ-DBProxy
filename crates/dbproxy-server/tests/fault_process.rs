@@ -4,6 +4,8 @@
 //! server force-killed repeatedly while receipt cleanup is deleting.
 //! Superusers ignore `CONNECTION LIMIT`, so tenant A logs in as a separate non-superuser role that
 //! owns its database. Every test creates its own databases and fails if they already exist.
+#[path = "support/batch_read_matrix.rs"]
+mod batch_read_matrix;
 #[path = "support/monitor_listener_failure.rs"]
 mod monitor_listener_failure;
 #[path = "support/outbox_publish_crash.rs"]
