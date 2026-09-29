@@ -261,6 +261,179 @@ async fn insert_expired(db: &tokio_postgres::Client, namespace: &str, rows: i64)
 }
 
 #[tokio::test]
+#[ignore = "F07: isolated PG, real cleanup worker, row/table locks and the production 60-second retry"]
+async fn f07_cleanup_skips_rows_and_backs_off_on_table_lock() {
+    let env = env();
+    let db = format!("{}_f07", env.run_id);
+    let dir = env.artifacts.join("f07");
+    std::fs::create_dir_all(&dir).unwrap();
+    let admin_user: String = sql(&format!("{}/postgres", env.admin_base))
+        .await
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    create_database(&env.admin_base, &db, &admin_user).await;
+    let url = format!("{}/{db}", env.admin_base);
+    let admin = sql(&url).await;
+    let endpoint = free_port();
+    let observability = free_port();
+    tenant_config(&dir, "A", &endpoint, &observability);
+    let deployment = deployment(&dir, &endpoint, &["A"]);
+    let mut seed = spawn(&deployment, &dir, "seed", &env, &url, &url);
+    let client_a = client(&endpoint, TOKEN_A, &mut seed).await;
+    let request = write("f07-business", "protected", 42);
+    assert_eq!(
+        client_a.save(request.clone()).await.unwrap(),
+        SnapshotWriteOutcome::Applied {
+            revision: Revision(1)
+        }
+    );
+    drop(client_a);
+    drop(seed);
+
+    insert_expired(&admin, "f07-expired", 1101).await;
+    admin.execute(
+        "INSERT INTO dbproxy_idempotency(request_id,namespace,record_key,schema_name,schema_version,payload,revision,recorded_at)
+         SELECT 'f07-recent-'||n,'f07-recent',n::text,'test',1,'',1,clock_timestamp() FROM generate_series(1,100) n", &[]
+    ).await.unwrap();
+    let locker = sql(&url).await;
+    locker.batch_execute("BEGIN").await.unwrap();
+    let locked = locker.query(
+        "SELECT request_id FROM dbproxy_idempotency WHERE namespace='f07-expired' ORDER BY request_id LIMIT 101 FOR UPDATE", &[]
+    ).await.unwrap();
+    assert_eq!(locked.len(), 101);
+    let mut server = spawn(&deployment, &dir, "locks", &env, &url, &url);
+    let client_a = client(&endpoint, TOKEN_A, &mut server).await;
+    let expired = "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f07-expired'";
+    let skip_time = wait_until(
+        Duration::from_secs(15),
+        "unlocked receipts to be deleted",
+        || async { count(&admin, expired).await == 101 },
+    )
+    .await;
+    let row_metrics = metrics(&observability).await;
+    assert_eq!(
+        metric_sum(&row_metrics, "dbproxy_receipt_cleanup_deleted_total"),
+        1000.0
+    );
+    assert_eq!(
+        metric_sum(&row_metrics, "dbproxy_receipt_cleanup_failures_total"),
+        0.0
+    );
+    locker.batch_execute("COMMIT").await.unwrap();
+    wait_until(
+        Duration::from_secs(70),
+        "released rows to be deleted",
+        || async { count(&admin, expired).await == 0 },
+    )
+    .await;
+
+    // EXCLUSIVE blocks the cleanup's RowExclusive lock but allows our count queries.
+    // Only the test connection holds this lock; no production retry interval is shortened.
+    locker
+        .batch_execute("BEGIN; LOCK TABLE dbproxy_idempotency IN EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let before = metrics(&observability).await;
+    let initial_failures = metric_sum(&before, "dbproxy_receipt_cleanup_failures_total");
+    wait_until(
+        Duration::from_secs(70),
+        "table-lock failure metric",
+        || async {
+            metric_sum(
+                &metrics(&observability).await,
+                "dbproxy_receipt_cleanup_failures_total",
+            ) > initial_failures
+        },
+    )
+    .await;
+    let failure_at = Instant::now();
+    let failed_metrics = metrics(&observability).await;
+    assert_eq!(
+        metric_sum(&failed_metrics, "dbproxy_receipt_cleanup_failures_total"),
+        initial_failures + 1.0
+    );
+    // The ordinary authoritative read remains available while cleanup cannot lock its table.
+    for _ in 0..20 {
+        let snapshot = tokio::time::timeout(Duration::from_secs(3), client_a.load(&request.record))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.revision, Revision(1));
+        assert_eq!(snapshot.payload, vec![42]);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let backoff_metrics = metrics(&observability).await;
+    assert_eq!(
+        metric_sum(&backoff_metrics, "dbproxy_receipt_cleanup_failures_total"),
+        initial_failures + 1.0
+    );
+    let lock_log = server_log(&dir, "locks");
+    assert!(lock_log.contains("55P03") && lock_log.contains("retry in 60 seconds"));
+    insert_expired(&locker, "f07-recovered", 501).await;
+    locker.batch_execute("COMMIT").await.unwrap();
+    let recovery = wait_until(
+        Duration::from_secs(70),
+        "cleanup retry after releasing table lock",
+        || async {
+            count(
+                &admin,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f07-recovered'",
+            )
+            .await
+                == 0
+        },
+    )
+    .await;
+    assert!(
+        failure_at.elapsed() >= Duration::from_secs(59),
+        "cleanup retried before its production backoff"
+    );
+    assert_eq!(
+        count(
+            &admin,
+            "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f07-recent'"
+        )
+        .await,
+        100
+    );
+    assert_eq!(
+        client_a.save(request).await.unwrap(),
+        SnapshotWriteOutcome::Duplicate {
+            revision: Revision(1)
+        }
+    );
+    let final_metrics = metrics(&observability).await;
+    assert_eq!(
+        metric_sum(&final_metrics, "dbproxy_receipt_cleanup_deleted_total"),
+        1602.0
+    );
+    assert_eq!(
+        metric_sum(&final_metrics, "dbproxy_receipt_cleanup_failures_total"),
+        initial_failures + 1.0
+    );
+    for (name, text) in [
+        ("row-lock", row_metrics),
+        ("table-lock", failed_metrics),
+        ("backoff", backoff_metrics),
+        ("final", final_metrics),
+    ] {
+        std::fs::write(dir.join(format!("metrics-{name}.txt")), text).unwrap();
+    }
+    let result = serde_json::json!({"run":env.run_id,"row_locked":101,"skipped_locked_rows_seconds":skip_time.as_secs_f64(),
+        "deleted":1602,"recent_kept":100,"table_lock_failures":1,"recovery_after_release_seconds":recovery.as_secs_f64(),
+        "failure_to_recovery_seconds":failure_at.elapsed().as_secs_f64(),"business_replay":"Duplicate"});
+    std::fs::write(
+        dir.join("result.json"),
+        serde_json::to_vec_pretty(&result).unwrap(),
+    )
+    .unwrap();
+    println!("F07_RESULT {result}");
+}
+
+#[tokio::test]
 #[ignore = "F09: isolated PG with a non-superuser role, real server process"]
 async fn f09_postgres_connection_limit_fails_clearly_and_recovers() {
     let env = env();
