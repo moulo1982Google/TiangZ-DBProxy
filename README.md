@@ -78,6 +78,8 @@ TiangZ主仓库已经提供首个Player Snapshot Repository和Rust Host Transpor
 
 PG 请求分片现使用独立的连接排队预算与重连失败冷却：`storage.postgresConnectionWaitTimeoutMs` 默认 2,000 ms，`storage.postgresReconnectCooldownMs` 默认 500 ms。只限制取得连接前的等待，不缩短已发送 SQL/事务的执行时间；提交后修复 ACK 排队失败保留修复目标。范围、兼容和验证见[PG 请求预算](docs/postgres-request-budget.md)，后续演练安排见[交接记录](docs/handoff-2026-09-07.md)。
 
+PG TCP 连接增加缺省网络保护：Linux 上未获 TCP 确认的数据采用 30 秒发送超时，空闲连接配置保活探测；显式连接参数优先，包括零值。它不是 SQL 执行时限，也不能把超时当成确定未提交。平台差异、连接参数单位及真实断网换地址证据见[断网保护与验收](docs/acceptance-f06-netcut-20260929.md)。
+
 PG 主库读取现使用每租户共享的小连接池，`storage.postgresReadConnections` 默认 2，写连接仍由 `storage.shards` 控制；读取不再固定排在写分片后面。每租户总连接数为 `shards + postgresReadConnections + 2`，部署前须合计所有租户和实例。配置、读取一致性、取消边界见[PG 读取连接池](docs/postgres-read-pool.md)，本轮实测及未通过项见[实施验证报告](docs/acceptance-read-pool-20260922.md)。独立读池功能通过不代表短测达标；保留尖峰漏发和测试夹具冲突的原始失败证据。
 
 PostgreSQL 的 WAL 与检查点参数（`max_wal_size`、`min_wal_size` 等）属于部署配置，DBProxy 不设置它们。实测它们不影响正确性和 P99，只影响约 0.01% 的偶发几十毫秒慢写；推荐值、监控方法和云 PG 服务的注意事项见[WAL 与检查点参数](docs/postgres-wal-checkpoint-tuning.md)。

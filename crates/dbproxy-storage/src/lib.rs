@@ -1096,9 +1096,167 @@ impl DerefMut for ReconnectingPostgresClient {
     }
 }
 
+/// 连接串未指定时的网络保护。发送超时限制未获 TCP 确认的数据，不是 SQL 执行时限；
+/// 保活探测空闲连接，实际断开时间取决于系统支持和这些选项的共同作用。
+/// Network guards for unacknowledged TCP data and dead idle connections, not SQL deadlines.
+/// Explicit connection parameters retain tokio-postgres semantics, including zero/default values.
+/// This driver's timeout/interval parameters use seconds; retries is a count. OS support varies.
+pub const DEFAULT_POSTGRES_TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_POSTGRES_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+pub const DEFAULT_POSTGRES_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+pub const DEFAULT_POSTGRES_KEEPALIVE_RETRIES: u32 = 3;
+/// 只补连接串未指定的选项；保留显式关闭及库默认值。
+/// Fill absent parameters only, preserving explicitly requested library defaults or disabling.
+pub fn postgres_config(url: &str) -> Result<tokio_postgres::Config, StorageError> {
+    let mut config: tokio_postgres::Config = url.parse()?;
+    let keys = postgres_parameter_names(url);
+    let absent = |name: &str| !keys.iter().any(|key| key == name);
+    if absent("tcp_user_timeout") {
+        config.tcp_user_timeout(DEFAULT_POSTGRES_TCP_USER_TIMEOUT);
+    }
+    if config.get_keepalives() {
+        if absent("keepalives_idle") {
+            config.keepalives_idle(DEFAULT_POSTGRES_KEEPALIVE_IDLE);
+        }
+        if absent("keepalives_interval") {
+            config.keepalives_interval(DEFAULT_POSTGRES_KEEPALIVE_INTERVAL);
+        }
+        if absent("keepalives_retries") {
+            config.keepalives_retries(DEFAULT_POSTGRES_KEEPALIVE_RETRIES);
+        }
+    }
+    Ok(config)
+}
+
+// 先由驱动验证完整语法，再只提取参数名。不能在密码或引号内容里搜索关键字。
+// Called after driver validation; extract names without mistaking quoted/escaped values for keys.
+fn postgres_parameter_names(connection: &str) -> Vec<String> {
+    if connection.starts_with("postgres://") || connection.starts_with("postgresql://") {
+        // Match the driver's credential split before looking for the query delimiter.
+        let location = connection
+            .split_once('@')
+            .map_or(connection, |(_, rest)| rest);
+        return location
+            .split_once('?')
+            .map_or_else(Vec::new, |(_, query)| {
+                form_urlencoded::parse(query.as_bytes())
+                    .map(|(key, _)| key.into_owned())
+                    .collect()
+            });
+    }
+    let mut names = Vec::new();
+    let mut chars = connection.chars().peekable();
+    while chars.peek().is_some() {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let key: String = chars.by_ref().take_while(|c| *c != '=').collect();
+        if key.trim().is_empty() {
+            break;
+        }
+        names.push(key.trim().to_owned());
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let quoted = chars.peek() == Some(&'\'');
+        if quoted {
+            chars.next();
+        }
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                chars.next();
+            } else if (quoted && c == '\'') || (!quoted && c.is_whitespace()) {
+                break;
+            }
+        }
+    }
+    names
+}
+
+#[cfg(test)]
+mod postgres_config_tests {
+    use super::*;
+
+    #[test]
+    fn network_guards_fill_unset_values() {
+        let config = postgres_config("postgres://u:p@db:5432/x").unwrap();
+        assert_eq!(
+            config.get_tcp_user_timeout(),
+            Some(&DEFAULT_POSTGRES_TCP_USER_TIMEOUT)
+        );
+        assert!(config.get_keepalives());
+        assert_eq!(
+            config.get_keepalives_idle(),
+            DEFAULT_POSTGRES_KEEPALIVE_IDLE
+        );
+        assert_eq!(
+            config.get_keepalives_interval(),
+            Some(DEFAULT_POSTGRES_KEEPALIVE_INTERVAL)
+        );
+        assert_eq!(
+            config.get_keepalives_retries(),
+            Some(DEFAULT_POSTGRES_KEEPALIVE_RETRIES)
+        );
+    }
+
+    #[test]
+    fn url_parameters_override_the_guards() {
+        let config = postgres_config(
+            "postgres://u:p@db:5432/x?tcp_user_timeout=5&keepalives_idle=60&keepalives_interval=7&keepalives_retries=9",
+        )
+        .unwrap();
+        assert_eq!(config.get_tcp_user_timeout(), Some(&Duration::from_secs(5)));
+        assert_eq!(config.get_keepalives_idle(), Duration::from_secs(60));
+        assert_eq!(
+            config.get_keepalives_interval(),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(config.get_keepalives_retries(), Some(9));
+        let off = postgres_config("postgres://u:p@db:5432/x?keepalives=0").unwrap();
+        assert!(!off.get_keepalives());
+        assert_eq!(off.get_keepalives_interval(), None);
+        assert_eq!(
+            off.get_tcp_user_timeout(),
+            Some(&DEFAULT_POSTGRES_TCP_USER_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn explicit_zero_and_library_defaults_are_preserved() {
+        for connection in [
+            "postgres://u:p@db/x?tcp_user_timeout=0&keepalives_idle=7200&keepalives_interval=0&keepalives_retries=0",
+            "host=db tcp_user_timeout = 0 keepalives_idle='7200' keepalives_interval=0 keepalives_retries=0",
+            "postgresql://u:p@db/x?%74cp_user_timeout=0&keepalives_idle=7200&keepalives_interval=0&keepalives_retries=0",
+            "postgres://u:p?literal@db/x?tcp_user_timeout=0&keepalives_idle=7200&keepalives_interval=0&keepalives_retries=0",
+        ] {
+            let config = postgres_config(connection).unwrap();
+            assert_eq!(config.get_tcp_user_timeout(), None);
+            assert_eq!(config.get_keepalives_idle(), Duration::from_secs(7200));
+            assert_eq!(config.get_keepalives_interval(), None);
+            assert_eq!(config.get_keepalives_retries(), Some(0));
+        }
+        for connection in [
+            "host=db password='tcp_user_timeout=0 keepalives_idle=7200'",
+            r"host=db password=tcp_user_timeout=0\ keepalives_idle=7200",
+            "postgres://u:tcp_user_timeout=0@db/x",
+        ] {
+            let config = postgres_config(connection).unwrap();
+            assert_eq!(
+                config.get_tcp_user_timeout(),
+                Some(&DEFAULT_POSTGRES_TCP_USER_TIMEOUT)
+            );
+            assert_eq!(
+                config.get_keepalives_idle(),
+                DEFAULT_POSTGRES_KEEPALIVE_IDLE
+            );
+        }
+    }
+}
+
 async fn open_postgres(url: &str) -> Result<Client, StorageError> {
     let timeout_duration = Duration::from_millis(DEFAULT_POSTGRES_RECONNECT_TIMEOUT_MS);
-    let (client, connection) = timeout(timeout_duration, tokio_postgres::connect(url, NoTls))
+    let config = postgres_config(url)?;
+    let (client, connection) = timeout(timeout_duration, config.connect(NoTls))
         .await
         .map_err(|_| StorageError::PostgresConnectTimeout {
             timeout_ms: DEFAULT_POSTGRES_RECONNECT_TIMEOUT_MS,

@@ -166,13 +166,14 @@ fn latest_intent(ledger: &std::path::Path) -> Option<u64> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kind = std::env::var("ACCEPT_FAULT_KIND")?;
-    const KINDS: [&str; 6] = [
+    const KINDS: [&str; 7] = [
         "blocked_write",
         "kill_connections",
         "pg_pause",
         "pg_delay",
         "read_only",
         "disk_full",
+        "external",
     ];
     if !KINDS.contains(&kind.as_str()) {
         return Err(format!("ACCEPT_FAULT_KIND must be one of {KINDS:?}").into());
@@ -393,6 +394,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if killed == 0 {
                 return Err("no DBProxy backend was connected; no fault was injected".into());
             }
+        }
+        "external" => {
+            // The fault itself is done on the host (e.g. `docker network disconnect` in
+            // run_f06_netcut.sh), which this container cannot do. Handshake through two files in
+            // the artifact folder: `fault-go` asks the host to inject, `fault-release` reports it
+            // has undone the fault. The host writes `unix_us=<n>` first: the instant just before
+            // it started the fault and just after it undid it (containers share the host clock).
+            // f06_cut_*_a used this side's later observation instead, so a few sends that the
+            // cut had already blocked were counted as missed in the normal phase.
+            let host_time = |note: &str| {
+                note.split_whitespace()
+                    .next()
+                    .and_then(|first| first.strip_prefix("unix_us="))
+                    .and_then(|value| value.parse::<u128>().ok())
+            };
+            let go = artifacts.join("fault-go");
+            let release = artifacts.join("fault-release");
+            std::fs::write(&go, b"")?;
+            let asked = Instant::now();
+            let injected = artifacts.join("fault-injected");
+            while !injected.exists() {
+                if asked.elapsed() > Duration::from_secs(30) {
+                    return Err("the host never injected the external fault".into());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let note = std::fs::read_to_string(&injected).unwrap_or_default();
+            let seen = unix_us();
+            writeln!(
+                events,
+                "{}",
+                json!({"kind":"injected","unix_us":host_time(&note).unwrap_or(seen),"seen_unix_us":seen,"fault":kind,"host_note":note})
+            )?;
+            events.flush()?;
+            let waiting = Instant::now();
+            while !release.exists() {
+                if waiting.elapsed() > hold + Duration::from_secs(120) {
+                    return Err("the host never released the external fault".into());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let note = std::fs::read_to_string(&release).unwrap_or_default();
+            let seen = unix_us();
+            writeln!(
+                events,
+                "{}",
+                json!({"kind":"released","unix_us":host_time(&note).unwrap_or(seen),"seen_unix_us":seen,"fault":kind,"host_note":note})
+            )?;
+            events.flush()?;
+            println!(
+                "FAULT_INJECTED fault=external held_ms={}",
+                waiting.elapsed().as_millis()
+            );
         }
         "disk_full" => {
             // F10 disk full: the PostgreSQL data directory lives on a small tmpfs shared with

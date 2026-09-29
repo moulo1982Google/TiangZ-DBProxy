@@ -17,7 +17,7 @@ mkdir -p "$LOGDIR" && chmod 777 "$LOGDIR"
 docker volume create --driver local --opt type=tmpfs --opt device=tmpfs --opt "o=size=$SIZE,mode=1777" "$VOLUME" >/dev/null
 cleanup() {
     docker logs "$PG" >"$LOGDIR/container.log" 2>&1 || true
-    docker rm -f "$PG" >/dev/null 2>&1 || true
+    docker rm -f -v "$PG" >/dev/null 2>&1 || true
     docker volume rm "$VOLUME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT

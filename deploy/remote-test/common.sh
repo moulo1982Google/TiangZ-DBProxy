@@ -34,7 +34,8 @@ start_host() {
     local database=$1 mode=$2 folder=$3 workers=$4
     rm -f "$folder/host.exit"
     (
-        TOKIO_WORKER_THREADS="$workers" DBPROXY_TEST_POSTGRES_URL="${PG_BASE_URL}/${database}" \
+        # PG_URL_PARAMS (optional) reaches only the host, e.g. to switch the network guards off.
+        TOKIO_WORKER_THREADS="$workers" DBPROXY_TEST_POSTGRES_URL="${PG_BASE_URL}/${database}${PG_URL_PARAMS:+?$PG_URL_PARAMS}" \
         DBPROXY_REDIS_URL="$REDIS_URL" DBPROXY_CACHE_REDIS_URL="$CACHE_REDIS_URL" \
         ACCEPT_CLEANUP="$mode" ACCEPT_STOP_FILE="$folder/stop" \
         "$SRC/target/release/examples/acceptance_host" >"$folder/host.out" 2>"$folder/host.err"

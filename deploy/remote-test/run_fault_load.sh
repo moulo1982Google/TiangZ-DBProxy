@@ -10,6 +10,7 @@
 # which holds all traffic (blackhole with open connections) or delays it for the fault window.
 # read_only / disk_full (F10): see acceptance_fault_injector.rs; disk_full needs the throwaway
 # tmpfs PostgreSQL started by run_f10_disk_full.sh and ACCEPT_BALLAST_DIR on that tmpfs.
+# external: the host performs the fault (run_f06_netcut.sh); see the injector for the handshake.
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 RUN_ID=""; FAULT=blocked_write; RATE=200; SECONDS_=60; WARMUP=10; FAULT_START=30; FAULT_DURATION=5; GRACE=5
@@ -27,7 +28,7 @@ done
 [[ -n $RUN_ID ]] || { echo "--run-id is required" >&2; exit 2; }
 require_run_id "$RUN_ID"
 require_pglog
-[[ $FAULT =~ ^(blocked_write|kill_connections|pg_pause|pg_delay|read_only|disk_full)$ ]] || { echo "invalid --fault" >&2; exit 2; }
+[[ $FAULT =~ ^(blocked_write|kill_connections|pg_pause|pg_delay|read_only|disk_full|external)$ ]] || { echo "invalid --fault" >&2; exit 2; }
 RELAYED=0; [[ $FAULT == pg_* ]] && RELAYED=1
 # Errors each fault may legitimately surface, declared before the run. The F10 kinds add the
 # PostgreSQL messages for a read-only session, a full disk and the crash restart it can cause.
@@ -67,6 +68,7 @@ pg_sql -c "ALTER DATABASE \"$DATABASE\" SET log_min_duration_statement = $SQL_LO
 cat >"$ARTIFACTS/fault-plan.json" <<EOF
 {"fault_kind":"$FAULT","fault_start_seconds":$FAULT_START,"fault_duration_seconds":$FAULT_DURATION,"recovery_grace_seconds":$GRACE,
 "relay":$( ((RELAYED)) && echo "{\"listen\":\"$ACCEPT_PROXY_LISTEN\",\"delay_ms\":$DELAY_MS}" || echo null),
+"host_url_params":"${PG_URL_PARAMS:-}",
 "allowed_fault_error_patterns":[$ALLOWED],
 "phase_rule_version":2,
 "phase_assignment":"before = completed before injection; during = in-flight interval overlaps [injection, release + $GRACE s]; after = sent after that window; missed sends by scheduled instant",

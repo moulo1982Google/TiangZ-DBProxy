@@ -19,3 +19,4 @@ tokio.workspace = true
 tokio-postgres.workspace = true
 tracing.workspace = true
 tiangz-dbproxy-core = { path = "../dbproxy-core" }
+form_urlencoded = "1"
