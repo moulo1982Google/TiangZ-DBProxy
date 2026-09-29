@@ -39,7 +39,7 @@ for test in $TESTS; do
     echo "=== $test ==="
     if DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION=1 FAULT_RUN_ID="$RUN_ID" FAULT_LIMITED_ROLE="$ROLE" \
         FAULT_PG_ADMIN_BASE="$PG_BASE_URL" FAULT_PG_LIMITED_BASE="postgres://$ROLE:fault_dev@postgres:5432" \
-        FAULT_REDIS_A="redis://:tiangz_dev@redis:6379/4" FAULT_REDIS_B="redis://:tiangz_dev@redis:6379/5" \
+        FAULT_REDIS_A="${FAULT_REDIS_A_URL:-redis://:tiangz_dev@redis:6379/4}" FAULT_REDIS_B="redis://:tiangz_dev@redis:6379/5" \
         FAULT_CACHE_A="redis://:tiangz_dev@cache:6379/4" FAULT_CACHE_B="redis://:tiangz_dev@cache:6379/5" \
         DBPROXY_ACCEPTANCE_ARTIFACTS="$OUT" DBPROXY_ACCEPTANCE_BINARY="$SRC/target/release/tiangz-dbproxy-server" \
         cargo test -p tiangz-dbproxy-server --test fault_process --locked -- --ignored --exact "$test" --nocapture \
