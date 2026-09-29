@@ -54,7 +54,7 @@
 | F08 | 运行中索引缺失/无效、确定性慢 SQL 超时与原进程恢复均通过（`index_20260929a`），见 [运行中索引报告](acceptance-runtime-index-20260929.md)；不是无索引的大规模性能测量 |
 | F10 | WAL 写满触发崩溃重启、日志写入失败；只能用专用受限容器 |
 | F11 | 可靠 Redis 已确认/未确认间隙与清理并发 |
-| F13 | 发布后 PG 确认前崩溃、重投去重和租约交错的完整链路 |
+| F13 | 正式服务实际 Redis 发布后、PG 确认发送前 SIGKILL，重投顺序、实际消费组去重和租约 fencing 通过，见 [发布后崩溃报告](acceptance-outbox-publish-crash-20260929.md) |
 | F15 | 双租户数据库故障、采集路径故障已通过；实际监控监听器独立停止期间 80 笔业务与 1,501 条清理的组件集成测试也通过，见 [监听器停止报告](acceptance-monitor-listener-20260929.md)。不声称正式进程内所有 listener 崩溃形态均已注入 |
 
 详细历史：[原验收计划](acceptance-performance-fault-test-plan.md)、[执行台账](acceptance-run-20260922.md)、[真实断网收尾](acceptance-f06-netcut-20260929.md)。完成一项即更新本页，不删除原失败或扩大“通过”的范围。
