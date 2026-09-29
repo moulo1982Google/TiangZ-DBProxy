@@ -46,6 +46,7 @@ docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cp
     -e FAULT_TESTS=f05_postgres_restart_keeps_acknowledged_data_and_resumes_cleanup \
     -v "$DATA/evidence:/evidence" -v "$LOGDIR:/pglog:ro" \
     -v "$DATA/src/crates/dbproxy-server/tests/fault_process.rs:/src/crates/dbproxy-server/tests/fault_process.rs:ro" \
+    -v "$DATA/src/crates/dbproxy-server/tests/support:/src/crates/dbproxy-server/tests/support:ro" \
     "$IMAGE" bash /src/deploy/remote-test/run_fault_process.sh "$RUN_ID" >/dev/null
 for mode in stop kill; do
     phase=$OUT/f05/$mode

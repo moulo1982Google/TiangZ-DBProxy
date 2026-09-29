@@ -4,6 +4,9 @@
 //! server force-killed repeatedly while receipt cleanup is deleting.
 //! Superusers ignore `CONNECTION LIMIT`, so tenant A logs in as a separate non-superuser role that
 //! owns its database. Every test creates its own databases and fails if they already exist.
+#[path = "support/monitor_listener_failure.rs"]
+mod monitor_listener_failure;
+
 use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
