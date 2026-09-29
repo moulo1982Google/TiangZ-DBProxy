@@ -2525,3 +2525,217 @@ async fn f01_terminate_uncommitted_write_then_retry_same_id() {
         serde_json::json!({"run":env.run_id,"rounds":results})
     );
 }
+
+#[tokio::test]
+#[ignore = "F05: host stops/kills a dedicated PG container, restarts its original volume during cleanup and an in-flight write"]
+async fn f05_postgres_restart_keeps_acknowledged_data_and_resumes_cleanup() {
+    let env = env();
+    assert_eq!(std::env::var("FAULT_DEDICATED_PG").as_deref(), Ok("1"));
+    let owner: String = sql(&format!("{}/postgres", env.admin_base))
+        .await
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let mut results = Vec::new();
+    for mode in ["stop", "kill"] {
+        let db = format!("{}_f05_{mode}", env.run_id);
+        let dir = env.artifacts.join("f05").join(mode);
+        std::fs::create_dir_all(&dir).unwrap();
+        create_database(&env.admin_base, &db, &owner).await;
+        let url = format!("{}/{db}", env.admin_base);
+        let admin = sql(&url).await;
+        let identity: String = admin
+            .query_one(
+                "SELECT system_identifier::text FROM pg_control_system()",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let started: String = admin
+            .query_one("SELECT pg_postmaster_start_time()::text", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let endpoint = free_port();
+        let observability = free_port();
+        tenant_config(&dir, "A", &endpoint, &observability);
+        let deployment = deployment(&dir, &endpoint, &["A"]);
+        let mut seed = spawn(&deployment, &dir, "seed", &env, &url, &url);
+        let seed_client = client(&endpoint, TOKEN_A, &mut seed).await;
+        for n in 0..20 {
+            seed_client
+                .save(write("f05-confirmed", &n.to_string(), n))
+                .await
+                .unwrap();
+        }
+        drop(seed_client);
+        drop(seed);
+        insert_expired(&admin, "f05-expired", 5000).await;
+        admin.batch_execute("INSERT INTO dbproxy_idempotency(request_id,namespace,record_key,schema_name,schema_version,payload,revision,recorded_at)
+            SELECT 'f05-recent-'||n,'f05-recent',n::text,'test',1,'',1,clock_timestamp() FROM generate_series(1,100) n;
+            CREATE FUNCTION f05_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.namespace='f05-pending' THEN PERFORM pg_advisory_xact_lock(928305); END IF; RETURN NEW; END $$;
+            CREATE TRIGGER f05_pause AFTER INSERT ON dbproxy_idempotency FOR EACH ROW EXECUTE FUNCTION f05_pause(); SELECT pg_advisory_lock(928305)").await.unwrap();
+        let mut server = spawn(&deployment, &dir, "run", &env, &url, &url);
+        let client_a = client(&endpoint, TOKEN_A, &mut server).await;
+        wait_until(
+            Duration::from_secs(5),
+            "cleanup first committed batch",
+            || async {
+                metric_sum(
+                    &metrics(&observability).await,
+                    "dbproxy_receipt_cleanup_deleted_total",
+                ) >= 500.0
+            },
+        )
+        .await;
+        let request = write("f05-pending", "target", 99);
+        let operation = client_a.save(request.clone());
+        tokio::pin!(operation);
+        let barrier = async {
+            loop {
+                if count(&admin, "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND wait_event='advisory' AND query LIKE '%dbproxy_idempotency%'").await > 0 { break; }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::select! {
+            outcome = &mut operation => panic!("write completed before PG fault: {outcome:?}"),
+            ready = tokio::time::timeout(Duration::from_secs(10), barrier) => ready.expect("pending write barrier missing"),
+        }
+        let remaining = count(
+            &admin,
+            "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f05-expired'",
+        )
+        .await;
+        assert!(
+            remaining > 0 && remaining < 5000,
+            "cleanup must have committed batches and still have backlog"
+        );
+        std::fs::write(dir.join("fault-go"), mode).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(20), &mut operation)
+            .await
+            .expect("PG outage did not unblock write")
+            .expect_err("uncommitted write falsely succeeded");
+        assert!(
+            format!("{error:?}").contains("StorageUnavailable"),
+            "unexpected outage error: {error:?}"
+        );
+        wait_until(
+            Duration::from_secs(60),
+            "host restarted original PG volume",
+            || async { dir.join("fault-release").exists() },
+        )
+        .await;
+        let recovered = sql(&url).await;
+        let recovered_identity: String = recovered
+            .query_one(
+                "SELECT system_identifier::text FROM pg_control_system()",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let recovered_start: String = recovered
+            .query_one("SELECT pg_postmaster_start_time()::text", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(identity, recovered_identity);
+        assert_ne!(started, recovered_start);
+        assert_eq!(
+            count(
+                &recovered,
+                "SELECT count(*) FROM dbproxy_snapshots WHERE namespace='f05-pending'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(
+                &recovered,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f05-pending'"
+            )
+            .await,
+            0
+        );
+        let after_restart = count(
+            &recovered,
+            "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f05-expired'",
+        )
+        .await;
+        assert!(
+            after_restart <= remaining,
+            "previously committed deletes reappeared"
+        );
+        recovered
+            .batch_execute(
+                "DROP TRIGGER f05_pause ON dbproxy_idempotency; DROP FUNCTION f05_pause()",
+            )
+            .await
+            .unwrap();
+        for n in 0..20u8 {
+            let original = write("f05-confirmed", &n.to_string(), n);
+            let row = recovered.query_one("SELECT payload,revision FROM dbproxy_snapshots WHERE namespace='f05-confirmed' AND record_key=$1", &[&n.to_string()]).await.unwrap();
+            assert_eq!(row.get::<_, Vec<u8>>(0), vec![n]);
+            assert_eq!(row.get::<_, i64>(1), 1);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), client_a.save(original))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                SnapshotWriteOutcome::Duplicate {
+                    revision: Revision(1)
+                }
+            );
+        }
+        assert_eq!(
+            client_a.save(request.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Applied {
+                revision: Revision(1)
+            }
+        );
+        assert_eq!(
+            client_a.save(request.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Duplicate {
+                revision: Revision(1)
+            }
+        );
+        let cleanup_recovery = wait_until(
+            Duration::from_secs(90),
+            "cleanup resumes after PG restart",
+            || async {
+                count(
+                    &recovered,
+                    "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f05-expired'",
+                )
+                .await
+                    == 0
+            },
+        )
+        .await;
+        assert_eq!(
+            count(
+                &recovered,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f05-recent'"
+            )
+            .await,
+            100
+        );
+        let row = recovered.query_one("SELECT payload,revision FROM dbproxy_snapshots WHERE namespace='f05-pending' AND record_key='target'", &[]).await.unwrap();
+        assert_eq!(row.get::<_, Vec<u8>>(0), vec![99]);
+        assert_eq!(row.get::<_, i64>(1), 1);
+        assert!(server.0.try_wait().unwrap().is_none());
+        std::fs::write(dir.join("metrics-final.txt"), metrics(&observability).await).unwrap();
+        results.push(serde_json::json!({"mode":mode,"system_identifier":identity,"postmaster_start_before":started,"postmaster_start_after":recovered_start,"confirmed_writes_verified":20,"expired_before_fault":remaining,"expired_after_pg_restart":after_restart,"expired_final":0,"recent_kept":100,"retry":"Applied then Duplicate","cleanup_recovery_seconds":cleanup_recovery.as_secs_f64(),"dp_restarted":false}));
+    }
+    std::fs::write(
+        env.artifacts.join("f05/result.json"),
+        serde_json::to_vec_pretty(&results).unwrap(),
+    )
+    .unwrap();
+    println!(
+        "F05_RESULT {}",
+        serde_json::json!({"run":env.run_id,"modes":results})
+    );
+}
