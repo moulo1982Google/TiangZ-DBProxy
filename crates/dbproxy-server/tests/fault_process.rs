@@ -2208,3 +2208,185 @@ async fn f04_kill_after_commit_before_metrics_keeps_deletion() {
         serde_json::json!({"run":env.run_id,"rounds":results})
     );
 }
+
+#[tokio::test]
+#[ignore = "F15: failed monitoring scrapes and incomplete HTTP clients while both tenants commit"]
+async fn f15_monitoring_path_failure_does_not_block_commits() {
+    struct Relay(tokio::task::JoinHandle<()>);
+    impl Drop for Relay {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let env = env();
+    let owner: String = sql(&format!("{}/postgres", env.admin_base))
+        .await
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let dir = env.artifacts.join("f15-monitoring");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut urls = Vec::new();
+    for tenant in ["a", "b"] {
+        let db = format!("{}_f15mon_{tenant}", env.run_id);
+        create_database(&env.admin_base, &db, &owner).await;
+        urls.push(format!("{}/{db}", env.admin_base));
+    }
+    let endpoint = free_port();
+    let obs_a = free_port();
+    let obs_b = free_port();
+    tenant_config(&dir, "A", &endpoint, &obs_a);
+    tenant_config(&dir, "B", &endpoint, &obs_b);
+    let deployment = deployment(&dir, &endpoint, &["A", "B"]);
+    let mut server = spawn(&deployment, &dir, "run", &env, &urls[0], &urls[1]);
+    let a = client(&endpoint, TOKEN_A, &mut server).await;
+    let b = client(&endpoint, TOKEN_B, &mut server).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let scrape_address = listener.local_addr().unwrap().to_string();
+    let cut = Arc::new(AtomicBool::new(false));
+    let blocked = Arc::new(AtomicU64::new(0));
+    let (cut_relay, blocked_relay, target) = (cut.clone(), blocked.clone(), obs_a.clone());
+    let relay = Relay(tokio::spawn(async move {
+        let mut clients = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut downstream, _) = accepted.unwrap();
+                    let blocked = cut_relay.load(Ordering::SeqCst);
+                    if blocked { blocked_relay.fetch_add(1, Ordering::SeqCst); }
+                    let target = target.clone();
+                    clients.spawn(async move {
+                        if blocked {
+                            // Consume the scrape request but never answer: a bounded blackhole
+                            // on the monitoring path only. Business sockets never use this relay.
+                            let mut request = [0; 1024];
+                            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                                while downstream.read(&mut request).await? != 0 {}
+                                Ok::<(), std::io::Error>(())
+                            }).await;
+                        } else {
+                            let mut upstream = tokio::net::TcpStream::connect(target).await.unwrap();
+                            let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                        }
+                    });
+                },
+                _ = clients.join_next(), if !clients.is_empty() => {},
+            }
+        }
+    }));
+    let mut results = Vec::new();
+    for (phase, failed) in [("before", false), ("cut", true), ("restored", false)] {
+        cut.store(failed, Ordering::SeqCst);
+        let mut partial_clients = Vec::new();
+        if failed {
+            for _ in 0..16 {
+                let mut stream = tokio::net::TcpStream::connect(&obs_a).await.unwrap();
+                stream
+                    .write_all(b"GET /metrics HTTP/1.1\r\nHost: incomplete")
+                    .await
+                    .unwrap();
+                partial_clients.push(stream);
+            }
+        }
+        let traffic = async {
+            let mut max_write_seconds = 0.0f64;
+            for n in 0..40 {
+                for (client, payload) in [(&a, 15u8), (&b, 16u8)] {
+                    let request = write("f15-monitoring", &format!("{phase}-{n}"), payload);
+                    let started = Instant::now();
+                    let outcome =
+                        tokio::time::timeout(Duration::from_secs(2), client.save(request.clone()))
+                            .await
+                            .expect("monitoring fault blocked a write")
+                            .unwrap();
+                    assert_eq!(
+                        outcome,
+                        SnapshotWriteOutcome::Applied {
+                            revision: Revision(1)
+                        }
+                    );
+                    max_write_seconds = max_write_seconds.max(started.elapsed().as_secs_f64());
+                    let loaded =
+                        tokio::time::timeout(Duration::from_secs(2), client.load(&request.record))
+                            .await
+                            .expect("monitoring fault blocked a read")
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(loaded.payload, vec![payload]);
+                    assert_eq!(loaded.revision, Revision(1));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            max_write_seconds
+        };
+        let scrapes = async {
+            let mut successes = 0;
+            let mut timeouts = 0;
+            for _ in 0..10 {
+                match tokio::time::timeout(Duration::from_millis(300), metrics(&scrape_address))
+                    .await
+                {
+                    Ok(response) => {
+                        assert!(!failed, "broken scrape unexpectedly succeeded");
+                        assert!(
+                            response.starts_with("HTTP/1.1 200 OK")
+                                && response.contains("dbproxy_receipt_cleanup_batches_total")
+                        );
+                        successes += 1;
+                    }
+                    Err(_) => {
+                        assert!(failed, "healthy scrape timed out");
+                        timeouts += 1;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            (successes, timeouts)
+        };
+        let (max_write_seconds, (successes, timeouts)) = tokio::join!(traffic, scrapes);
+        // The production HTTP read budget must also close all incomplete requests.
+        for mut stream in partial_clients {
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+                    .await
+                    .expect("incomplete monitoring request remained open")
+                    .unwrap(),
+                0
+            );
+        }
+        assert!(server.0.try_wait().unwrap().is_none());
+        results.push(serde_json::json!({"phase":phase,"tenant_a_writes":40,"tenant_b_writes":40,"sdk_reads_verified":80,"scrape_successes":successes,"scrape_timeouts":timeouts,"max_write_seconds":max_write_seconds}));
+    }
+    assert_eq!(blocked.load(Ordering::SeqCst), 10);
+    for (url, payload) in [(&urls[0], 15u8), (&urls[1], 16u8)] {
+        let db = sql(url).await;
+        let rows = db.query("SELECT record_key,payload,revision FROM dbproxy_snapshots WHERE namespace='f15-monitoring'", &[]).await.unwrap();
+        assert_eq!(rows.len(), 120);
+        for phase in ["before", "cut", "restored"] {
+            for n in 0..40 {
+                let key = format!("{phase}-{n}");
+                let row = rows
+                    .iter()
+                    .find(|r| r.get::<_, String>(0) == key)
+                    .expect("acknowledged write missing from PostgreSQL");
+                assert_eq!(row.get::<_, Vec<u8>>(1), vec![payload]);
+                assert_eq!(row.get::<_, i64>(2), 1);
+            }
+        }
+    }
+    for (name, address) in [("a", &obs_a), ("b", &obs_b)] {
+        let response = metrics(address).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        std::fs::write(dir.join(format!("metrics-final-{name}.txt")), response).unwrap();
+    }
+    let result = serde_json::json!({"run":env.run_id,"phases":results,"direct_pg_rows_verified":240,"incomplete_http_connections_closed":16,"restarted":false,"scope":"monitoring scrape path blackhole; exporter listener itself remains alive"});
+    std::fs::write(
+        dir.join("result.json"),
+        serde_json::to_vec_pretty(&result).unwrap(),
+    )
+    .unwrap();
+    println!("F15_MONITORING_RESULT {result}");
+    drop(relay);
+}

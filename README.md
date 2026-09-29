@@ -1,6 +1,6 @@
 # TiangZ DBProxy
 
-> 本地未提交工作接续：请先读[索引与验收交接（2026-09-22）](docs/handoff-index-acceptance-20260922.md)。包含代码状态、测试证据、未解决问题、环境及下一步；综合验收和两小时测试尚未完成。
+> 验收进度请先读[当前剩余清单（2026-09-29）](docs/acceptance-remaining-20260929.md)，历史证据见[索引与验收交接](docs/handoff-index-acceptance-20260922.md)。两小时测试及多项补测已完成；综合验收仍有缺口，不能把历史交接的未完成状态当作当前结论。
 
 [![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)
 [![nightly acceptance](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml?query=event%3Aschedule)
