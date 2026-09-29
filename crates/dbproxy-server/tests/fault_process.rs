@@ -6,6 +6,8 @@
 //! owns its database. Every test creates its own databases and fails if they already exist.
 #[path = "support/monitor_listener_failure.rs"]
 mod monitor_listener_failure;
+#[path = "support/shared_cleanup_pressure.rs"]
+mod shared_cleanup_pressure;
 #[path = "support/tenant_cleanup_pressure.rs"]
 mod tenant_cleanup_pressure;
 
