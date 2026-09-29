@@ -168,11 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pg_config: tokio_postgres::Config =
         std::env::var("DBPROXY_TEST_POSTGRES_URL")?.parse()?;
     pg_config.application_name("acceptance-sampler");
-    let (pg, connection) = pg_config.connect(tokio_postgres::NoTls).await?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    pg.batch_execute("SET statement_timeout='500ms'").await?;
+    let mut sampler = ActivitySampler::default();
     let path = std::path::Path::new(&stop_file).with_file_name("storage-stages.jsonl");
     let mut stages = std::io::BufWriter::new(
         std::fs::OpenOptions::new()
@@ -192,13 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         stages.flush()?;
         let started = std::time::Instant::now();
-        let activity = pg.query("SELECT pid,state,wait_event_type,wait_event FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()", &[]).await;
-        let activity = match activity {
-            Ok(rows) => {
-                serde_json::json!({"backends":rows.into_iter().map(|r|serde_json::json!({"pid":r.get::<_,i32>(0),"state":r.get::<_,Option<String>>(1),"wait_type":r.get::<_,Option<String>>(2),"wait":r.get::<_,Option<String>>(3)})).collect::<Vec<_>>() })
-            }
-            Err(error) => serde_json::json!({"error":error.to_string()}),
-        };
+        let activity = sampler.sample(&pg_config).await;
         writeln!(
             stages,
             "{}",
@@ -217,4 +207,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::timeout(Duration::from_secs(35), worker).await??;
     }
     Ok(())
+}
+
+// 采样独立限时；超时后销毁连接，下次重新解析地址，不能阻塞停止文件的检查。
+// Diagnostics have their own deadline and discard the socket on failure, independently of
+// the production network guards being compared. The next sample resolves the address again.
+#[derive(Default)]
+struct ActivitySampler {
+    connection: Option<(tokio_postgres::Client, tokio::task::JoinHandle<()>)>,
+}
+
+impl Drop for ActivitySampler {
+    fn drop(&mut self) {
+        self.disconnect();
+    }
+}
+
+impl ActivitySampler {
+    fn disconnect(&mut self) {
+        if let Some((_, driver)) = self.connection.take() {
+            driver.abort();
+        }
+    }
+
+    async fn sample(&mut self, config: &tokio_postgres::Config) -> serde_json::Value {
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            if self.connection.is_none() {
+                let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
+                self.connection = Some((client, tokio::spawn(async move {
+                    let _ = connection.await;
+                })));
+                self.connection.as_ref().unwrap().0
+                    .batch_execute("SET statement_timeout='500ms'").await?;
+            }
+            self.connection.as_ref().unwrap().0.query(
+                "SELECT pid,state,wait_event_type,wait_event FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()", &[]
+            ).await
+        }).await;
+        match result {
+            Ok(Ok(rows)) => {
+                serde_json::json!({"backends": rows.into_iter().map(|r| serde_json::json!({
+                "pid":r.get::<_,i32>(0), "state":r.get::<_,Option<String>>(1),
+                "wait_type":r.get::<_,Option<String>>(2), "wait":r.get::<_,Option<String>>(3)
+            })).collect::<Vec<_>>() })
+            }
+            result => {
+                self.disconnect();
+                let error = match result {
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_) => "activity sample exceeded 1 second; connection discarded".to_owned(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                serde_json::json!({"error": error})
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sampler_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn silent_peer_does_not_block_sampling_or_shutdown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let config = format!(
+            "host=127.0.0.1 port={} user=test sslmode=disable",
+            address.port()
+        )
+        .parse()
+        .unwrap();
+        let mut sampler = ActivitySampler::default();
+        let sample = tokio::time::timeout(Duration::from_secs(3), sampler.sample(&config))
+            .await
+            .unwrap();
+        assert!(
+            sample["error"]
+                .as_str()
+                .unwrap()
+                .contains("exceeded 1 second")
+        );
+        assert!(sampler.connection.is_none());
+        drop(sampler);
+        peer.abort();
+    }
 }
