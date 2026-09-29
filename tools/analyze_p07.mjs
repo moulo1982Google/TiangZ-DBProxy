@@ -32,6 +32,8 @@ const phases = [];
 for (const name of fs.readdirSync(root).filter(n => /^r[0-2]_[lb]_(on|off)$/.test(n)).sort()) {
   assert.match(read(`${name}.log`), /test result: ok\. 1 passed/);
   const result = JSON.parse(read(`${name}/result.json`));
+  result.publishers ??= 1;
+  assert([1,2].includes(result.publishers));
   const [round, mode, stats] = name.split('_');
   assert.equal(result.mode, mode === 'l' ? 'leased' : 'blocked');
   assert.equal(result.stats, stats === 'on');
@@ -43,6 +45,7 @@ for (const name of fs.readdirSync(root).filter(n => /^r[0-2]_[lb]_(on|off)$/.tes
     assert.equal(Number(r.slot), i);
     assert.equal(r.sample, String(i >= result.warmup_seconds*4));
     assert.equal(r.event_id, mode === 'b' ? `ready-${i}` : '');
+    if (result.publishers === 2) assert.equal(r.publisher_filter, i%2===0 ? 'p07-a' : 'p07-b');
   });
   const sampled = rows.filter(r => r.sample === 'true');
   assert.equal(sampled.length, result.sample_count);
@@ -59,6 +62,7 @@ for (const name of fs.readdirSync(root).filter(n => /^r[0-2]_[lb]_(on|off)$/.tes
     stats_ms:result.stats ? distribution(statRows.filter(r => r.sample === 'true').map(r => Number(r.latency_ms))) : null});
 }
 assert(phases.length > 0);
+assert.equal(new Set(phases.map(p => p.publishers)).size, 1);
 const full = phases.length === 12 && phases.every(p => p.full_timing);
 if (full) {
   for (let r=0; r<3; r++) for (const m of ['l','b']) for (const s of ['off','on']) {

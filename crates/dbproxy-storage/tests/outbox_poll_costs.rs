@@ -24,6 +24,8 @@ async fn sustained_polling_with_shared_stats() {
     let mode = std::env::var("P07_MODE").unwrap();
     assert!(matches!(mode.as_str(), "leased" | "blocked"));
     let with_stats = std::env::var("P07_STATS").unwrap() == "on";
+    let publishers = seconds("P07_PUBLISHERS", 1);
+    assert!((1..=2).contains(&publishers));
     let warmup = seconds("P07_WARMUP_SECONDS", 120);
     let sample = seconds("P07_SAMPLE_SECONDS", 300);
     assert!(warmup <= 120 && (1..=300).contains(&sample));
@@ -42,12 +44,31 @@ async fn sustained_polling_with_shared_stats() {
         0
     );
     sql.batch_execute("SET statement_timeout='5s'; INSERT INTO dbproxy_operation_claims(operation_id,operation_kind) VALUES('p07','multi')").await.unwrap();
+    let mut topics = ["test".to_string(), "test".to_string()];
+    if publishers == 2 {
+        for (index, publisher) in ["p07-a", "p07-b"].iter().enumerate() {
+            queue
+                .register_publisher(publisher, "isolated-no-mq-test")
+                .await
+                .unwrap();
+            let route = tiangz_dbproxy_storage::OutboxRoute {
+                producer: publisher.to_string(),
+                publisher: publisher.to_string(),
+                version: 1,
+                destination: "p07-destination".into(),
+            };
+            queue.register_route(&route).await.unwrap();
+            topics[index] = route.key();
+        }
+    }
     if mode == "leased" {
-        sql.batch_execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms,lease_until) SELECT 'leased-'||n,'p07','test','group-'||n,'',0,clock_timestamp()+interval '1 day' FROM generate_series(1,100000) n").await.unwrap();
+        for first in (1_i64..=100000).step_by(10000) {
+            sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms,lease_until) SELECT 'leased-'||n,'p07',CASE WHEN n%2=0 THEN $1 ELSE $2 END,'group-'||n,'',0,clock_timestamp()+interval '1 day' FROM generate_series($3::bigint,$4::bigint) n", &[&topics[0], &topics[1], &first, &(first+9999)]).await.unwrap();
+        }
     } else {
-        // A dead head and 1,000 ready followers force the grouping fallback.
-        sql.batch_execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms,dead_lettered_at) SELECT 'blocked-'||n,'p07','test','blocked','',0,CASE WHEN n=0 THEN clock_timestamp() ELSE NULL END FROM generate_series(0,1000) n ORDER BY n").await.unwrap();
-        sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms) SELECT 'ready-'||n,'p07','test','independent-'||(n%2),'',0 FROM generate_series(0,$1::bigint-1) n ORDER BY n", &[&(slots as i64)]).await.unwrap();
+        // Register routes before inserting: delivery routes are immutable after insertion.
+        sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms,dead_lettered_at) SELECT 'blocked-'||n,'p07',$1,'blocked','',0,CASE WHEN n=0 THEN clock_timestamp() ELSE NULL END FROM generate_series(0,1000) n ORDER BY n", &[&topics[0]]).await.unwrap();
+        sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms) SELECT 'ready-'||n,'p07',CASE WHEN n%2=0 THEN $2 ELSE $3 END,CASE WHEN $4 THEN 'independent-shared-key' ELSE 'independent-'||(n%2) END,'',0 FROM generate_series(0,$1::bigint-1) n ORDER BY n", &[&(slots as i64), &topics[0], &topics[1], &(publishers==2)]).await.unwrap();
     }
     sql.batch_execute("ANALYZE dbproxy_outbox").await.unwrap();
     let start = Instant::now() + Duration::from_millis(100);
@@ -91,17 +112,29 @@ async fn sustained_polling_with_shared_stats() {
         n
     });
     let mut raw = BufWriter::new(File::create(output.join("claims.csv")).unwrap());
-    writeln!(raw, "slot,sample,dispatch_ms,claim_ms,ack_ms,event_id").unwrap();
+    writeln!(
+        raw,
+        "slot,sample,dispatch_ms,claim_ms,ack_ms,event_id,publisher_filter"
+    )
+    .unwrap();
     let mut groups = [0_u64; 2];
     for n in 0..slots {
         let scheduled = start + Duration::from_millis(n * 250);
         sleep_until(scheduled).await;
         let before = Instant::now();
         let lag = before.duration_since(scheduled).as_secs_f64() * 1000.0;
-        let lease = timeout(Duration::from_secs(5), queue.claim("p07-worker", 30000))
-            .await
-            .unwrap()
-            .unwrap();
+        let publisher = if publishers == 2 {
+            Some(if n % 2 == 0 { "p07-a" } else { "p07-b" })
+        } else {
+            None
+        };
+        let lease = timeout(
+            Duration::from_secs(5),
+            queue.claim_for_publisher("p07-worker", 30000, publisher),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let claim_ms = before.elapsed().as_secs_f64() * 1000.0;
         let mut ack_ms = 0.0;
         let mut event_id = String::new();
@@ -111,7 +144,13 @@ async fn sustained_polling_with_shared_stats() {
             let lease = lease.expect("independent group must be claimable despite blocked prefix");
             event_id = lease.event.event_id.clone();
             assert_eq!(event_id, format!("ready-{n}"));
-            assert_eq!(lease.event.partition_key, format!("independent-{}", n % 2));
+            if let Some(publisher) = publisher {
+                assert_eq!(lease.publisher_id, publisher);
+                assert_eq!(lease.destination, "p07-destination");
+                assert_eq!(lease.event.partition_key, "independent-shared-key");
+            } else {
+                assert_eq!(lease.event.partition_key, format!("independent-{}", n % 2));
+            }
             let before_ack = Instant::now();
             assert!(
                 timeout(Duration::from_secs(5), queue.acknowledge(&lease))
@@ -124,8 +163,9 @@ async fn sustained_polling_with_shared_stats() {
         }
         writeln!(
             raw,
-            "{n},{},{lag},{claim_ms},{ack_ms},{event_id}",
-            n >= warmup * 4
+            "{n},{},{lag},{claim_ms},{ack_ms},{event_id},{}",
+            n >= warmup * 4,
+            publisher.unwrap_or("")
         )
         .unwrap();
         raw.flush().unwrap();
@@ -147,7 +187,7 @@ async fn sustained_polling_with_shared_stats() {
         assert_eq!(groups, [slots / 2, slots / 2]);
         assert_eq!(sql.query_one("SELECT count(*) FROM dbproxy_outbox WHERE event_id LIKE 'blocked-%' AND published_at IS NOT NULL", &[]).await.unwrap().get::<_, i64>(0), 0);
     }
-    let result = serde_json::json!({"mode":mode,"stats":with_stats,"full_timing":warmup==120 && sample==300,"warmup_seconds":warmup,"sample_seconds":sample,"sample_count":sample*4,"total_count":slots,"stats_count":stats_count,"groups":groups,"elapsed_seconds":start.elapsed().as_secs_f64()});
+    let result = serde_json::json!({"mode":mode,"stats":with_stats,"publishers":publishers,"full_timing":warmup==120 && sample==300,"warmup_seconds":warmup,"sample_seconds":sample,"sample_count":sample*4,"total_count":slots,"stats_count":stats_count,"groups":groups,"elapsed_seconds":start.elapsed().as_secs_f64()});
     std::fs::write(
         output.join("result.json"),
         serde_json::to_vec_pretty(&result).unwrap(),

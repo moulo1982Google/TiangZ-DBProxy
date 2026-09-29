@@ -38,4 +38,16 @@ UTC 14:24:25（北京时间 22:24:25）结束，容器退出 0、OOM=false。三
 
 这些是队列组件的固定速率对照，未发布到外部消息队列，也未同时施加完整应用混合读写；应用整体影响、更多 publisher 的性能矩阵仍需单独补测。同键多 publisher/destination 功能矩阵见 [A12 报告](acceptance-outbox-routes-20260929.md)。
 
+## 双 publisher 补测方法
+
+短测 `p7ms_0929a` 在夹具准备阶段失败并保留：插入后 UPDATE publisher/destination 被 `outbox delivery route is immutable` 正确拒绝，尚未开始计时。已修正为先调用生产 API 注册 publisher/route，再按 route.key 插入，由生产触发器固化路由；没有关闭触发器、修改生产规则或放宽断言。失败日志和容器资料保存在 `target/server_20260929/outbox_p7ms_0929a/` 及同级文件，新库 `p7ms_0929b` 用于修正后的短测。
+
+`p7ms_0929b` 在十万条带路由插入时触发准备连接的 5 秒语句超时，也未进入计时，证据同样拉回保留。调整为每批一万条、共十批，保留总量和全部路由触发器；5 秒语句/请求上限不变。新库 `p7ms_0929c` 验证分批准备后的工具。
+
+`p7ms_0929c` 短测已通过，容器 exit=0/OOM=false，三项诊断和四个短计时场景各实际执行 `1 passed`。四场景 publishers=2，80 条正式样本、112 条含预热记录，阻塞场景每个 publisher 各确认 14 条。证据已拉回、分析器返回 `PARTIAL_OR_SMOKE`；不是正式三轮性能结果。定向 Clippy、格式、差异检查通过，旧单 publisher 完整证据也通过新分析器的兼容检查。
+
+通过 `P07_PUBLISHERS=2` 使用两个已注册 publisher。十万有效租约平均分配给两者；阻塞夹具的死信队首和 1,000 后继属于 A，其余可领取消息交错分配给 A/B，使用相同 destination 和 partition key。每个槽位轮流指定 A/B 调用实际 `claim_for_publisher`，核对返回 publisher、destination、key、消息 ID 和确认结果；CSV 保存 publisher_filter，结果记录 publishers=2，分析器逐条核对。
+
+总速率保持 4 次/秒（每 publisher 2 次/秒），仍是一个领取循环，不声称两个 worker 并发。统计开关、预热/采样及三轮顺序沿用前述设计，短测独立标记。与此前单 publisher 的比较同时改变了筛选条件和分组键布局，因此只能分别报告测得成本，不把差异全归因于 publisher 数量。它也不替代多 publisher 的九种分布全组合或整体应用负载对照。
+
 复测：宿主 `bash deploy/remote-test/launch_p07.sh <全新RunId>`；正式默认 120/300 秒、3 轮。短测可覆盖 `P07_WARMUP_SECONDS/P07_SAMPLE_SECONDS/P07_ROUNDS`，结果不会标记为完整计时。结束后拉回 `outbox_<RunId>`，运行 `node tools/analyze_p07.mjs <证据目录>`，并核实容器退出状态、12 个成功阶段和资源记录。Windows 定向 Clippy、格式/差异检查、Linux 编译和短测、bash 语法检查通过。
