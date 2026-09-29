@@ -1830,3 +1830,200 @@ async fn f03_kill_after_delete_rolls_back_and_restarts() {
         serde_json::json!({"run":env.run_id,"rounds":results})
     );
 }
+
+#[tokio::test]
+#[ignore = "F08: runtime missing/invalid index, bounded SQL failure and in-process recovery"]
+async fn f08_runtime_index_damage_times_out_and_recovers() {
+    let env = env();
+    let owner: String = sql(&format!("{}/postgres", env.admin_base))
+        .await
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let mut results = Vec::new();
+    for (n, damage) in ["missing", "invalid"].into_iter().enumerate() {
+        let db = format!("{}_f08_{n}", env.run_id);
+        let dir = env.artifacts.join("f08").join(damage);
+        std::fs::create_dir_all(&dir).unwrap();
+        create_database(&env.admin_base, &db, &owner).await;
+        let url = format!("{}/{db}", env.admin_base);
+        let admin = sql(&url).await;
+        let endpoint = free_port();
+        let observability = free_port();
+        tenant_config(&dir, "A", &endpoint, &observability);
+        let deployment = deployment(&dir, &endpoint, &["A"]);
+        let mut server = spawn(&deployment, &dir, "runtime", &env, &url, &url);
+        let client_a = client(&endpoint, TOKEN_A, &mut server).await;
+        wait_until(
+            Duration::from_secs(5),
+            "initial healthy cleanup",
+            || async {
+                metric_sum(
+                    &metrics(&observability).await,
+                    "dbproxy_receipt_cleanup_batches_total",
+                ) == 1.0
+            },
+        )
+        .await;
+        let request = write("f08", "protected", 8);
+        client_a.save(request.clone()).await.unwrap();
+        admin.batch_execute("INSERT INTO dbproxy_idempotency(request_id,namespace,record_key,schema_name,schema_version,payload,revision,recorded_at)
+            SELECT 'f08-recent-'||n,'f08-recent',n::text,'test',1,'',1,clock_timestamp() FROM generate_series(1,100000) n;
+            DROP INDEX dbproxy_idempotency_retention").await.unwrap();
+        if damage == "invalid" {
+            // A failed concurrent unique build leaves a real indisvalid=false catalog entry.
+            let error = admin.batch_execute("CREATE UNIQUE INDEX CONCURRENTLY dbproxy_idempotency_retention ON dbproxy_idempotency(namespace)").await.unwrap_err();
+            assert_eq!(error.code().map(|c| c.code()), Some("23505"));
+            assert_eq!(count(&admin, "SELECT count(*) FROM pg_index WHERE indexrelid='dbproxy_idempotency_retention'::regclass AND NOT indisvalid").await, 1);
+        } else {
+            assert_eq!(
+                count(
+                    &admin,
+                    "SELECT count(*) FROM pg_class WHERE relname='dbproxy_idempotency_retention'"
+                )
+                .await,
+                0
+            );
+        }
+        insert_expired(&admin, "f08-expired", 501).await;
+        // Index drift alone need not make this small fixture slow. Explicitly delay DELETE
+        // to test the production two-second statement budget without millions of extra rows.
+        admin.batch_execute("CREATE FUNCTION f08_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NULL; END $$;
+            CREATE TRIGGER f08_delay AFTER DELETE ON dbproxy_idempotency FOR EACH STATEMENT EXECUTE FUNCTION f08_delay()").await.unwrap();
+        let mut writes = 0u64;
+        let mut max_write_seconds = 0.0f64;
+        let failure_started = Instant::now();
+        loop {
+            let started = Instant::now();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(3),
+                client_a.save(write("f08-live", &writes.to_string(), 8)),
+            )
+            .await
+            .expect("foreground write stalled")
+            .unwrap();
+            assert_eq!(
+                outcome,
+                SnapshotWriteOutcome::Applied {
+                    revision: Revision(1)
+                }
+            );
+            max_write_seconds = max_write_seconds.max(started.elapsed().as_secs_f64());
+            writes += 1;
+            if metric_sum(
+                &metrics(&observability).await,
+                "dbproxy_receipt_cleanup_failures_total",
+            ) == 1.0
+            {
+                break;
+            }
+            assert!(
+                failure_started.elapsed() < Duration::from_secs(75),
+                "cleanup failed to report its statement timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let failed_metrics = metrics(&observability).await;
+        std::fs::write(dir.join("metrics-failed.txt"), &failed_metrics).unwrap();
+        assert_eq!(
+            metric_sum(&failed_metrics, "dbproxy_receipt_cleanup_deleted_total"),
+            0.0
+        );
+        assert_eq!(
+            count(
+                &admin,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f08-expired'"
+            )
+            .await,
+            501
+        );
+        let log = server_log(&dir, "runtime");
+        assert!(
+            log.contains("57014") && log.contains("statement timeout"),
+            "missing observable PG statement-timeout cause: {log}"
+        );
+        admin.batch_execute("DROP TRIGGER f08_delay ON dbproxy_idempotency; DROP FUNCTION f08_delay(); DROP INDEX IF EXISTS dbproxy_idempotency_retention;
+            CREATE INDEX dbproxy_idempotency_retention ON dbproxy_idempotency(recorded_at,request_id)").await.unwrap();
+        let restored_at = Instant::now();
+        loop {
+            let started = Instant::now();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                client_a.save(write("f08-live", &writes.to_string(), 8)),
+            )
+            .await
+            .expect("foreground write stalled during recovery")
+            .unwrap();
+            max_write_seconds = max_write_seconds.max(started.elapsed().as_secs_f64());
+            writes += 1;
+            if count(
+                &admin,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f08-expired'",
+            )
+            .await
+                == 0
+            {
+                break;
+            }
+            assert!(
+                restored_at.elapsed() < Duration::from_secs(75),
+                "cleanup did not recover after index repair"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(server.0.try_wait().unwrap().is_none());
+        assert_eq!(
+            count(
+                &admin,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f08-recent'"
+            )
+            .await,
+            100000
+        );
+        assert_eq!(
+            client_a.save(request.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Duplicate {
+                revision: Revision(1)
+            }
+        );
+        assert_eq!(
+            client_a
+                .load(&request.record)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            vec![8]
+        );
+        for i in 0..writes {
+            let record = write("f08-live", &i.to_string(), 8).record;
+            assert_eq!(
+                client_a.load(&record).await.unwrap().unwrap().payload,
+                vec![8]
+            );
+        }
+        let final_metrics = metrics(&observability).await;
+        assert_eq!(
+            metric_sum(&final_metrics, "dbproxy_receipt_cleanup_deleted_total"),
+            501.0
+        );
+        assert_eq!(
+            metric_sum(&final_metrics, "dbproxy_receipt_cleanup_failures_total"),
+            1.0
+        );
+        std::fs::write(dir.join("metrics-restored.txt"), &final_metrics).unwrap();
+        results.push(serde_json::json!({"damage":damage,"database":db,"expired_after_timeout":501,"deleted_after_repair":501,"recent_kept":100000,"foreground_writes_verified":writes,"max_write_seconds":max_write_seconds,"repair_to_drain_seconds":restored_at.elapsed().as_secs_f64(),"restart_required":false}));
+        drop(client_a);
+        drop(server);
+    }
+    std::fs::write(
+        env.artifacts.join("f08/result.json"),
+        serde_json::to_vec_pretty(&results).unwrap(),
+    )
+    .unwrap();
+    println!(
+        "F08_RESULT {}",
+        serde_json::json!({"run":env.run_id,"cases":results})
+    );
+}
