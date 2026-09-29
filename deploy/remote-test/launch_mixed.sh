@@ -6,6 +6,11 @@ RUN_ID=${1:?new run id required}
 DATA=${DBPROXY_TEST_DATA:-/data/dbproxy-test}
 IMAGE=${DBPROXY_WORKBENCH_IMAGE:-dbproxy-workbench:f06-20260929}
 WB=dbproxy-mixed-$RUN_ID
+case ${MIX_SUITE:-baseline} in
+    baseline) runner=run_mixed_rounds.sh ;;
+    paired) runner=run_mixed_pairs.sh ;;
+    *) echo 'MIX_SUITE must be baseline or paired'; exit 2 ;;
+esac
 OUT=$DATA/evidence/fault_process_${RUN_ID}_r0
 [[ ! -e $OUT ]] || { echo 'Use a new RunId'; exit 2; }
 if docker inspect "$WB" >/dev/null 2>&1; then echo 'Container exists'; exit 2; fi
@@ -22,6 +27,7 @@ trap finish EXIT
 docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cpus 4 \
     --memory 16g --memory-swap 16g -e CARGO_BUILD_JOBS=4 \
     -e MIX_BASELINE="${MIX_BASELINE:-B2}" \
+    -e MIX_PAIR_RATES="${MIX_PAIR_RATES:-64 96}" \
     -e MIX_RATE="${MIX_RATE:-20}" -e MIX_CONCURRENCY="${MIX_CONCURRENCY:-8}" \
     -e MIX_WARMUP="${MIX_WARMUP:-120}" \
     -e MIX_SAMPLE="${MIX_SAMPLE:-300}" \
@@ -30,7 +36,7 @@ docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cp
     -v "$DATA/src/crates/dbproxy-server/examples:/src/crates/dbproxy-server/examples:ro" \
     -v "$DATA/src/crates/dbproxy-server/src:/src/crates/dbproxy-server/src:ro" \
     -v "$DATA/src/deploy/remote-test:/src/deploy/remote-test:ro" \
-    "$IMAGE" bash /src/deploy/remote-test/run_mixed_rounds.sh "$RUN_ID" >/dev/null
+    "$IMAGE" bash "/src/deploy/remote-test/$runner" "$RUN_ID" >/dev/null
 docker exec "$WB" sha256sum /src/crates/dbproxy-server/tests/support/mixed_paced.rs \
     /src/crates/dbproxy-server/tests/support/mixed_workload.rs \
     /src/crates/dbproxy-server/src/server_process.rs \
