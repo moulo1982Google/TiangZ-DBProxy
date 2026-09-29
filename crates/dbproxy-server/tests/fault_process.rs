@@ -6,6 +6,8 @@
 //! owns its database. Every test creates its own databases and fails if they already exist.
 #[path = "support/monitor_listener_failure.rs"]
 mod monitor_listener_failure;
+#[path = "support/tenant_cleanup_pressure.rs"]
+mod tenant_cleanup_pressure;
 
 use std::{
     path::{Path, PathBuf},
