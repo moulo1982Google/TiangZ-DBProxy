@@ -260,6 +260,243 @@ async fn insert_expired(db: &tokio_postgres::Client, namespace: &str, rows: i64)
     .unwrap();
 }
 
+async fn schema_catalog(sql: &tokio_postgres::Client) -> serde_json::Value {
+    let migrations: Vec<String> = sql
+        .query(
+            "SELECT row_to_json(m)::text FROM dbproxy_schema_migrations m ORDER BY version",
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    let indexes: Vec<String> = sql.query(
+        "SELECT c.oid::text||':'||c.relname||':'||pg_get_indexdef(c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('i','I') ORDER BY c.relname", &[]
+    ).await.unwrap().into_iter().map(|row| row.get(0)).collect();
+    let primary = count(sql, "SELECT count(*) FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='public' AND NOT t.relispartition AND i.indisprimary").await;
+    let partitions = count(
+        sql,
+        "SELECT count(*) FROM pg_inherits WHERE inhparent='dbproxy_snapshots'::regclass",
+    )
+    .await;
+    assert_eq!(migrations.len(), 15);
+    assert_eq!(primary, 18);
+    assert_eq!(partitions, 32);
+    serde_json::json!({"migrations":migrations,"indexes":indexes,"primary_keys":primary,"partitions":partitions})
+}
+
+#[tokio::test]
+#[ignore = "A01: fresh PG, real release process initial startup and two restarts"]
+async fn a01_empty_database_and_restarts_preserve_schema_and_business() {
+    let env = env();
+    let db = format!("{}_a01", env.run_id);
+    let dir = env.artifacts.join("a01");
+    std::fs::create_dir_all(&dir).unwrap();
+    let owner: String = sql(&format!("{}/postgres", env.admin_base))
+        .await
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    create_database(&env.admin_base, &db, &owner).await;
+    let url = format!("{}/{db}", env.admin_base);
+    let admin = sql(&url).await;
+    assert_eq!(count(&admin, "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public'").await, 0);
+    let endpoint = free_port();
+    tenant_config(&dir, "A", &endpoint, &free_port());
+    let deployment = deployment(&dir, &endpoint, &["A"]);
+    let request = write("a01", "survives-restart", 73);
+    let mut baseline = None;
+    for round in 0..3 {
+        let mut server = spawn(
+            &deployment,
+            &dir,
+            &format!("round-{round}"),
+            &env,
+            &url,
+            &url,
+        );
+        let client_a = client(&endpoint, TOKEN_A, &mut server).await;
+        let actual = client_a.save(request.clone()).await.unwrap();
+        let expected = if round == 0 {
+            SnapshotWriteOutcome::Applied {
+                revision: Revision(1),
+            }
+        } else {
+            SnapshotWriteOutcome::Duplicate {
+                revision: Revision(1),
+            }
+        };
+        assert_eq!(actual, expected);
+        let snapshot = client_a.load(&request.record).await.unwrap().unwrap();
+        assert_eq!(snapshot.revision, Revision(1));
+        assert_eq!(snapshot.payload, vec![73]);
+        let catalog = schema_catalog(&admin).await;
+        let storage = tiangz_dbproxy_storage::PostgresSnapshotStore::connect_existing(&url)
+            .await
+            .unwrap();
+        storage.validate_schema_indexes().await.unwrap();
+        drop(storage);
+        if let Some(baseline) = &baseline {
+            assert_eq!(
+                &catalog, baseline,
+                "restart re-applied migrations or replaced indexes"
+            );
+        } else {
+            baseline = Some(catalog.clone());
+        }
+        std::fs::write(
+            dir.join(format!("catalog-{round}.json")),
+            serde_json::to_vec_pretty(&catalog).unwrap(),
+        )
+        .unwrap();
+        drop(client_a);
+        drop(server);
+    }
+    let result = serde_json::json!({"run":env.run_id,"starts":3,"primary_keys":18,"partitions":32,"migration_rows":15,"catalog_unchanged":true,"business_revision":1});
+    std::fs::write(
+        dir.join("result.json"),
+        serde_json::to_vec_pretty(&result).unwrap(),
+    )
+    .unwrap();
+    println!("A01_RESULT {result}");
+}
+
+#[tokio::test]
+#[ignore = "A03: separate fresh PG databases, damage six schema shapes, real process refusal then repair"]
+async fn a03_schema_damage_refuses_clients_and_recovers_after_repair() {
+    let env = env();
+    let owner: String = sql(&format!("{}/postgres", env.admin_base))
+        .await
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let cases = [
+        (
+            "dbproxy_idempotency",
+            "ALTER TABLE dbproxy_idempotency DROP CONSTRAINT dbproxy_idempotency_pkey",
+            "ALTER TABLE dbproxy_idempotency ADD PRIMARY KEY(request_id)",
+        ),
+        (
+            "dbproxy_snapshots",
+            "ALTER TABLE dbproxy_snapshots DROP CONSTRAINT dbproxy_snapshots_pkey; ALTER TABLE dbproxy_snapshots ADD PRIMARY KEY(record_key,namespace)",
+            "ALTER TABLE dbproxy_snapshots DROP CONSTRAINT dbproxy_snapshots_pkey; ALTER TABLE dbproxy_snapshots ADD PRIMARY KEY(namespace,record_key)",
+        ),
+        (
+            "dbproxy_idempotency_retention",
+            "DROP INDEX dbproxy_idempotency_retention",
+            "CREATE INDEX dbproxy_idempotency_retention ON dbproxy_idempotency(recorded_at,request_id)",
+        ),
+        (
+            "dbproxy_cache_repairs_leased_order",
+            "DROP INDEX dbproxy_cache_repairs_leased_order; CREATE INDEX dbproxy_cache_repairs_leased_order ON dbproxy_cache_repairs(requested_at,namespace,record_key,lease_until,available_at) WHERE dead_lettered_at IS NULL",
+            "DROP INDEX dbproxy_cache_repairs_leased_order; CREATE INDEX dbproxy_cache_repairs_leased_order ON dbproxy_cache_repairs(requested_at,namespace,record_key,lease_until,available_at) WHERE dead_lettered_at IS NULL AND lease_until IS NOT NULL",
+        ),
+        (
+            "dbproxy_outbox_operation",
+            "DROP INDEX dbproxy_outbox_operation; CREATE INDEX dbproxy_outbox_operation ON dbproxy_outbox(event_id,operation_id)",
+            "DROP INDEX dbproxy_outbox_operation; CREATE INDEX dbproxy_outbox_operation ON dbproxy_outbox(operation_id,event_id)",
+        ),
+        (
+            "dbproxy_snapshots_p00",
+            "ALTER TABLE dbproxy_snapshots DETACH PARTITION dbproxy_snapshots_p00",
+            "ALTER TABLE dbproxy_snapshots ATTACH PARTITION dbproxy_snapshots_p00 FOR VALUES WITH (MODULUS 32, REMAINDER 0)",
+        ),
+    ];
+    let mut results = Vec::new();
+    for (n, (object, damage, repair)) in cases.into_iter().enumerate() {
+        let db = format!("{}_a03_{n}", env.run_id);
+        let dir = env.artifacts.join("a03").join(n.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        create_database(&env.admin_base, &db, &owner).await;
+        let url = format!("{}/{db}", env.admin_base);
+        let admin = sql(&url).await;
+        let endpoint = free_port();
+        tenant_config(&dir, "A", &endpoint, &free_port());
+        let deployment = deployment(&dir, &endpoint, &["A"]);
+        let request = write(&format!("a03-{n}"), "protected", n as u8);
+        let mut seed = spawn(&deployment, &dir, "seed", &env, &url, &url);
+        let client_a = client(&endpoint, TOKEN_A, &mut seed).await;
+        assert_eq!(
+            client_a.save(request.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Applied {
+                revision: Revision(1)
+            }
+        );
+        drop(client_a);
+        drop(seed);
+        admin.batch_execute(damage).await.unwrap();
+        let mut broken = spawn(&deployment, &dir, "damaged", &env, &url, &url);
+        let started = Instant::now();
+        let exit = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "damaged startup did not fail"
+            );
+            assert!(
+                tokio::net::TcpStream::connect(&endpoint).await.is_err(),
+                "damaged schema exposed the service port"
+            );
+            if let Some(exit) = broken.0.try_wait().unwrap() {
+                break exit;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(!exit.success());
+        let log = server_log(&dir, "damaged");
+        // A detached partition is rejected by the layout check before individual index checks.
+        // schema_20260929a expected its name and failed despite the correct early rejection.
+        let diagnostic = if object == "dbproxy_snapshots_p00" {
+            "expected 32 canonical hash partitions, found 31"
+        } else {
+            object
+        };
+        assert!(
+            log.contains(diagnostic),
+            "startup error did not identify {diagnostic}: {log}"
+        );
+        drop(broken);
+        admin.batch_execute(repair).await.unwrap();
+        let mut fixed = spawn(&deployment, &dir, "repaired", &env, &url, &url);
+        let client_a = client(&endpoint, TOKEN_A, &mut fixed).await;
+        assert_eq!(
+            client_a.save(request.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Duplicate {
+                revision: Revision(1)
+            }
+        );
+        assert_eq!(
+            client_a
+                .load(&request.record)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            vec![n as u8]
+        );
+        let catalog = schema_catalog(&admin).await;
+        std::fs::write(
+            dir.join("catalog-repaired.json"),
+            serde_json::to_vec_pretty(&catalog).unwrap(),
+        )
+        .unwrap();
+        results.push(serde_json::json!({"database":db,"object":object,"damaged_exit":exit.code(),"repaired_replay":"Duplicate"}));
+        drop(client_a);
+        drop(fixed);
+    }
+    std::fs::write(
+        env.artifacts.join("a03/result.json"),
+        serde_json::to_vec_pretty(&results).unwrap(),
+    )
+    .unwrap();
+    println!(
+        "A03_RESULT {}",
+        serde_json::json!({"run":env.run_id,"cases":results.len(),"all_refused_and_repaired":true})
+    );
+}
+
 #[tokio::test]
 #[ignore = "F07: isolated PG, real cleanup worker, row/table locks and the production 60-second retry"]
 async fn f07_cleanup_skips_rows_and_backs_off_on_table_lock() {
