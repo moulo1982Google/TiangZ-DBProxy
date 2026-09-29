@@ -15,6 +15,23 @@ resolve() {
     done
 }
 stat_field() { awk -v k="$2" '$1 == k { print $2; exit }' "$1" 2>/dev/null; }
+# Missing cgroup files are unavailable, never zero pressure. Counters are cumulative;
+# consumers must subtract samples from the same cgroup identity.
+counter_json() {
+    [[ -r $1 ]] || { printf 'null'; return; }
+    awk 'BEGIN { printf "{" } NF == 2 && $2 ~ /^[0-9]+$/ {
+        printf "%s\"%s\":%s", sep, $1, $2; sep=","
+    } END { printf "}" }' "$1"
+}
+pressure_json() {
+    [[ -r $1 ]] || { printf 'null'; return; }
+    awk 'BEGIN { printf "{" } $1 == "some" || $1 == "full" {
+        printf "%s\"%s\":{", sep, $1; inner=""
+        for(i=2;i<=NF;i++) { split($i,a,"="); if(a[2] ~ /^[0-9.]+$/) {
+            printf "%s\"%s\":%s", inner,a[1],a[2]; inner=","
+        }} printf "}"; sep=","
+    } END { printf "}" }' "$1"
+}
 io_bytes() { awk '{ for (i = 2; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "rbytes") r += kv[2]; if (kv[1] == "wbytes") w += kv[2] } } END { printf "%d,%d", r, w }' "$1" 2>/dev/null; }
 redis_info() {
     docker exec "$1" redis-cli -a tiangz_dev --no-auth-warning INFO 2>/dev/null | tr -d '\r' | awk -F: '
@@ -34,7 +51,9 @@ while :; do
         anon=$(stat_field "$d/memory.stat" anon); file=$(stat_field "$d/memory.stat" file)
         cpu=$(stat_field "$d/cpu.stat" usage_usec); thr=$(stat_field "$d/cpu.stat" throttled_usec)
         io=$(io_bytes "$d/io.stat")
-        line+=",\"$c\":{\"memory\":${mem:-0},\"anon\":${anon:-0},\"file\":${file:-0},\"cpu_usec\":${cpu:-0},\"throttled_usec\":${thr:-0},\"io_read_bytes\":${io%,*},\"io_write_bytes\":${io#*,}}"
+        line+=",\"$c\":{\"memory\":${mem:-0},\"anon\":${anon:-0},\"file\":${file:-0},\"cpu_usec\":${cpu:-0},\"throttled_usec\":${thr:-0},\"io_read_bytes\":${io%,*},\"io_write_bytes\":${io#*,}"
+        line+=",\"cgroup\":\"${d##*/}\",\"memory_events\":$(counter_json "$d/memory.events"),\"memory_stat\":$(counter_json "$d/memory.stat")"
+        line+=",\"memory_pressure\":$(pressure_json "$d/memory.pressure"),\"cpu_pressure\":$(pressure_json "$d/cpu.pressure"),\"io_pressure\":$(pressure_json "$d/io.pressure") }"
     done
     line+=",\"redis\":$(redis_info dbproxy-test-redis),\"cache\":$(redis_info dbproxy-test-cache)"
     read -r load1 _ </proc/loadavg
