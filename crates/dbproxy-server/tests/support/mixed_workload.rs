@@ -1,4 +1,6 @@
 //! Six-operation workload foundation. This smoke verifies semantics, not performance.
+#[path = "mixed_paced.rs"]
+mod paced;
 use super::*;
 use std::io::Write;
 use tiangz_dbproxy_core::{
