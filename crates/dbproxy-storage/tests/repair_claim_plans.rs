@@ -178,3 +178,115 @@ async fn repair_claim_distribution_matrix() {
             .unwrap();
     }
 }
+
+#[tokio::test]
+#[ignore = "P06: isolated PG, 50 percent row locks, whole-query plan and 1000 hot-key merges"]
+async fn half_locked_claim_and_hot_merge_costs() {
+    use tiangz_dbproxy_core::{RecordKey, Revision};
+    assert_eq!(
+        std::env::var("DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION").as_deref(),
+        Ok("1")
+    );
+    let url = std::env::var("DBPROXY_TEST_POSTGRES_URL").unwrap();
+    let store = PostgresSnapshotStore::connect(&url).await.unwrap();
+    let queue = store.cache_repair_queue();
+    let (mut locker, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let driver = tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let (mut observer, observer_driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let observer_driver = tokio::spawn(async move {
+        let _ = observer_driver.await;
+    });
+    locker.batch_execute("INSERT INTO dbproxy_cache_repairs(namespace,record_key,target_revision,requested_at,available_at,lease_until)
+        SELECT 'repair-half',n::text,1,'2020-01-01'::timestamptz+n*interval '1 millisecond','2020-01-01',CASE WHEN n%2=0 THEN '2020-02-01'::timestamptz ELSE NULL END FROM generate_series(1,20000) n;
+        ANALYZE dbproxy_cache_repairs").await.unwrap();
+    let held = locker.transaction().await.unwrap();
+    assert_eq!(held.query("SELECT record_key FROM dbproxy_cache_repairs WHERE namespace='repair-half' AND record_key::int<=10000 FOR UPDATE", &[]).await.unwrap().len(), 10000);
+    let probe = observer.transaction().await.unwrap();
+    probe
+        .batch_execute("SET LOCAL statement_timeout='5s'")
+        .await
+        .unwrap();
+    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&"half-probe", &30000_i64];
+    let plan = explain(&probe, "half-locked-complete-claim", CLAIM, params).await;
+    assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(1.0));
+    probe.rollback().await.unwrap();
+    let started = std::time::Instant::now();
+    let lease = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        queue.claim("half-worker", 30000),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let claim_seconds = started.elapsed().as_secs_f64();
+    assert_eq!(lease.record.key, "10001");
+    assert!(queue.acknowledge(&lease, Some(Revision(1))).await.unwrap());
+    assert_eq!(held.query_one("SELECT count(*) FROM dbproxy_cache_repairs WHERE namespace='repair-half' AND record_key::int<=10000 AND lease_owner IS NOT NULL", &[]).await.unwrap().get::<_, i64>(0), 0);
+    held.rollback().await.unwrap();
+    let first = queue
+        .claim("released-worker", 30000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.record.key, "1");
+    assert!(queue.acknowledge(&first, Some(Revision(1))).await.unwrap());
+    let hot = RecordKey::new("repair-hot-cost", "same-key").unwrap();
+    queue.enqueue(&hot, Revision(1)).await.unwrap();
+    observer.batch_execute("UPDATE dbproxy_cache_repairs SET requested_at='2010-01-01' WHERE namespace='repair-hot-cost'").await.unwrap();
+    let original = queue.claim("hot-worker", 30000).await.unwrap().unwrap();
+    assert_eq!(original.record, hot);
+    let mut timings = Vec::new();
+    for revision in 2..=1001 {
+        let started = std::time::Instant::now();
+        queue.enqueue(&hot, Revision(revision)).await.unwrap();
+        timings.push(started.elapsed().as_secs_f64());
+    }
+    let state = observer.query_one("SELECT target_revision,lease_token,lease_owner,requested_at::text FROM dbproxy_cache_repairs WHERE namespace='repair-hot-cost'", &[]).await.unwrap();
+    assert_eq!(state.get::<_, i64>(0), 1001);
+    assert_eq!(state.get::<_, i64>(1), original.lease_token);
+    assert_eq!(state.get::<_, String>(2), "hot-worker");
+    assert!(state.get::<_, String>(3).starts_with("2010-01-01"));
+    assert!(
+        queue
+            .acknowledge(&original, Some(Revision(1)))
+            .await
+            .unwrap()
+    );
+    let merged = queue.claim("hot-worker", 30000).await.unwrap().unwrap();
+    assert_eq!(merged.record, hot);
+    assert_eq!(merged.target_revision, Revision(1001));
+    assert!(merged.lease_token > original.lease_token);
+    assert!(
+        !queue
+            .acknowledge(&original, Some(Revision(1001)))
+            .await
+            .unwrap()
+    );
+    assert!(
+        queue
+            .acknowledge(&merged, Some(Revision(1001)))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        observer
+            .query_one(
+                "SELECT count(*) FROM dbproxy_cache_repairs WHERE namespace='repair-hot-cost'",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    timings.sort_by(f64::total_cmp);
+    println!(
+        "P06_HALF_HOT_RESULT {}",
+        serde_json::json!({"rows":20000,"locked":10000,"claim_seconds":claim_seconds,"merge_count":1000,"merge_p50_seconds":timings[499],"merge_p99_seconds":timings[989],"merge_max_seconds":timings.last(),"final_target":1001,"old_lease_rejected":true,"scope":"PG repair queue; no Redis repair or full application load"})
+    );
+    driver.abort();
+    observer_driver.abort();
+}
