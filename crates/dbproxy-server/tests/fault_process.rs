@@ -2027,3 +2027,184 @@ async fn f08_runtime_index_damage_times_out_and_recovers() {
         serde_json::json!({"run":env.run_id,"cases":results})
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "F04: hold the committed cleanup reply, SIGKILL before metrics, then restart"]
+async fn f04_kill_after_commit_before_metrics_keeps_deletion() {
+    use std::os::unix::process::ExitStatusExt;
+    struct Relay(tokio::task::JoinHandle<()>);
+    impl Drop for Relay {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let env = env();
+    let owner: String = sql(&format!("{}/postgres", env.admin_base))
+        .await
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let mut results = Vec::new();
+    for round in 0..3 {
+        let db = format!("{}_f04_exact_{round}", env.run_id);
+        let dir = env.artifacts.join("f04-exact").join(round.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        create_database(&env.admin_base, &db, &owner).await;
+        let url = format!("{}/{db}", env.admin_base);
+        let admin = sql(&url).await;
+        let endpoint = free_port();
+        let observability = free_port();
+        tenant_config(&dir, "A", &endpoint, &observability);
+        let deployment = deployment(&dir, &endpoint, &["A"]);
+        let kept = write("f04-exact", "recent", 4);
+        let expired = write("f04-exact", "expired", 5);
+        let mut seed = spawn(&deployment, &dir, "seed", &env, &url, &url);
+        let seed_client = client(&endpoint, TOKEN_A, &mut seed).await;
+        seed_client.save(kept.clone()).await.unwrap();
+        seed_client.save(expired.clone()).await.unwrap();
+        drop(seed_client);
+        drop(seed);
+        insert_expired(&admin, "f04-fixture", 499).await;
+        admin.execute("UPDATE dbproxy_idempotency SET recorded_at=clock_timestamp()-interval '170 hours' WHERE request_id=$1", &[&expired.request_id]).await.unwrap();
+        admin.batch_execute("INSERT INTO dbproxy_idempotency(request_id,namespace,record_key,schema_name,schema_version,payload,revision,recorded_at)
+            SELECT 'f04-recent-'||n,'f04-recent',n::text,'test',1,'',1,clock_timestamp() FROM generate_series(1,100) n").await.unwrap();
+        // Test-only plaintext PostgreSQL relay: frontend bytes pass unchanged. Parse backend
+        // frames so COMMIT cannot be confused with payload bytes, split reads or another socket.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (prefix, rest) = url
+            .rsplit_once('@')
+            .expect("test URL must have explicit credentials");
+        let upstream = rest.split('/').next().unwrap().to_owned();
+        let relay_url = format!("{prefix}@{address}/{db}?sslmode=disable");
+        let held = Arc::new(AtomicBool::new(false));
+        let signal = held.clone();
+        let relay = Relay(tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (downstream, _) = accepted.unwrap();
+                        let upstream = upstream.clone();
+                        let signal = signal.clone();
+                        connections.spawn(async move {
+                            let upstream = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                            let (mut down_read, mut down_write) = downstream.into_split();
+                            let (mut up_read, mut up_write) = upstream.into_split();
+                            let replies = async {
+                                let mut deleted = false;
+                                loop {
+                                    let tag = up_read.read_u8().await?;
+                                    let length = up_read.read_u32().await?;
+                                    if !(4..=16*1024*1024).contains(&length) {
+                                        return Err(std::io::Error::other("invalid PostgreSQL frame length"));
+                                    }
+                                    let mut body = vec![0; (length-4) as usize];
+                                    up_read.read_exact(&mut body).await?;
+                                    if tag == b'C' && body == b"DELETE 500\0" { deleted = true; }
+                                    if tag == b'C' && body == b"COMMIT\0" && deleted {
+                                        signal.store(true, Ordering::SeqCst);
+                                        std::future::pending::<()>().await;
+                                    }
+                                    if tag == b'Z' && body == b"I" { deleted = false; }
+                                    down_write.write_u8(tag).await?;
+                                    down_write.write_u32(length).await?;
+                                    down_write.write_all(&body).await?;
+                                }
+                                #[allow(unreachable_code)]
+                                Ok::<(), std::io::Error>(())
+                            };
+                            tokio::select! {
+                                _ = tokio::io::copy(&mut down_read, &mut up_write) => {},
+                                _ = replies => {},
+                            }
+                        });
+                    },
+                    _ = connections.join_next(), if !connections.is_empty() => {},
+                }
+            }
+        }));
+        let mut server = spawn(&deployment, &dir, "kill", &env, &relay_url, &relay_url);
+        wait_until(
+            Duration::from_secs(15),
+            "committed cleanup reply barrier",
+            || async { held.load(Ordering::SeqCst) },
+        )
+        .await;
+        // Independent direct PG reads prove COMMIT is durable/visible, while the worker is
+        // still awaiting its withheld reply and cannot have recorded successful metrics.
+        assert_eq!(count(&admin, "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f04-fixture' OR request_id='f04-exact-expired'").await, 0);
+        let before_kill = metrics(&observability).await;
+        assert_eq!(
+            metric_sum(&before_kill, "dbproxy_receipt_cleanup_batches_total"),
+            0.0
+        );
+        assert_eq!(
+            metric_sum(&before_kill, "dbproxy_receipt_cleanup_deleted_total"),
+            0.0
+        );
+        assert!(!server_log(&dir, "kill").contains("ordinary receipt cleanup completed"));
+        std::fs::write(dir.join("metrics-before-kill.txt"), before_kill).unwrap();
+        server.0.kill().unwrap();
+        let exit = server.0.wait().unwrap();
+        assert_eq!(exit.signal(), Some(9));
+        drop(server);
+        drop(relay);
+        let mut restarted = spawn(&deployment, &dir, "restart", &env, &url, &url);
+        let client_a = client(&endpoint, TOKEN_A, &mut restarted).await;
+        wait_until(Duration::from_secs(5), "restart empty cleanup", || async {
+            metric_sum(
+                &metrics(&observability).await,
+                "dbproxy_receipt_cleanup_batches_total",
+            ) >= 1.0
+        })
+        .await;
+        let after = metrics(&observability).await;
+        assert_eq!(
+            metric_sum(&after, "dbproxy_receipt_cleanup_deleted_total"),
+            0.0
+        );
+        std::fs::write(dir.join("metrics-restarted.txt"), after).unwrap();
+        assert_eq!(count(&admin, "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f04-fixture' OR request_id='f04-exact-expired'").await, 0);
+        assert_eq!(
+            count(
+                &admin,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f04-recent'"
+            )
+            .await,
+            100
+        );
+        assert_eq!(
+            client_a.save(kept.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Duplicate {
+                revision: Revision(1)
+            }
+        );
+        match client_a.save(expired.clone()).await.unwrap_err() {
+            tiangz_dbproxy_client::ClientError::Remote(error) => {
+                assert_eq!(format!("{:?}", error.code), "RevisionConflict");
+                assert_eq!(error.actual_revision, Some(Revision(1)));
+            }
+            error => panic!("expired receipt replay did not retain CAS protection: {error}"),
+        }
+        for request in [kept, expired] {
+            let snapshot = client_a.load(&request.record).await.unwrap().unwrap();
+            assert_eq!(snapshot.payload, request.payload);
+            assert_eq!(snapshot.revision, Revision(1));
+        }
+        results.push(serde_json::json!({"round":round,"database":db,"committed_deleted":500,"metric_deleted_before_kill":0,"signal":9,"metric_deleted_after_restart":0,"recent_kept":100,"kept_replay":"Duplicate","expired_replay":"RevisionConflict","business_revisions":[1,1]}));
+        drop(client_a);
+        drop(restarted);
+    }
+    std::fs::write(
+        env.artifacts.join("f04-exact/result.json"),
+        serde_json::to_vec_pretty(&results).unwrap(),
+    )
+    .unwrap();
+    println!(
+        "F04_EXACT_RESULT {}",
+        serde_json::json!({"run":env.run_id,"rounds":results})
+    );
+}

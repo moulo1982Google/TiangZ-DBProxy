@@ -1,6 +1,6 @@
 # 索引、回执清理与性能验收交接（2026-09-22）
 
-> 当前进度以 [2026-09-29 剩余清单](acceptance-remaining-20260929.md) 为准。下文保留历史交接状态。F03 已删未提交的真实 DP 强杀三轮通过，见 [精确强杀报告](acceptance-cleanup-sigkill-20260929.md)；F04 提交后、指标前仍待补。
+> 当前进度以 [2026-09-29 剩余清单](acceptance-remaining-20260929.md) 为准。下文保留历史交接状态。F03 已删未提交的真实 DP 强杀三轮通过，见 [精确强杀报告](acceptance-cleanup-sigkill-20260929.md)；F04 提交后、指标前精确强杀三轮也已通过，见 [提交后强杀报告](acceptance-cleanup-postcommit-20260929.md)。
 
 > F08 运行中索引缺失/无效、慢 SQL 超时及修复续清已通过，见 [运行中索引报告](acceptance-runtime-index-20260929.md)。故障期与恢复期 478 笔前台写入均核对一致。
 
