@@ -2390,3 +2390,138 @@ async fn f15_monitoring_path_failure_does_not_block_commits() {
     println!("F15_MONITORING_RESULT {result}");
     drop(relay);
 }
+
+#[tokio::test]
+#[ignore = "F01: real process write paused before commit, terminate only that PG backend, retry same ID"]
+async fn f01_terminate_uncommitted_write_then_retry_same_id() {
+    let env = env();
+    let owner: String = sql(&format!("{}/postgres", env.admin_base))
+        .await
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let mut results = Vec::new();
+    for round in 0..3 {
+        let db = format!("{}_f01_{round}", env.run_id);
+        let dir = env.artifacts.join("f01").join(round.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        create_database(&env.admin_base, &db, &owner).await;
+        let url = format!("{}/{db}", env.admin_base);
+        let admin = sql(&url).await;
+        let observer = sql(&url).await;
+        let endpoint = free_port();
+        let observability = free_port();
+        tenant_config(&dir, "A", &endpoint, &observability);
+        let deployment = deployment(&dir, &endpoint, &["A"]);
+        let mut server = spawn(&deployment, &dir, "run", &env, &url, &url);
+        let client_a = client(&endpoint, TOKEN_A, &mut server).await;
+        let protected = write("f01", "protected", 1);
+        client_a.save(protected.clone()).await.unwrap();
+        // A receipt INSERT runs within the write transaction after the snapshot mutation.
+        // Only this test namespace is held; background cleanup and the preserved record run normally.
+        admin.batch_execute("CREATE FUNCTION f01_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.namespace='f01-pending' THEN PERFORM pg_advisory_xact_lock(928301); END IF; RETURN NEW; END $$;
+            CREATE TRIGGER f01_pause AFTER INSERT ON dbproxy_idempotency FOR EACH ROW EXECUTE FUNCTION f01_pause();
+            SELECT pg_advisory_lock(928301)").await.unwrap();
+        let request = write("f01-pending", "target", 9);
+        let operation = client_a.save(request.clone());
+        tokio::pin!(operation);
+        let barrier = async {
+            loop {
+                let rows = observer.query("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND wait_event='advisory' AND query LIKE '%dbproxy_idempotency%'", &[]).await.unwrap();
+                if let Some(row) = rows.first() {
+                    return row.get::<_, i32>(0);
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        let pid = tokio::select! {
+            outcome = &mut operation => panic!("write finished before exact barrier: {outcome:?}"),
+            pid = tokio::time::timeout(Duration::from_secs(10), barrier) => pid.expect("write never reached receipt barrier"),
+        };
+        assert_eq!(
+            count(
+                &observer,
+                "SELECT count(*) FROM dbproxy_snapshots WHERE namespace='f01-pending'"
+            )
+            .await,
+            0
+        );
+        let terminated: bool = observer
+            .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(terminated);
+        let first = tokio::time::timeout(Duration::from_secs(5), &mut operation)
+            .await
+            .expect("terminated write did not return");
+        let first_error = first.expect_err("uncommitted write falsely reported success");
+        assert!(
+            format!("{first_error:?}").contains("StorageUnavailable"),
+            "unexpected failure: {first_error:?}"
+        );
+        assert_eq!(
+            count(
+                &observer,
+                "SELECT count(*) FROM dbproxy_snapshots WHERE namespace='f01-pending'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(
+                &observer,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f01-pending'"
+            )
+            .await,
+            0
+        );
+        admin.batch_execute("SELECT pg_advisory_unlock(928301); DROP TRIGGER f01_pause ON dbproxy_idempotency; DROP FUNCTION f01_pause()").await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), client_a.save(request.clone()))
+                .await
+                .unwrap()
+                .unwrap(),
+            SnapshotWriteOutcome::Applied {
+                revision: Revision(1)
+            }
+        );
+        assert_eq!(
+            client_a.save(request.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Duplicate {
+                revision: Revision(1)
+            }
+        );
+        assert_eq!(
+            client_a.save(protected.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Duplicate {
+                revision: Revision(1)
+            }
+        );
+        for expected in [&request, &protected] {
+            let row = observer.query_one("SELECT payload,revision FROM dbproxy_snapshots WHERE namespace=$1 AND record_key=$2", &[&expected.record.namespace, &expected.record.key]).await.unwrap();
+            assert_eq!(row.get::<_, Vec<u8>>(0), expected.payload);
+            assert_eq!(row.get::<_, i64>(1), 1);
+        }
+        assert_eq!(
+            count(
+                &observer,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f01-pending'"
+            )
+            .await,
+            1
+        );
+        assert!(server.0.try_wait().unwrap().is_none());
+        results.push(serde_json::json!({"round":round,"database":db,"terminated_backend":pid,"first_error":format!("{first_error:?}"),"uncommitted_snapshot_rows":0,"uncommitted_receipt_rows":0,"same_id_retry":"Applied","second_retry":"Duplicate","revision":1,"server_restarted":false}));
+    }
+    std::fs::write(
+        env.artifacts.join("f01/result.json"),
+        serde_json::to_vec_pretty(&results).unwrap(),
+    )
+    .unwrap();
+    println!(
+        "F01_RESULT {}",
+        serde_json::json!({"run":env.run_id,"rounds":results})
+    );
+}
