@@ -33,6 +33,8 @@ json_sha256 "$SRC/target/release/tiangz-dbproxy-server" >"$OUT/binaries.json"
 status=0
 TESTS=${FAULT_TESTS:-f09_postgres_connection_limit_fails_clearly_and_recovers f15_tenant_a_postgres_fault_leaves_tenant_b_serving f04_kill_server_during_cleanup_keeps_invariants}
 for test in $TESTS; do
+    # Rust module separators are not valid in downloaded Windows filenames.
+    log_name=${test//::/__}
     offset=$(pglog_offset)
     echo "=== $test ==="
     if DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION=1 FAULT_RUN_ID="$RUN_ID" FAULT_LIMITED_ROLE="$ROLE" \
@@ -41,16 +43,16 @@ for test in $TESTS; do
         FAULT_CACHE_A="redis://:tiangz_dev@cache:6379/4" FAULT_CACHE_B="redis://:tiangz_dev@cache:6379/5" \
         DBPROXY_ACCEPTANCE_ARTIFACTS="$OUT" DBPROXY_ACCEPTANCE_BINARY="$SRC/target/release/tiangz-dbproxy-server" \
         cargo test -p tiangz-dbproxy-server --test fault_process --locked -- --ignored --exact "$test" --nocapture \
-        >"$OUT/$test.log" 2>&1 && grep -q "^test result: ok. 1 passed" "$OUT/$test.log"; then
-        grep -E "^test result|_RESULT" "$OUT/$test.log" | cut -c1-400
+        >"$OUT/$log_name.log" 2>&1 && grep -q "^test result: ok. 1 passed" "$OUT/$log_name.log"; then
+        grep -E "^test result|_RESULT" "$OUT/$log_name.log" | cut -c1-400
     else
         status=1
-        tail -40 "$OUT/$test.log"
+        tail -40 "$OUT/$log_name.log"
     fi
-    pglog_since "$offset" >"$OUT/$test.postgres.log"
+    pglog_since "$offset" >"$OUT/$log_name.postgres.log"
     # Every refused (re)connection is one FATAL line: the reconnect rate during the fault.
-    echo "refused_connections=$(grep -c 'too many connections for role' "$OUT/$test.postgres.log" || true)" \
-        | tee "$OUT/$test.refused.txt"
+    echo "refused_connections=$(grep -c 'too many connections for role' "$OUT/$log_name.postgres.log" || true)" \
+        | tee "$OUT/$log_name.refused.txt"
 done
 pg_sql -c "ALTER ROLE $ROLE CONNECTION LIMIT -1" >/dev/null
 echo "FAULT_PROCESS status=$status"

@@ -13,3 +13,5 @@ RunId `listener_20260929a`，新库 `_f15listener`，Linux 组件集成测试通
 入口：`FAULT_TESTS=monitor_listener_failure::f15_listener_stop_does_not_stop_business_or_cleanup bash deploy/remote-test/run_fault_process.sh <新RunId>`。旧镜像运行新增测试时，除 `fault_process.rs` 外也须挂载 `tests/support/`；F05 宿主脚本已补对应挂载。工作台固定 cpuset、4 CPU、16 GiB，未并行故障测试。
 
 证据：服务器 `/data/dbproxy-test/evidence/fault_process_listener_20260929a/`，本地 `target/server_20260929/fault_process_listener_20260929a/`，含 `f15-listener/result.json`、恢复后的指标、测试日志及 PG 日志。此次实际被测组件链接在测试二进制内，不能把 runner 附带的正式服务哈希当作组件测试二进制哈希。测试源码由本提交保存，Linux 实际重新编译执行，Windows 定向 Clippy、格式检查通过。无协议变更或代码生成。
+
+归档修复：Rust 模块测试名带 `::`，Linux 日志可正常保存，但 Windows 不接受该文件名。原远端文件保留，本地对应文件以 `__` 代替 `::`，已逐个补齐下载。runner 此后仅对日志文件名做该替换，传给 cargo 的精确测试名仍保持原样；禁止通过去掉模块名改变实际执行的测试。
