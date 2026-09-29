@@ -162,7 +162,34 @@ async fn fixed_rate_six_operations() {
     let endpoint = free_port();
     tenant_config(&dir, "A", &endpoint, &free_port());
     let deploy = deployment(&dir, &endpoint, &["A"]);
-    let mut server = spawn(&deploy, &dir, "paced", &env, &url, &url);
+    let baseline = std::env::var("MIX_BASELINE").unwrap_or_else(|_| "B2".into());
+    assert!(baseline == "B1" || baseline == "B2");
+    let mut server = if baseline == "B1" {
+        let binary = std::env::var("DBPROXY_ACCEPTANCE_HOST_BINARY")
+            .expect("B1 requires the explicitly built test host");
+        Server(
+            Command::new(binary)
+                .env("DBPROXY_TEST_POSTGRES_URL", &url)
+                .env("DBPROXY_REDIS_URL", &env.redis[0])
+                .env("DBPROXY_CACHE_REDIS_URL", &env.cache[0])
+                .env("ACCEPT_CLEANUP", "off")
+                .env("ACCEPT_READ_CONNECTION", "pooled")
+                .env("ACCEPT_SHARDS", "2")
+                .env("ACCEPT_BACKGROUND", "all")
+                .env("ACCEPT_AUTH_TOKEN", TOKEN_A)
+                .env("ACCEPT_MAX_CONNECTIONS", "32")
+                .env("TOKIO_WORKER_THREADS", "4")
+                .env("ACCEPT_LISTEN", &endpoint)
+                .env("ACCEPT_STOP_FILE", dir.join("host.stop"))
+                .stdin(Stdio::null())
+                .stdout(std::fs::File::create(dir.join("server-paced.stdout")).unwrap())
+                .stderr(std::fs::File::create(dir.join("server-paced.stderr")).unwrap())
+                .spawn()
+                .unwrap(),
+        )
+    } else {
+        spawn(&deploy, &dir, "paced", &env, &url, &url)
+    };
     let c = client(&endpoint, TOKEN_A, &mut server).await;
     // Four actual SDK connections; in-flight concurrency is a separate limit.
     let mut clients = vec![c];
@@ -181,7 +208,7 @@ async fn fixed_rate_six_operations() {
     let mut ledger = std::fs::File::create(dir.join("requests.jsonl")).unwrap();
     append(
         &mut ledger,
-        &json!({"kind":"manifest","run":env.run_id,"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":"production-enabled","full_timing":warm==120&&sample==300}),
+        &json!({"kind":"manifest","run":env.run_id,"baseline":baseline,"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
     );
     let start = tokio::time::Instant::now();
     let mut tasks = tokio::task::JoinSet::new();

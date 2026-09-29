@@ -7,6 +7,10 @@ const rows=read('requests.jsonl').trim().split(/\r?\n/).map(JSON.parse);
 const checks=read('reconciliation.jsonl').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);
 const result=JSON.parse(read('result.json'));
 const manifest=rows.filter(r=>r.kind==='manifest');assert.equal(manifest.length,1);const m=manifest[0];
+// Historical B2 runs predate the explicit baseline field.
+const baseline=m.baseline??'B2';assert(['B1','B2'].includes(baseline));
+assert.equal(m.cleanup,baseline==='B1'?'test-host-disabled':'production-enabled');
+if(m.baseline){assert.equal(m.shards,2);assert.equal(m.read_connections,2);assert.equal(m.runtime_workers,4);}
 const total=(m.warmup+m.sample)*m.rate;assert.equal(total,result.scheduled);
 assert.equal(result.full_timing,m.warmup===120 && m.sample===300);
 const kinds=['load','load_multi','save','save_multi','transaction','commit_records'];

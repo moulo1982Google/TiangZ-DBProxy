@@ -52,13 +52,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = std::env::var("ACCEPT_CLEANUP")?;
     assert!(mode == "on" || mode == "off");
     let read_mode = std::env::var("ACCEPT_READ_CONNECTION").unwrap_or_else(|_| "shared".into());
+    let shard_count =
+        std::env::var("ACCEPT_SHARDS").map_or(Ok(4), |value| value.parse::<usize>())?;
+    if !(1..=64).contains(&shard_count) {
+        return Err("ACCEPT_SHARDS must be between 1 and 64".into());
+    }
     let backend = Arc::new(
         StorageBackend::connect_with_redis_urls(
             &std::env::var("DBPROXY_TEST_POSTGRES_URL")?,
             &std::env::var("DBPROXY_REDIS_URL")?,
             &std::env::var("DBPROXY_CACHE_REDIS_URL")?,
             StorageBackendConfig {
-                shard_count: 4,
+                shard_count,
                 read_connection_count: if read_mode == "pooled" { 2 } else { 0 },
                 tiered: Default::default(),
                 enqueue: Default::default(),
@@ -80,9 +85,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request_metrics = Arc::new(DbProxyMetrics::default());
     let mut server_config = ServerConfig::new(
         std::env::var("ACCEPT_LISTEN")?.parse()?,
-        "acceptance-performance-token",
+        std::env::var("ACCEPT_AUTH_TOKEN")
+            .unwrap_or_else(|_| "acceptance-performance-token".into()),
     );
     server_config.metrics = request_metrics.clone();
+    if let Ok(value) = std::env::var("ACCEPT_MAX_CONNECTIONS") {
+        server_config.max_connections = value.parse()?;
+    }
     let server = DbProxyServer::bind(server_config, request_backend).await?;
     let (stop, shutdown) = watch::channel(false);
     let heartbeat_delay_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -158,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )));
     }
     println!(
-        "READY cleanup={mode} reads={read_mode} background={background} workers={} endpoint={}",
+        "READY cleanup={mode} reads={read_mode} shards={shard_count} background={background} workers={} endpoint={}",
         tokio::runtime::Handle::current().metrics().num_workers(),
         server.local_addr()?
     );

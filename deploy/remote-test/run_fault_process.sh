@@ -30,6 +30,11 @@ cd "$SRC"
 touch crates/dbproxy-server/tests/fault_process.rs 2>/dev/null || true
 cargo build --release --locked -p tiangz-dbproxy-server --bin tiangz-dbproxy-server >"$OUT/build.log" 2>&1
 json_sha256 "$SRC/target/release/tiangz-dbproxy-server" >"$OUT/binaries.json"
+if [[ ${MIX_BASELINE:-B2} == B1 ]]; then
+    cargo build --release --locked -p tiangz-dbproxy-server --example acceptance_host >"$OUT/host-build.log" 2>&1
+    export DBPROXY_ACCEPTANCE_HOST_BINARY="$SRC/target/release/examples/acceptance_host"
+    json_sha256 "$DBPROXY_ACCEPTANCE_HOST_BINARY" >"$OUT/host-binary.json"
+fi
 status=0
 TESTS=${FAULT_TESTS:-f09_postgres_connection_limit_fails_clearly_and_recovers f15_tenant_a_postgres_fault_leaves_tenant_b_serving f04_kill_server_during_cleanup_keeps_invariants}
 for test in $TESTS; do

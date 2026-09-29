@@ -58,3 +58,13 @@ Windows 定向 Clippy `cargo clippy -p tiangz-dbproxy-server --test fault_proces
 正式样本最大发送调度延迟 6.406 毫秒。131 份资源采样中，主机可用内存最低 34.60 GiB，PG cgroup 内存峰值 5.16 GiB（含文件缓存），工作台峰值 0.560 GiB；该曲线覆盖整个运行，不单独当作业务进程常驻内存。容器维持 4 CPU/16 GiB 和固定 cpuset，未并行启动其他验收。
 
 证据：`target/server_20260929/fault_process_mixf_0930a_r{0,1,2}/mixed-paced/`，同级 `mixf_0930a.*` 保存主机日志、资源、镜像、容器与源码摘要。服务器原件保留。本阶段只证明 B2 固定 20/s 混合基线及核对工具持续运行通过；没有 B1 同速对照或饱和点测量，不得称容量验收通过。下一步仍需 B1 完整六类宿主、自动饱和停止控制器，再执行有上限阶梯、50%/75% 承载率及修复/Outbox 的应用成本对照。
+
+## B1 六类测试宿主接入短测
+
+`mixb1s_0930a` 使用同一固定速率驱动，`MIX_BASELINE=B1` 显式选择独立编译的 release `acceptance_host`，不修改生产清理配置。宿主复用完整 StorageBackend 的 pooled 路径，不经过 DedicatedReadProbe。新增测试参数允许设置分片数、认证和连接上限，旧脚本默认值不变；本次分片 2、主库读连接 2、运行线程 4、总连接上限 32，其他后台任务开启，清理关闭。manifest 显式记录 B1 与清理状态，保存测试宿主二进制摘要。
+
+UTC 2026-09-29 17:51:33 结束，容器 exit=0/OOM=false，指定测试 `1 passed`、8.26 秒；20/s、2 秒预热 5 秒采样、并发上限 8。140 次响应、499 条快照和 14 条效果核对通过，错误/未发送/差异均为零。READY 日志核实 `cleanup=off reads=pooled shards=2 background=all workers=4`。证据已拉回 `target/server_20260929/fault_process_mixb1s_0930a/` 与同级容器记录，分析器返回 SMOKE_ONLY。本短测无连续资源曲线，不报告资源峰值。
+
+仍不能直接把 B1 与上述 B2 的差异全归因于清理：现有测试宿主每 100ms 进行独立 PG 活动采样，而正式服务是监控监听器和 5 秒存储指标轮询；正式服务还经过租户路由和独立租户指标。正式对照前需要核实并对齐这部分路径与默认存储配置。这里只验证宿主选择和六类请求完整工作，未启动高负载或容量阶梯。后续补自动饱和停止决策。
+
+验证：本地针对 acceptance_host 和 fault_process 的 Clippy（`-D warnings`）、cargo fmt、差异检查通过；Linux 实际重新编译并执行 B1 短测，分析器同时回归一份旧 B2 正式证据。无协议/生成文件变更，不运行无关全量测试。
