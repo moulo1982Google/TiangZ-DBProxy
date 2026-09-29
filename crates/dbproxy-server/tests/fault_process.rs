@@ -1527,3 +1527,170 @@ async fn f04_kill_server_during_cleanup_keeps_invariants() {
     .unwrap();
     println!("F04_RESULT {result}");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "A14: fresh PG per phase, SIGTERM during idle/lock wait/after-delete barrier, then restart"]
+async fn a14_cleanup_stops_gracefully_at_each_phase_and_resumes() {
+    let env = env();
+    let owner: String = sql(&format!("{}/postgres", env.admin_base))
+        .await
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let mut results = Vec::new();
+    for (n, phase) in ["idle", "table-lock", "after-delete"]
+        .into_iter()
+        .enumerate()
+    {
+        let db = format!("{}_a14_{n}", env.run_id);
+        let dir = env.artifacts.join("a14").join(phase);
+        std::fs::create_dir_all(&dir).unwrap();
+        create_database(&env.admin_base, &db, &owner).await;
+        let url = format!("{}/{db}", env.admin_base);
+        let admin = sql(&url).await;
+        let endpoint = free_port();
+        let observability = free_port();
+        tenant_config(&dir, "A", &endpoint, &observability);
+        let deployment = deployment(&dir, &endpoint, &["A"]);
+        let request = write("a14", "protected", 14);
+        let mut seed = spawn(&deployment, &dir, "seed", &env, &url, &url);
+        let client_a = client(&endpoint, TOKEN_A, &mut seed).await;
+        client_a.save(request.clone()).await.unwrap();
+        drop(client_a);
+        drop(seed);
+        admin.execute("INSERT INTO dbproxy_idempotency(request_id,namespace,record_key,schema_name,schema_version,payload,revision,recorded_at)
+            SELECT 'a14-recent-'||n,'a14-recent',n::text,'test',1,'',1,clock_timestamp() FROM generate_series(1,100) n", &[]).await.unwrap();
+        if phase != "idle" {
+            insert_expired(&admin, "a14-expired", 501).await;
+        }
+        if phase == "table-lock" {
+            admin
+                .batch_execute("BEGIN; LOCK TABLE dbproxy_idempotency IN EXCLUSIVE MODE")
+                .await
+                .unwrap();
+        }
+        if phase == "after-delete" {
+            admin.batch_execute("CREATE FUNCTION a14_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(928314); RETURN NULL; END $$;
+                CREATE TRIGGER a14_pause AFTER DELETE ON dbproxy_idempotency FOR EACH STATEMENT EXECUTE FUNCTION a14_pause(); SELECT pg_advisory_lock(928314)").await.unwrap();
+        }
+        // A separate autocommit observer avoids a cached pg_stat_activity snapshot in the
+        // transaction holding the table lock (stop_20260929a missed the 100ms wait that way).
+        let observer = sql(&url).await;
+        let mut server = spawn(&deployment, &dir, "stop", &env, &url, &url);
+        // For the two lock phases poll PG immediately, before waiting for the SDK handshake:
+        // the production lock timeout is only 100ms, so observing the actual barrier is required.
+        if phase == "idle" {
+            let client_a = client(&endpoint, TOKEN_A, &mut server).await;
+            wait_until(Duration::from_secs(5), "idle cleanup", || async {
+                metric_sum(
+                    &metrics(&observability).await,
+                    "dbproxy_receipt_cleanup_batches_total",
+                ) >= 1.0
+            })
+            .await;
+            drop(client_a);
+        } else {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if count(&observer, "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%DELETE FROM dbproxy_idempotency%'").await > 0 { break; }
+                    assert!(server.0.try_wait().unwrap().is_none(), "server exited before the cleanup barrier");
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }).await.expect("did not observe the exact cleanup wait");
+        }
+        let stopped_at = Instant::now();
+        assert!(
+            Command::new("kill")
+                .arg("-TERM")
+                .arg(server.0.id().to_string())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let exit = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(exit) = server.0.try_wait().unwrap() {
+                    break exit;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("graceful stop exceeded its budget");
+        assert!(exit.success(), "SIGTERM did not exit normally: {exit}");
+        let stopped_seconds = stopped_at.elapsed().as_secs_f64();
+        let log = server_log(&dir, "stop");
+        assert!(
+            log.contains("DBProxy shutdown requested") && log.contains("TiangZ DBProxy stopped")
+        );
+        assert!(!log.contains("shutdown grace expired"));
+        if phase == "table-lock" {
+            admin.batch_execute("ROLLBACK").await.unwrap();
+        }
+        if phase == "after-delete" {
+            admin.batch_execute("SELECT pg_advisory_unlock(928314); DROP TRIGGER a14_pause ON dbproxy_idempotency; DROP FUNCTION a14_pause()").await.unwrap();
+        }
+        let remaining = count(
+            &admin,
+            "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='a14-expired'",
+        )
+        .await;
+        assert_eq!(
+            remaining,
+            if phase == "idle" { 0 } else { 501 },
+            "uncommitted cleanup did not roll back completely"
+        );
+        if phase == "idle" {
+            insert_expired(&admin, "a14-expired", 501).await;
+        }
+        drop(server);
+        let mut restarted = spawn(&deployment, &dir, "restart", &env, &url, &url);
+        let client_a = client(&endpoint, TOKEN_A, &mut restarted).await;
+        wait_until(Duration::from_secs(15), "restart cleanup", || async {
+            count(
+                &admin,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='a14-expired'",
+            )
+            .await
+                == 0
+        })
+        .await;
+        assert_eq!(
+            count(
+                &admin,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='a14-recent'"
+            )
+            .await,
+            100
+        );
+        assert_eq!(
+            client_a.save(request.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Duplicate {
+                revision: Revision(1)
+            }
+        );
+        assert_eq!(
+            client_a
+                .load(&request.record)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            vec![14]
+        );
+        results.push(serde_json::json!({"phase":phase,"exit":exit.code(),"stop_seconds":stopped_seconds,"expired_after_stop":remaining,"recent_kept":100,"restart_deleted":501}));
+        drop(client_a);
+        drop(restarted);
+    }
+    std::fs::write(
+        env.artifacts.join("a14/result.json"),
+        serde_json::to_vec_pretty(&results).unwrap(),
+    )
+    .unwrap();
+    println!(
+        "A14_RESULT {}",
+        serde_json::json!({"run":env.run_id,"phases":results})
+    );
+}
