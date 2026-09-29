@@ -31,8 +31,8 @@ touch crates/dbproxy-server/tests/fault_process.rs 2>/dev/null || true
 cargo build --release --locked -p tiangz-dbproxy-server --bin tiangz-dbproxy-server >"$OUT/build.log" 2>&1
 json_sha256 "$SRC/target/release/tiangz-dbproxy-server" >"$OUT/binaries.json"
 if [[ ${MIX_BASELINE:-B2} == B1 ]]; then
-    cargo build --release --locked -p tiangz-dbproxy-server --example acceptance_host >"$OUT/host-build.log" 2>&1
-    export DBPROXY_ACCEPTANCE_HOST_BINARY="$SRC/target/release/examples/acceptance_host"
+    cargo build --release --locked -p tiangz-dbproxy-server --example acceptance_baseline >"$OUT/host-build.log" 2>&1
+    export DBPROXY_ACCEPTANCE_HOST_BINARY="$SRC/target/release/examples/acceptance_baseline"
     json_sha256 "$DBPROXY_ACCEPTANCE_HOST_BINARY" >"$OUT/host-binary.json"
 fi
 status=0

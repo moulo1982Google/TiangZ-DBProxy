@@ -169,18 +169,12 @@ async fn fixed_rate_six_operations() {
             .expect("B1 requires the explicitly built test host");
         Server(
             Command::new(binary)
-                .env("DBPROXY_TEST_POSTGRES_URL", &url)
-                .env("DBPROXY_REDIS_URL", &env.redis[0])
-                .env("DBPROXY_CACHE_REDIS_URL", &env.cache[0])
-                .env("ACCEPT_CLEANUP", "off")
-                .env("ACCEPT_READ_CONNECTION", "pooled")
-                .env("ACCEPT_SHARDS", "2")
-                .env("ACCEPT_BACKGROUND", "all")
-                .env("ACCEPT_AUTH_TOKEN", TOKEN_A)
-                .env("ACCEPT_MAX_CONNECTIONS", "32")
-                .env("TOKIO_WORKER_THREADS", "4")
-                .env("ACCEPT_LISTEN", &endpoint)
-                .env("ACCEPT_STOP_FILE", dir.join("host.stop"))
+                .arg("--tenants")
+                .arg(&deploy)
+                .env("FAULT_PG_A", &url)
+                .env("FAULT_AUTH_A", TOKEN_A)
+                .env("FAULT_REDIS_A", &env.redis[0])
+                .env("FAULT_CACHE_A", &env.cache[0])
                 .stdin(Stdio::null())
                 .stdout(std::fs::File::create(dir.join("server-paced.stdout")).unwrap())
                 .stderr(std::fs::File::create(dir.join("server-paced.stderr")).unwrap())
@@ -191,6 +185,9 @@ async fn fixed_rate_six_operations() {
         spawn(&deploy, &dir, "paced", &env, &url, &url)
     };
     let c = client(&endpoint, TOKEN_A, &mut server).await;
+    if baseline == "B1" {
+        assert!(server_log(&dir, "paced").contains("acceptance host: receipt cleanup disabled"));
+    }
     // Four actual SDK connections; in-flight concurrency is a separate limit.
     let mut clients = vec![c];
     for _ in 1..4 {

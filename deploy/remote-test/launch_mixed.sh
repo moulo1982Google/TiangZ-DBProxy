@@ -28,10 +28,14 @@ docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cp
     -v "$DATA/evidence:/evidence" -v "$DATA/pglog:/pglog:ro" \
     -v "$DATA/src/crates/dbproxy-server/tests:/src/crates/dbproxy-server/tests:ro" \
     -v "$DATA/src/crates/dbproxy-server/examples:/src/crates/dbproxy-server/examples:ro" \
+    -v "$DATA/src/crates/dbproxy-server/src:/src/crates/dbproxy-server/src:ro" \
     -v "$DATA/src/deploy/remote-test:/src/deploy/remote-test:ro" \
     "$IMAGE" bash /src/deploy/remote-test/run_mixed_rounds.sh "$RUN_ID" >/dev/null
 docker exec "$WB" sha256sum /src/crates/dbproxy-server/tests/support/mixed_paced.rs \
-    /src/crates/dbproxy-server/tests/support/mixed_workload.rs >"$DATA/evidence/$RUN_ID.sources.sha256"
+    /src/crates/dbproxy-server/tests/support/mixed_workload.rs \
+    /src/crates/dbproxy-server/src/server_process.rs \
+    /src/crates/dbproxy-server/src/main.rs \
+    /src/crates/dbproxy-server/examples/acceptance_baseline.rs >"$DATA/evidence/$RUN_ID.sources.sha256"
 docker image inspect "$IMAGE" >"$DATA/evidence/$RUN_ID.image.json"
 bash "$DATA/src/deploy/remote-test/sample_containers.sh" "$DATA/evidence/$RUN_ID.containers.jsonl" "$WB" 10 >/dev/null 2>&1 &
 sampler=$!
