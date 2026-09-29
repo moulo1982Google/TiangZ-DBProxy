@@ -1694,3 +1694,139 @@ async fn a14_cleanup_stops_gracefully_at_each_phase_and_resumes() {
         serde_json::json!({"run":env.run_id,"phases":results})
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "F03: three fresh databases, SIGKILL at the actual after-delete/pre-commit barrier"]
+async fn f03_kill_after_delete_rolls_back_and_restarts() {
+    use std::os::unix::process::ExitStatusExt;
+    let env = env();
+    let owner: String = sql(&format!("{}/postgres", env.admin_base))
+        .await
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let mut results = Vec::new();
+    for round in 0..3 {
+        let db = format!("{}_f03_{round}", env.run_id);
+        let dir = env.artifacts.join("f03").join(round.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        create_database(&env.admin_base, &db, &owner).await;
+        let url = format!("{}/{db}", env.admin_base);
+        let admin = sql(&url).await;
+        let observer = sql(&url).await;
+        let endpoint = free_port();
+        let observability = free_port();
+        tenant_config(&dir, "A", &endpoint, &observability);
+        let deployment = deployment(&dir, &endpoint, &["A"]);
+        let request = write("f03", "protected", 3);
+        let mut seed = spawn(&deployment, &dir, "seed", &env, &url, &url);
+        let client_a = client(&endpoint, TOKEN_A, &mut seed).await;
+        client_a.save(request.clone()).await.unwrap();
+        drop(client_a);
+        drop(seed);
+        insert_expired(&admin, "f03-expired", 501).await;
+        admin.batch_execute("INSERT INTO dbproxy_idempotency(request_id,namespace,record_key,schema_name,schema_version,payload,revision,recorded_at)
+            SELECT 'f03-recent-'||n,'f03-recent',n::text,'test',1,'',1,clock_timestamp() FROM generate_series(1,100) n;
+            CREATE FUNCTION f03_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(928303); RETURN NULL; END $$;
+            CREATE TRIGGER f03_pause AFTER DELETE ON dbproxy_idempotency FOR EACH STATEMENT EXECUTE FUNCTION f03_pause();
+            SELECT pg_advisory_lock(928303)").await.unwrap();
+        let mut server = spawn(&deployment, &dir, "kill", &env, &url, &url);
+        // Observe from an autocommit connection, before any SDK handshake. The production
+        // 100ms lock timeout stays unchanged; the AFTER trigger identifies the exact phase.
+        let backend_pid: i32 = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let rows = observer.query("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND wait_event='advisory' AND query LIKE '%DELETE FROM dbproxy_idempotency%'", &[]).await.unwrap();
+                if let Some(row) = rows.first() { break row.get(0); }
+                assert!(server.0.try_wait().unwrap().is_none(), "server exited before the barrier");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }).await.expect("after-delete advisory wait was not observed");
+        let killed_at = Instant::now();
+        server.0.kill().unwrap();
+        let exit = server.0.wait().unwrap();
+        assert_eq!(exit.signal(), Some(9), "expected actual SIGKILL");
+        let kill_seconds = killed_at.elapsed().as_secs_f64();
+        // Keep the barrier held until PG has discarded the dead process's transaction.
+        wait_until(
+            Duration::from_secs(5),
+            "dead cleanup connection to disappear",
+            || async {
+                observer
+                    .query(
+                        "SELECT pid FROM pg_stat_activity WHERE pid=$1",
+                        &[&backend_pid],
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            },
+        )
+        .await;
+        assert_eq!(
+            count(
+                &admin,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f03-expired'"
+            )
+            .await,
+            501
+        );
+        assert_eq!(
+            count(
+                &admin,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f03-recent'"
+            )
+            .await,
+            100
+        );
+        admin.batch_execute("SELECT pg_advisory_unlock(928303); DROP TRIGGER f03_pause ON dbproxy_idempotency; DROP FUNCTION f03_pause()").await.unwrap();
+        drop(server);
+        let mut restarted = spawn(&deployment, &dir, "restart", &env, &url, &url);
+        let client_a = client(&endpoint, TOKEN_A, &mut restarted).await;
+        wait_until(Duration::from_secs(15), "restart cleanup", || async {
+            count(
+                &admin,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f03-expired'",
+            )
+            .await
+                == 0
+        })
+        .await;
+        assert_eq!(
+            count(
+                &admin,
+                "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='f03-recent'"
+            )
+            .await,
+            100
+        );
+        assert_eq!(
+            client_a.save(request.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Duplicate {
+                revision: Revision(1)
+            }
+        );
+        assert_eq!(
+            client_a
+                .load(&request.record)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            vec![3]
+        );
+        results.push(serde_json::json!({"round":round,"database":db,"barrier_backend_pid":backend_pid,"signal":exit.signal(),"kill_seconds":kill_seconds,"expired_after_kill":501,"restart_deleted":501,"recent_kept":100,"replay":"Duplicate","revision":1}));
+        drop(client_a);
+        drop(restarted);
+    }
+    std::fs::write(
+        env.artifacts.join("f03/result.json"),
+        serde_json::to_vec_pretty(&results).unwrap(),
+    )
+    .unwrap();
+    println!(
+        "F03_RESULT {}",
+        serde_json::json!({"run":env.run_id,"rounds":results})
+    );
+}
