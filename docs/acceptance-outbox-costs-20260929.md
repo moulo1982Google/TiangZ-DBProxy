@@ -40,6 +40,8 @@ UTC 14:24:25（北京时间 22:24:25）结束，容器退出 0、OOM=false。三
 
 ## 双 publisher 补测方法
 
+正式 `p7mf_0929a` 于 UTC 2026-09-29 14:58:07（北京时间 22:58:07）启动，容器 `dbproxy-p07-p7mf_0929a`，源码提交 `a1c3089`。保持 4 CPU/16 GiB、固定 cpuset，两个 publisher 的 12 阶段三轮预计北京时间 9 月 30 日 00:24 左右完成。当前尚未取得完整结果；证据在 `/data/dbproxy-test/evidence/outbox_p7mf_0929a`，资源和主机日志为同级 `p7mf_0929a.*`。
+
 短测 `p7ms_0929a` 在夹具准备阶段失败并保留：插入后 UPDATE publisher/destination 被 `outbox delivery route is immutable` 正确拒绝，尚未开始计时。已修正为先调用生产 API 注册 publisher/route，再按 route.key 插入，由生产触发器固化路由；没有关闭触发器、修改生产规则或放宽断言。失败日志和容器资料保存在 `target/server_20260929/outbox_p7ms_0929a/` 及同级文件，新库 `p7ms_0929b` 用于修正后的短测。
 
 `p7ms_0929b` 在十万条带路由插入时触发准备连接的 5 秒语句超时，也未进入计时，证据同样拉回保留。调整为每批一万条、共十批，保留总量和全部路由触发器；5 秒语句/请求上限不变。新库 `p7ms_0929c` 验证分批准备后的工具。
