@@ -132,6 +132,41 @@ fn append(file: &mut std::fs::File, row: &Value) {
     file.flush().unwrap();
 }
 
+// Conservative test safety limits, not service SLAs or an assertion relaxation.
+fn stop_reason(
+    error: bool,
+    full: bool,
+    dispatch_us: u128,
+    oldest_us: u128,
+) -> Option<&'static str> {
+    if error {
+        Some("response_error")
+    } else if full {
+        Some("in_flight_limit")
+    } else if dispatch_us > 100_000 {
+        Some("dispatch_over_100ms")
+    } else if oldest_us > 1_000_000 {
+        Some("in_flight_over_1s")
+    } else {
+        None
+    }
+}
+
+#[test]
+fn saturation_guard_has_fixed_boundaries() {
+    assert_eq!(stop_reason(false, false, 100_000, 1_000_000), None);
+    assert_eq!(stop_reason(true, false, 0, 0), Some("response_error"));
+    assert_eq!(stop_reason(false, true, 0, 0), Some("in_flight_limit"));
+    assert_eq!(
+        stop_reason(false, false, 100_001, 0),
+        Some("dispatch_over_100ms")
+    );
+    assert_eq!(
+        stop_reason(false, false, 0, 1_000_001),
+        Some("in_flight_over_1s")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "new PG database and real process; bounded mixed fixed-rate driver"]
 async fn fixed_rate_six_operations() {
@@ -208,30 +243,55 @@ async fn fixed_rate_six_operations() {
         &json!({"kind":"manifest","run":env.run_id,"baseline":baseline,"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
     );
     let start = tokio::time::Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks = tokio::task::JoinSet::<Value>::new();
     let mut completed = Vec::new();
     let mut not_sent = 0_u64;
+    let mut stopped: Option<Value> = None;
+    let mut pending = std::collections::BTreeMap::new();
+    let mut response_error = false;
+    append(
+        &mut ledger,
+        &json!({"kind":"guard_policy","version":1,"dispatch_us":100_000,"in_flight_us":1_000_000,"first_error_or_capacity_miss":true}),
+    );
     for n in 0..total {
         let scheduled = start + Duration::from_secs_f64(n as f64 / rate as f64);
         tokio::time::sleep_until(scheduled).await;
         while let Some(row) = tasks.try_join_next() {
             let row = row.unwrap();
+            pending.remove(&row["n"].as_u64().unwrap());
+            response_error |= row["outcome"]["status"] != "success";
             append(&mut ledger, &row);
             completed.push(row);
         }
-        if tasks.len() >= concurrency {
-            append(
-                &mut ledger,
-                &json!({"kind":"not_sent","n":n,"op":KINDS[kind(n)],"sample":n>=warm*rate,"reason":"in_flight_limit"}),
-            );
-            not_sent += 1;
-            continue;
+        let oldest_us = pending
+            .values()
+            .map(|sent: &tokio::time::Instant| sent.elapsed().as_micros())
+            .max()
+            .unwrap_or(0);
+        if let Some(reason) = stop_reason(
+            response_error,
+            tasks.len() >= concurrency,
+            scheduled.elapsed().as_micros(),
+            oldest_us,
+        ) {
+            let event = json!({"kind":"guard_stop","n":n,"reason":reason,"in_flight":tasks.len(),"dispatch_us":scheduled.elapsed().as_micros(),"oldest_us":oldest_us,"elapsed_us":start.elapsed().as_micros()});
+            append(&mut ledger, &event);
+            stopped = Some(event);
+            for skipped in n..total {
+                append(
+                    &mut ledger,
+                    &json!({"kind":"not_sent","n":skipped,"op":KINDS[kind(skipped)],"sample":skipped>=warm*rate,"reason":"guard_stopped"}),
+                );
+                not_sent += 1;
+            }
+            break;
         }
         append(
             &mut ledger,
             &json!({"kind":"intent","n":n,"op":KINDS[kind(n)],"sample":n>=warm*rate,"scheduled_us":scheduled.duration_since(start).as_micros()}),
         );
         ledger.sync_data().unwrap();
+        pending.insert(n, tokio::time::Instant::now());
         let c = clients[n as usize % 4].clone();
         let run = env.run_id.clone();
         let seeds = seeds.clone();
@@ -247,7 +307,9 @@ async fn fixed_rate_six_operations() {
         append(&mut ledger, &row);
         completed.push(row);
     }
-    tokio::time::sleep_until(start + Duration::from_secs(warm + sample)).await;
+    if stopped.is_none() {
+        tokio::time::sleep_until(start + Duration::from_secs(warm + sample)).await;
+    }
     ledger.sync_all().unwrap();
     // All sent writes are checked, including failed/partial/unknown responses. Never resend here.
     let pg = sql(&url).await;
@@ -354,7 +416,7 @@ async fn fixed_rate_six_operations() {
         .iter()
         .filter(|r| r["outcome"]["status"] != "success")
         .count();
-    let result = json!({"full_timing":warm==120&&sample==300,"rounds":1,"rate":rate,"concurrency":concurrency,"scheduled":total,"responses":completed.len(),"not_sent":not_sent,"errors":errors,"reconciliation_mismatches":mismatches,"snapshots":present+BATCH as u64,"effect_rows":effects_found,"capacity_proven":false});
+    let result = json!({"full_timing":warm==120&&sample==300&&stopped.is_none(),"guard_stop":stopped,"rounds":1,"rate":rate,"concurrency":concurrency,"scheduled":total,"responses":completed.len(),"not_sent":not_sent,"errors":errors,"reconciliation_mismatches":mismatches,"snapshots":present+BATCH as u64,"effect_rows":effects_found,"capacity_proven":false});
     std::fs::write(
         dir.join("result.json"),
         serde_json::to_vec_pretty(&result).unwrap(),

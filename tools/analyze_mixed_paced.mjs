@@ -12,7 +12,9 @@ const baseline=m.baseline??'B2';assert(['B1','B2'].includes(baseline));
 assert.equal(m.cleanup,baseline==='B1'?'test-host-disabled':'production-enabled');
 if(m.baseline){assert.equal(m.shards,2);assert.equal(m.read_connections,2);assert.equal(m.runtime_workers,4);}
 const total=(m.warmup+m.sample)*m.rate;assert.equal(total,result.scheduled);
-assert.equal(result.full_timing,m.warmup===120 && m.sample===300);
+const stops=rows.filter(r=>r.kind==='guard_stop');assert(stops.length<=1);
+assert.deepEqual(result.guard_stop??null,stops[0]??null);
+assert.equal(result.full_timing,m.warmup===120 && m.sample===300 && stops.length===0);
 const kinds=['load','load_multi','save','save_multi','transaction','commit_records'];
 const kind=n=>{const x=n%20;return x<8?0:x<12?1:x<16?2:x<18?3:x===18?4:5;};
 const byType=t=>new Map(rows.filter(r=>r.kind===t).map(r=>[r.n,r]));
@@ -26,6 +28,20 @@ for(let n=0;n<total;n++){
 }
 assert.equal(intents.size+dropped.size,total);assert.equal(responses.size,result.responses);assert.equal(dropped.size,result.not_sent);
 assert.equal(responses.size,intents.size);
+if(Object.hasOwn(result,'guard_stop')){
+  const policies=rows.filter(r=>r.kind==='guard_policy');assert.equal(policies.length,1);
+  assert.deepEqual(policies[0],{kind:'guard_policy',version:1,dispatch_us:100000,in_flight_us:1000000,first_error_or_capacity_miss:true});
+}
+if(stops.length){
+  const stop=stops[0];assert(Number.isInteger(stop.n)&&stop.n>=0&&stop.n<total);
+  assert(['response_error','in_flight_limit','dispatch_over_100ms','in_flight_over_1s'].includes(stop.reason));
+  assert.equal(dropped.size,total-stop.n);assert.equal(intents.size,stop.n);
+  for(let n=stop.n;n<total;n++){assert(!intents.has(n));assert.equal(dropped.get(n)?.reason,'guard_stopped');}
+  if(stop.reason==='in_flight_limit')assert(stop.in_flight>=m.concurrency);
+  if(stop.reason==='dispatch_over_100ms')assert(stop.dispatch_us>100000);
+  if(stop.reason==='in_flight_over_1s')assert(stop.oldest_us>1000000);
+  if(stop.reason==='response_error')assert(result.errors>0);
+}
 assert.equal([...responses.values()].filter(r=>r.outcome.status!=='success').length,result.errors);
 const sentWrites=[...intents.keys()].filter(n=>kind(n)>=2);
 assert.equal(checks.length,sentWrites.length);assert.deepEqual([...new Set(checks.map(r=>r.n))].sort((a,b)=>a-b),sentWrites.sort((a,b)=>a-b));
