@@ -26,7 +26,19 @@ RunId `p06_0929a`，三项测试各用新库 `_distribution/_order/_half`，全�
 
 热点记录有效租约期间连续合并 1,000 次，目标 revision 从 1 到 1,001，租约身份及排队时间未被刷新。合并 P50 0.992ms、P99 1.239ms、最大 1.860ms。按旧 revision 确认不会删除新目标，重新领取获得新租约，旧租约确认被拒绝，最终按 revision=1,001 确认后归零。
 
-范围：PG 队列领取/写入和确认语义；不包含实际 Redis 缓存修复后的值、应用整体负载成本或容量阶梯，P06 整体仍为部分完成。
+上述范围：PG 队列领取/写入和确认语义。实际 Redis 链路补测见下一节；应用整体负载成本与容量阶梯仍未覆盖，P06 整体仍为部分完成。
+
+## 实际 Redis 修复链路补测
+
+`p06e2e_0929a` 于 2026-09-29 通过，Linux 指定测试 `1 passed`，耗时 7.98 秒。新 PG 库，使用生产 `StorageBackend::process_cache_repair_once`，实际经过领取、PG 权威读取、Redis 回填、PG 确认；生产代码没有改动。
+
+- 256 条记录：先在 Redis 保存 revision=1，再让 PG 前进到 revision=2 并留下修复目标。锁住前 128 条目标，另外 128 条正常修复；此时逐条检查锁住的缓存仍为旧值、未锁的为新值，全部剩余行锁住时返回 Empty。解锁后续修，256 条缓存与 PG 完整 envelope 一致、队列归零。
+- 删除一条权威快照但保留旧缓存，入队修复后 Redis 旧值被清除，未复活已删除记录。
+- 对一个热点连续提交 64 次新版本，并发运行实际修复方法，最终 Redis/PG 均为 revision=66、payload=[3,63]，队列归零。本轮发生 64 次成功修复；不把本轮执行交错当作所有租约时序覆盖，精确旧 ACK fencing 证据仍见前述 PG 测试。
+
+256 次完整修复调用的 P50=7.515ms、P99=8.851ms、最大=11.726ms；热点更新与消费约 0.905 秒。这是有限功能/成本样本，混合锁住/解锁阶段，不是 120/300 秒三轮性能对照，更不是整体应用吞吐结论。
+
+工作台仍为 4 CPU/16 GiB、固定 cpuset，测试在 P01 完整结束后串行执行。Windows 指定测试 Clippy `-D warnings`、格式和差异检查通过，Linux 实际重编译并执行。复测选择 `FAULT_TESTS=cache_repair_end_to_end::p06_repairs_reach_redis_and_preserve_latest_revision`，由 `run_fault_process.sh <全新RunId>` 创建新库。证据：`target/server_20260929/fault_process_p06e2e_0929a/p06-e2e/`，包含 result.json 和完整修复耗时；服务器原件保留。
 
 复测：工作台 `bash deploy/remote-test/run_repair_matrix.sh <新RunId>`，旧镜像挂载 `repair_claim_plans.rs` 与脚本目录；每项新库、300 秒上限、检查一项实际执行。220 工作台 4 CPU/16 GiB、固定 cpuset。
 

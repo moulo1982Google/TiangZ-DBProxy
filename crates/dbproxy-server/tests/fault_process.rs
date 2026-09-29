@@ -6,6 +6,8 @@
 //! owns its database. Every test creates its own databases and fails if they already exist.
 #[path = "support/batch_read_matrix.rs"]
 mod batch_read_matrix;
+#[path = "support/cache_repair_end_to_end.rs"]
+mod cache_repair_end_to_end;
 #[path = "support/monitor_listener_failure.rs"]
 mod monitor_listener_failure;
 #[path = "support/outbox_publish_crash.rs"]
