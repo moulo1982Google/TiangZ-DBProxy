@@ -34,4 +34,6 @@
 
 下一步先执行 B2（正式完整服务、清理开启）固定 20/s、并发上限 8 的三轮完整计时，验证整套负载/证据工具持续工作。入口 `launch_mixed.sh` → `run_mixed_rounds.sh`，每轮全新 RunId/数据库。尚未具备容量控制器的饱和停止决策，不使用此驱动单独扩大到高负载；B1 对照、容量阶梯和 50%/75% 承载率仍待后续阶段。
 
+正式 `mixf_0930a` 已于 UTC 2026-09-29 17:11:18（北京时间 9 月 30 日 01:11:18）启动，容器 `dbproxy-mixed-mixf_0930a`，源码 `f59c9f2`。每轮 120/300 秒，三个新库/RunId `_r0/_r1/_r2`；预计约 22–25 分钟，最终以退出与核对结果为准。证据在 `/data/dbproxy-test/evidence/fault_process_mixf_0930a_r{0,1,2}/mixed-paced`，资源/主机日志为同级 `mixf_0930a.*`。运行中不上传或修改挂载源码，也不并行服务器编译/负载/故障。
+
 Windows 定向 Clippy `cargo clippy -p tiangz-dbproxy-server --test fault_process --locked -- -D warnings`、cargo fmt 和差异检查通过；Linux 重新编译并实际执行。无协议或生成文件变化，未运行无关全量测试。原始证据在 `target/server_20260929/fault_process_mixs_0930a/`，容器/日志为同级 `mixs_0930a.*`，服务器原件保留。
