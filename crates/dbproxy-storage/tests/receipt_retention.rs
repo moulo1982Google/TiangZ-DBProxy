@@ -39,6 +39,71 @@ fn request(id: &str) -> SnapshotWrite {
 }
 
 #[tokio::test]
+#[ignore = "A06: fresh isolated PG; past/future business time and receipt retry age"]
+async fn business_time_never_controls_receipt_age_or_renews_it() {
+    let (_, mut store, sql) = fixture().await;
+    // Unix epoch, historical business time, and 2100; never alter the server clock.
+    for (n, business_ms) in [0, 1, 4_102_444_800_000u64].into_iter().enumerate() {
+        let mut saved = request(&format!("business-time-{n}"));
+        saved.updated_at_unix_ms = business_ms;
+        assert_eq!(
+            store.save(saved.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Applied {
+                revision: Revision(1)
+            }
+        );
+        let original: String = sql
+            .query_one(
+                "SELECT recorded_at::text FROM dbproxy_idempotency WHERE request_id=$1",
+                &[&saved.request_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(store.cleanup_expired_receipts(RETENTION).await.unwrap(), 0);
+        assert_eq!(
+            store.save(saved.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Duplicate {
+                revision: Revision(1)
+            }
+        );
+        let unchanged: bool = sql.query_one(
+            "SELECT recorded_at=$2::text::timestamptz FROM dbproxy_idempotency WHERE request_id=$1", &[&saved.request_id, &original]
+        ).await.unwrap().get(0);
+        assert!(unchanged, "retry renewed a fresh receipt");
+        sql.execute("UPDATE dbproxy_idempotency SET recorded_at=clock_timestamp()-interval '23 hours' WHERE request_id=$1", &[&saved.request_id]).await.unwrap();
+        let aged: String = sql
+            .query_one(
+                "SELECT recorded_at::text FROM dbproxy_idempotency WHERE request_id=$1",
+                &[&saved.request_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            store.save(saved.clone()).await.unwrap(),
+            SnapshotWriteOutcome::Duplicate {
+                revision: Revision(1)
+            }
+        );
+        let unchanged: bool = sql.query_one(
+            "SELECT recorded_at=$2::text::timestamptz FROM dbproxy_idempotency WHERE request_id=$1", &[&saved.request_id, &aged]
+        ).await.unwrap().get(0);
+        assert!(unchanged, "retry renewed an aged receipt");
+        assert_eq!(store.cleanup_expired_receipts(RETENTION).await.unwrap(), 0);
+        sql.execute("UPDATE dbproxy_idempotency SET recorded_at=clock_timestamp()-interval '25 hours' WHERE request_id=$1", &[&saved.request_id]).await.unwrap();
+        assert_eq!(store.cleanup_expired_receipts(RETENTION).await.unwrap(), 1);
+        let snapshot = store.load(&saved.record).await.unwrap().unwrap();
+        assert_eq!(snapshot.revision, Revision(1));
+        assert_eq!(snapshot.payload, saved.payload);
+        assert_eq!(snapshot.updated_at_unix_ms, business_ms);
+        println!(
+            "A06_BUSINESS_TIME business_ms={business_ms} fresh_kept=true retry_age_unchanged=true aged_deleted=true snapshot_kept=true"
+        );
+    }
+}
+
+#[tokio::test]
 #[ignore = "isolated PG; changes migration shape to test old-schema upgrade"]
 async fn migration_grants_old_receipts_full_retention() {
     let (url, mut store, sql) = fixture().await;
@@ -330,7 +395,9 @@ async fn cutoff_is_strict_and_expired_receipts_do_not_bypass_cas() {
             "$1::double precision",
             &format!("{seconds}::double precision"),
         );
-        tx.batch_execute(&format!("INSERT INTO dbproxy_idempotency(request_id,namespace,record_key,schema_name,schema_version,payload,revision,recorded_at) VALUES('retention-exact','receipt-retention','exact','test',1,'',1,statement_timestamp()-make_interval(secs => {seconds})); {cleanup}")).await.unwrap();
+        tx.batch_execute(&format!("INSERT INTO dbproxy_idempotency(request_id,namespace,record_key,schema_name,schema_version,payload,revision,recorded_at)
+            SELECT 'retention-'||label,'receipt-retention',label,'test',1,'',1,statement_timestamp()-make_interval(secs => {seconds}+delta)
+            FROM (VALUES ('before',-1),('exact',0),('after',1)) AS cases(label,delta); {cleanup}")).await.unwrap();
         let remains: bool = tx
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM dbproxy_idempotency WHERE request_id='retention-exact')",
@@ -342,6 +409,17 @@ async fn cutoff_is_strict_and_expired_receipts_do_not_bypass_cas() {
         assert!(
             remains,
             "a receipt exactly {seconds} seconds old is not strictly older than the retention"
+        );
+        let retained: Vec<String> = tx.query(
+            "SELECT request_id FROM dbproxy_idempotency WHERE namespace='receipt-retention' ORDER BY request_id", &[]
+        ).await.unwrap().into_iter().map(|row| row.get(0)).collect();
+        assert_eq!(
+            retained,
+            ["retention-before", "retention-exact"],
+            "only strictly expired receipts may be removed"
+        );
+        println!(
+            "A06_CUTOFF retention_seconds={seconds} before_kept=true exact_kept=true after_deleted=true"
         );
         tx.rollback().await.unwrap();
     }
