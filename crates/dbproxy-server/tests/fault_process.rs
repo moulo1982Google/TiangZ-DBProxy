@@ -8,6 +8,8 @@
 mod batch_read_matrix;
 #[path = "support/cache_repair_end_to_end.rs"]
 mod cache_repair_end_to_end;
+#[path = "support/mixed_workload.rs"]
+mod mixed_workload;
 #[path = "support/monitor_listener_failure.rs"]
 mod monitor_listener_failure;
 #[path = "support/outbox_publish_crash.rs"]
