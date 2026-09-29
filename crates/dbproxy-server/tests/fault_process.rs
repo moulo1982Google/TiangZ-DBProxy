@@ -287,6 +287,208 @@ async fn schema_catalog(sql: &tokio_postgres::Client) -> serde_json::Value {
 }
 
 #[tokio::test]
+#[ignore = "A07/A16: fresh PG, 100k recent receipts, real cleanup counters and database outage"]
+async fn a07_a16_receipt_counts_and_pg_failure_metrics() {
+    let env = env();
+    let db = format!("{}_a07", env.run_id);
+    let dir = env.artifacts.join("a07-a16");
+    std::fs::create_dir_all(&dir).unwrap();
+    let owner: String = sql(&format!("{}/postgres", env.admin_base))
+        .await
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    create_database(&env.admin_base, &db, &owner).await;
+    let url = format!("{}/{db}", env.admin_base);
+    let admin = sql(&url).await;
+    let endpoint = free_port();
+    let observability = free_port();
+    tenant_config(&dir, "A", &endpoint, &observability);
+    let deployment = deployment(&dir, &endpoint, &["A"]);
+    let mut seed = spawn(&deployment, &dir, "seed", &env, &url, &url);
+    let client_a = client(&endpoint, TOKEN_A, &mut seed).await;
+    wait_until(Duration::from_secs(5), "empty cleanup metric", || async {
+        metric_sum(
+            &metrics(&observability).await,
+            "dbproxy_receipt_cleanup_batches_total",
+        ) == 1.0
+    })
+    .await;
+    let empty_metrics = metrics(&observability).await;
+    assert_eq!(
+        metric_sum(&empty_metrics, "dbproxy_receipt_cleanup_deleted_total"),
+        0.0
+    );
+    assert_eq!(
+        metric_sum(&empty_metrics, "dbproxy_receipt_cleanup_failures_total"),
+        0.0
+    );
+    let request = write("a07-business", "protected", 74);
+    client_a.save(request.clone()).await.unwrap();
+    drop(client_a);
+    drop(seed);
+    insert_expired(&admin, "a07-expired", 1101).await;
+    admin.execute("INSERT INTO dbproxy_idempotency(request_id,namespace,record_key,schema_name,schema_version,payload,revision,recorded_at)
+        SELECT 'a07-recent-'||n,'a07-recent',n::text,'test',1,'',1,clock_timestamp() FROM generate_series(1,100000) n", &[]).await.unwrap();
+    let mut server = spawn(&deployment, &dir, "run", &env, &url, &url);
+    let client_a = client(&endpoint, TOKEN_A, &mut server).await;
+    wait_until(Duration::from_secs(15), "1101 deleted metric", || async {
+        metric_sum(
+            &metrics(&observability).await,
+            "dbproxy_receipt_cleanup_deleted_total",
+        ) == 1101.0
+    })
+    .await;
+    assert_eq!(
+        count(
+            &admin,
+            "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='a07-expired'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &admin,
+            "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='a07-recent'"
+        )
+        .await,
+        100000
+    );
+    let deleted_metrics = metrics(&observability).await;
+    assert_eq!(
+        metric_sum(&deleted_metrics, "dbproxy_receipt_cleanup_batches_total"),
+        3.0
+    );
+    assert_eq!(
+        metric_sum(&deleted_metrics, "dbproxy_receipt_cleanup_failures_total"),
+        0.0
+    );
+    let batches: Vec<u64> = server_log(&dir, "run")
+        .lines()
+        .filter(|line| line.contains("ordinary receipt cleanup completed"))
+        .map(|line| {
+            line.split("deleted=")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(batches, [500, 500, 101]);
+
+    // PG rejects disabling the database of the command's own session. Use a control session
+    // in postgres; preserve the existing fixture session for read-only checks and exclude it below.
+    let control = sql(&format!("{}/postgres", env.admin_base)).await;
+    control
+        .batch_execute(&format!("ALTER DATABASE \"{db}\" ALLOW_CONNECTIONS false"))
+        .await
+        .unwrap();
+    let killed: i64 = admin.query_one("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()", &[]).await.unwrap().get(0);
+    assert!(killed >= BUDGET as i64);
+    let failed_write = write("a07-business", "during-outage", 75);
+    let failure = tokio::time::timeout(Duration::from_secs(5), client_a.save(failed_write.clone()))
+        .await
+        .unwrap();
+    assert!(
+        failure.is_err(),
+        "write succeeded while this database was unavailable"
+    );
+    assert!(
+        failure
+            .unwrap_err()
+            .to_string()
+            .contains("StorageUnavailable")
+    );
+    wait_until(
+        Duration::from_secs(70),
+        "unavailable PG cleanup failure",
+        || async {
+            metric_sum(
+                &metrics(&observability).await,
+                "dbproxy_receipt_cleanup_failures_total",
+            ) == 1.0
+        },
+    )
+    .await;
+    let failure_metrics = metrics(&observability).await;
+    assert_eq!(
+        metric_sum(&failure_metrics, "dbproxy_receipt_cleanup_deleted_total"),
+        1101.0
+    );
+    assert!(
+        server_log(&dir, "run")
+            .lines()
+            .any(|line| line.contains("ordinary receipt cleanup failed")
+                && line.contains("tenant=a"))
+    );
+    control
+        .batch_execute(&format!("ALTER DATABASE \"{db}\" ALLOW_CONNECTIONS true"))
+        .await
+        .unwrap();
+    insert_expired(&admin, "a07-recovery", 1).await;
+    wait_until(
+        Duration::from_secs(70),
+        "cleanup recovery counter",
+        || async {
+            metric_sum(
+                &metrics(&observability).await,
+                "dbproxy_receipt_cleanup_deleted_total",
+            ) == 1102.0
+        },
+    )
+    .await;
+    assert_eq!(
+        count(
+            &admin,
+            "SELECT count(*) FROM dbproxy_idempotency WHERE namespace='a07-recent'"
+        )
+        .await,
+        100000
+    );
+    assert!(client_a.load(&failed_write.record).await.unwrap().is_none());
+    assert_eq!(
+        client_a.save(request.clone()).await.unwrap(),
+        SnapshotWriteOutcome::Duplicate {
+            revision: Revision(1)
+        }
+    );
+    assert_eq!(
+        client_a
+            .load(&request.record)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+        vec![74]
+    );
+    let recovered_metrics = metrics(&observability).await;
+    assert_eq!(
+        metric_sum(&recovered_metrics, "dbproxy_receipt_cleanup_failures_total"),
+        1.0
+    );
+    for (name, text) in [
+        ("empty", empty_metrics),
+        ("deleted", deleted_metrics),
+        ("unavailable", failure_metrics),
+        ("recovered", recovered_metrics),
+    ] {
+        std::fs::write(dir.join(format!("metrics-{name}.txt")), text).unwrap();
+    }
+    let result = serde_json::json!({"run":env.run_id,"recent_kept":100000,"batches":batches,"deleted_after_recovery":1102,"cleanup_failures":1,"killed_connections":killed,"outage_write_present":false});
+    std::fs::write(
+        dir.join("result.json"),
+        serde_json::to_vec_pretty(&result).unwrap(),
+    )
+    .unwrap();
+    println!("A07_A16_RESULT {result}");
+}
+
+#[tokio::test]
 #[ignore = "A01: fresh PG, real release process initial startup and two restarts"]
 async fn a01_empty_database_and_restarts_preserve_schema_and_business() {
     let env = env();
