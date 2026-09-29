@@ -8,6 +8,8 @@
 mod monitor_listener_failure;
 #[path = "support/outbox_publish_crash.rs"]
 mod outbox_publish_crash;
+#[path = "support/postgres_space_failure.rs"]
+mod postgres_space_failure;
 #[path = "support/reliable_redis_restart.rs"]
 mod reliable_redis_restart;
 #[path = "support/shared_cleanup_pressure.rs"]

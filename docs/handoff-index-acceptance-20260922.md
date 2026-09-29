@@ -1,5 +1,7 @@
 # 索引、回执清理与性能验收交接（2026-09-22）
 
+> F10 独立 WAL 满触发 PG PANIC 后恢复、日志满写入失败均通过；原数据与双记录原子性核对、清理续跑完成，见 [WAL/日志满报告](acceptance-wal-log-full-20260929.md)。
+
 > F11 可靠 Redis 正常停止/SIGKILL、精确未确认入队和并发清理通过。原请求重试后每轮 21 条业务均只落库一次，见 [可靠 Redis 恢复报告](acceptance-reliable-redis-20260929.md)。
 
 > 当前进度以 [2026-09-29 剩余清单](acceptance-remaining-20260929.md) 为准。下文保留历史交接状态。F03 已删未提交的真实 DP 强杀三轮通过，见 [精确强杀报告](acceptance-cleanup-sigkill-20260929.md)；F04 提交后、指标前精确强杀三轮也已通过，见 [提交后强杀报告](acceptance-cleanup-postcommit-20260929.md)。

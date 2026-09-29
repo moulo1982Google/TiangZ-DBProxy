@@ -52,7 +52,7 @@
 | F06 | 本轮三次真实断网换地址验证通过；ACK 后 SQL 等待不在 TCP 发送超时保证内，不再列为本轮待测 |
 | F07 | 本轮真实后台行锁/表锁退避验证通过，见 [F07/A06 报告](acceptance-f07-a06-20260929.md)，不再列为待测 |
 | F08 | 运行中索引缺失/无效、确定性慢 SQL 超时与原进程恢复均通过（`index_20260929a`），见 [运行中索引报告](acceptance-runtime-index-20260929.md)；不是无索引的大规模性能测量 |
-| F10 | WAL 写满触发崩溃重启、日志写入失败；只能用专用受限容器 |
+| F10 | 128 MiB WAL tmpfs 满触发真实 PANIC 后原库恢复、8 MiB 日志 tmpfs 写入失败均通过；32 条记录及双记录事务、清理续跑核对，见 [WAL/日志满报告](acceptance-wal-log-full-20260929.md) |
 | F11 | 可靠 Redis 正常停止/SIGKILL 的已确认和精确未确认间隙、原请求重试、离线并发清理通过，见 [可靠 Redis 恢复报告](acceptance-reliable-redis-20260929.md)；生产组件集成，不扩展为主机掉电保证 |
 | F13 | 正式服务实际 Redis 发布后、PG 确认发送前 SIGKILL，重投顺序、实际消费组去重和租约 fencing 通过，见 [发布后崩溃报告](acceptance-outbox-publish-crash-20260929.md) |
 | F15 | 双租户数据库故障、采集路径故障已通过；实际监控监听器独立停止期间 80 笔业务与 1,501 条清理的组件集成测试也通过，见 [监听器停止报告](acceptance-monitor-listener-20260929.md)。不声称正式进程内所有 listener 崩溃形态均已注入 |
