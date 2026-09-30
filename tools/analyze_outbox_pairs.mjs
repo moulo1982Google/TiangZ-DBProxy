@@ -20,6 +20,7 @@ for(const [i,e] of entries.entries()){
   assert.equal(m.repair_mode,'none');assert(m.outbox_audit);
   assert.equal(m.rate,20);assert.equal(m.concurrency,8);assert.equal(m.connections,4);
   assert.deepEqual(m.mix,[40,20,20,10,5,5]);
+  if(i)assert.equal(m.sdk_audit??false,runs[0].analysis.manifest.sdk_audit??false,'mixed SDK instrumentation');
   if(i)assert.equal(m.stage_audit??false,runs[0].analysis.manifest.stage_audit??false,'mixed stage instrumentation');
   if(i)for(const key of ['warmup','sample','batch','payload_bytes','payload_rule','shards','read_connections','runtime_workers','repair_rows'])assert.equal(m[key],runs[0].analysis.manifest[key]);
   runs.push({...e,analysis:a});
@@ -32,6 +33,7 @@ const operations=runs[0].analysis.perOperation.map((op,k)=>{
 });
 const result={status:runs.every(x=>x.analysis.result.full_timing)?'COMPLETE_OUTBOX_PAIRED_MATRIX':'SMOKE_ONLY',capacity_proven:false,operations,
   scope:'default 5s stats versus supplemental 1s stats on same maintenance connection; single publisher/worker; no capacity claim',
+  sdk_audit:runs[0].analysis.manifest.sdk_audit??false,
   stage_audit:runs[0].analysis.manifest.stage_audit??false,
   runs:runs.map(x=>({run:x.run,mode:x.mode,stages:x.analysis.stages,publication_rows:x.analysis.publication.pg_rows,stats_samples:x.analysis.stats.length,pending_peak:x.mode==='on'?Math.max(...x.analysis.stats.map(s=>s.result.pending)):null}))};
 fs.writeFileSync(path.join(root,'analysis.json'),JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2));

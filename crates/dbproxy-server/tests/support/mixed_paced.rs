@@ -7,6 +7,8 @@ use tiangz_dbproxy_client::ClientError;
 use tiangz_dbproxy_protocol::wire::ErrorCode;
 #[path = "mixed_repair.rs"]
 mod repair;
+#[path = "mixed_sdk_audit.rs"]
+mod sdk_audit;
 
 fn failure(error: ClientError) -> Value {
     let definite = matches!(&error, ClientError::Remote(e) if matches!(e.code,
@@ -217,6 +219,10 @@ async fn fixed_rate_six_operations() {
     let stage_mode = std::env::var("MIX_STAGE_AUDIT").unwrap_or_else(|_| "0".into());
     assert!(["0", "1"].contains(&stage_mode.as_str()));
     let stage_audit = stage_mode == "1";
+    let sdk_mode = std::env::var("MIX_SDK_AUDIT").unwrap_or_else(|_| "0".into());
+    assert!(["0", "1"].contains(&sdk_mode.as_str()));
+    let sdk_audit = sdk_mode == "1";
+    assert!(!sdk_audit || stage_audit);
     assert!(!stage_audit || stats_mode != "none");
     let mut server = if baseline == "B1" || stats_mode != "none" {
         let binary = std::env::var("DBPROXY_ACCEPTANCE_HOST_BINARY")
@@ -240,14 +246,14 @@ async fn fixed_rate_six_operations() {
     } else {
         spawn(&deploy, &dir, "paced", &env, &url, &url)
     };
-    let c = client(&endpoint, TOKEN_A, &mut server).await;
+    let c = audited_client(&endpoint, &mut server, sdk_audit).await;
     if baseline == "B1" {
         assert!(server_log(&dir, "paced").contains("acceptance host: receipt cleanup disabled"));
     }
     // Four actual SDK connections; in-flight concurrency is a separate limit.
     let mut clients = vec![c];
     for _ in 1..4 {
-        clients.push(client(&endpoint, TOKEN_A, &mut server).await);
+        clients.push(audited_client(&endpoint, &mut server, sdk_audit).await);
     }
     let seeds = Arc::new(writes(&env.run_id, u64::MAX, BATCH));
     for w in seeds.iter() {
@@ -269,7 +275,7 @@ async fn fixed_rate_six_operations() {
     let mut ledger = std::fs::File::create(dir.join("requests.jsonl")).unwrap();
     append(
         &mut ledger,
-        &json!({"kind":"manifest","stage_audit":stage_audit,"outbox_stats_mode":stats_mode,"outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
+        &json!({"kind":"manifest","sdk_audit":sdk_audit,"stage_audit":stage_audit,"outbox_stats_mode":stats_mode,"outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
     );
     append(
         &mut ledger,
@@ -333,9 +339,10 @@ async fn fixed_rate_six_operations() {
         let seeds = seeds.clone();
         tasks.spawn(async move {
             let sent=tokio::time::Instant::now();
-            let outcome=match tokio::time::timeout(Duration::from_secs(10),issue(&c,&run,n,&seeds)).await {
+            let (call,sdk_attempts)=sdk_audit::capture(sdk_audit,tokio::time::timeout(Duration::from_secs(10),issue(&c,&run,n,&seeds))).await;
+            let outcome=match call {
                 Ok(Ok(v))=>v,Ok(Err(e))=>failure(e),Err(_)=>json!({"status":"unknown","detail":"driver timeout; write may have committed"})};
-            json!({"kind":"response","n":n,"op":KINDS[kind(n)],"sample":n>=warm*rate,"dispatch_us":sent.duration_since(scheduled).as_micros(),"rpc_us":sent.elapsed().as_micros(),"end_to_end_us":scheduled.elapsed().as_micros(),"outcome":outcome})
+            json!({"kind":"response","sdk_attempts":sdk_attempts,"n":n,"op":KINDS[kind(n)],"sample":n>=warm*rate,"dispatch_us":sent.duration_since(scheduled).as_micros(),"rpc_us":sent.elapsed().as_micros(),"end_to_end_us":scheduled.elapsed().as_micros(),"outcome":outcome})
         });
     }
     while let Some(row) = tasks.join_next().await {
@@ -517,4 +524,22 @@ async fn fixed_rate_six_operations() {
         assert_eq!(repair_result["remaining"], 0);
         assert_eq!(repair_result["mismatches"], 0);
     }
+}
+
+async fn audited_client(endpoint: &str, server: &mut Server, audit: bool) -> DbProxyClient {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            assert!(server.0.try_wait().unwrap().is_none());
+            let mut config = ClientConfig::new(endpoint, TOKEN_A, "fault-acceptance");
+            if audit {
+                config = config.with_observer(Arc::new(sdk_audit::Observer));
+            }
+            if let Ok(client) = DbProxyClient::connect(config).await {
+                return client;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap()
 }

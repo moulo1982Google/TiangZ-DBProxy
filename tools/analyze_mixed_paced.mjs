@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import {analyzeSdk} from './analyze_mixed_sdk.mjs';
 import {analyzeStageSnapshots} from './analyze_mixed_stages.mjs';
 const root=process.argv[2];assert(root,'usage: node tools/analyze_mixed_paced.mjs <mixed-paced directory>');
 const read=n=>fs.readFileSync(path.join(root,n),'utf8');
@@ -95,6 +96,9 @@ if(m.stage_audit){
  stages=analyzeStageSnapshots(m,starts[0].unix_ms,read('stage-snapshots.jsonl').trim().split(/\r?\n/).map(JSON.parse));
  fs.writeFileSync(path.join(root,'stage-analysis.json'),JSON.stringify(stages,null,2));
 }
-const analysis={stages:stages?{status:stages.status,covered_us:stages.covered_us,summaries:stages.summaries}:null,stats,publication,status:accepted&&publicationValid?(result.full_timing?'COMPLETE_SINGLE_TIMED_ROUND':'SMOKE_ONLY'):'REJECTED_LOAD',manifest:m,result,perOperation,capacity_proven:false};
+assert(m.sdk_audit===undefined||typeof m.sdk_audit==='boolean');
+const sdk=m.sdk_audit?analyzeSdk(rows):null;
+if(sdk)fs.writeFileSync(path.join(root,'sdk-analysis.json'),JSON.stringify(sdk,null,2));
+const analysis={sdk,stages:stages?{status:stages.status,covered_us:stages.covered_us,summaries:stages.summaries}:null,stats,publication,status:accepted&&publicationValid?(result.full_timing?'COMPLETE_SINGLE_TIMED_ROUND':'SMOKE_ONLY'):'REJECTED_LOAD',manifest:m,result,perOperation,capacity_proven:false};
 fs.writeFileSync(path.join(root,'analysis.json'),JSON.stringify(analysis,null,2));console.log(JSON.stringify(analysis,null,2));
 if(!accepted||!publicationValid)process.exitCode=1;
