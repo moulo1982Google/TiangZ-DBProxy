@@ -418,3 +418,13 @@ leased起止900future_leased，backoff起止900future_available；受阻发布0�
 各仅2资源样本，PG max/oom增量0，scan/steal分别9461、4841、8404，有回收不升压，不排除采样外峰值。前/中/后实际均5基础服务；连续事件p7heads_0930a在首轮前开始、240秒约17:45:59自然结束，结束后补拉，不停止。旧p7mixed观察器到期文件已重拉，只有3轮自身start/die共6条、stderr空，宿主非容器负载不排除。
 
 现有工具名ready实际每publisher仅2个FIFO分区、每分区250行，对应密集ready而不是旧hybrid的独立key ready；不能把名字当覆盖两分布。下一步实际补独立key ready夹具与严格合法返回顺序核对，明确保留历史ready=密集语义，再评估正式统计对照所需防耗尽/分布观测。三种头阻塞短测不重复；九分布正式性能、真实超时、P06高积压/P09容量仍缺，全部旧失败保留。
+
+## P07 独立key ready短测（3c46528）
+
+新增spread-ready而保留历史ready密集语义。INSERT时每publisher生成500个独立分区，跨publisher同名key；schema4起止核对每publisher总数/分区数500、未发布500→486。领取只要求合法key与event严格对应、唯一、publisher/destination/token正确及最终PG匹配，不对独立key施加不存在的全局FIFO；同波两worker交换合法返回顺序的正例通过，5个新增错误分区/耗尽/事件等负例严格拒绝，原18+12+25负例仍通过。目标Clippy/fmt通过，上传SHA256543321bb58f2a4bfdcbfe8063087967723b5434100b5c32963dca26c34657f79一致。
+
+p7spread_0930a新库UTC17:58:06.011至17:58:21.816，exit0/OOMfalse、1 passed/结束标记。1000行2/5秒、两worker总4调用/s无stats，14波全部实际重叠，28唯一领取/确认（短采样20）、1000最终PG一致，两publisher各486未发布独立key。严格PARALLEL_CLAIMS_CHECKED/SMOKE_ONLY，原始及容器/镜像/源码/资源全回收。前后实际5基础服务，启动前进程无其他编译/验收。2资源样本单区间PGmax/oom/reclaim0，不排除未采样峰值，不解除旧升压边界。p7spread事件订阅首轮前120秒、约18:00:06自然结束，下一次补拉到期文件；p7heads已到期补拉仍6条自身start/die、stderr空，不排除非容器活动。
+
+九类分布现各有小数据短测证据：密集ready=p7ps，独立ready=p7spread，none=p7none，all-blocked=p7block，leased=p7lease_b，backoff=p7back，三头阻塞=p7hl/hb/hd。它们分步开发、schema/观测不同，不能合并为同版本正式性能矩阵，原p7lease_a预置失败保留。当前测试仍硬编码2/5秒且正式ready需求1680调用超过1000行，混合可领100行也不足；不得直接把秒数改成120/300启动。
+
+下一步先实际补参数与预算校验、充分但有界的新库行数/独立可领余量、统一分布/封存账本，并明确stats共享worker0现有连接（两组观测相同，非独立连接）。为保持受阻比例与防耗尽需明确正式夹具规模，不能暗增速率或默认十万行。先本地边界/负例和必要新工具短测，再决定120/300三对统计对照；九类正式性能、真实超时、P06高积压/P09容量未完成，不重复已完成同工具正常短测。
