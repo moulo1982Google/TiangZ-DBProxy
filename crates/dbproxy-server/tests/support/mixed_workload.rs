@@ -88,7 +88,11 @@ fn effects(w: &SnapshotWrite) -> CommitEffects {
         }],
         outbox_events: vec![OutboxEvent {
             event_id: w.request_id.clone(),
-            topic: "accept-mixed".into(),
+            topic: if std::env::var("MIX_OUTBOX_AUDIT").as_deref() == Ok("1") {
+                w.record.namespace.clone()
+            } else {
+                "accept-mixed".into()
+            },
             partition_key: w.record.key.clone(),
             payload: w.payload.clone(),
             occurred_at_unix_ms: 1,

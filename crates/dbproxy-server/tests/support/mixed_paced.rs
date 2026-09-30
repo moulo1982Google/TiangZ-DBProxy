@@ -1,4 +1,6 @@
 //! Fixed-rate mixed requests with bounded concurrency and post-run PG reconciliation.
+#[path = "mixed_outbox_audit.rs"]
+mod outbox_audit;
 use super::*;
 use serde_json::{Value, json};
 use tiangz_dbproxy_client::ClientError;
@@ -258,7 +260,7 @@ async fn fixed_rate_six_operations() {
     let mut ledger = std::fs::File::create(dir.join("requests.jsonl")).unwrap();
     append(
         &mut ledger,
-        &json!({"kind":"manifest","run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
+        &json!({"kind":"manifest","outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
     );
     let start = tokio::time::Instant::now();
     if let Some(trigger) = repair_start {
@@ -446,6 +448,16 @@ async fn fixed_rate_six_operations() {
             != effects_found as i64,
     );
     checks.sync_all().unwrap();
+    let publication = if std::env::var("MIX_OUTBOX_AUDIT").as_deref() == Ok("1") {
+        outbox_audit::verify(&pg, &env.redis[0], &env.run_id).await
+    } else {
+        Value::Null
+    };
+    std::fs::write(
+        dir.join("outbox-publication.json"),
+        serde_json::to_vec_pretty(&publication).unwrap(),
+    )
+    .unwrap();
     let errors = completed
         .iter()
         .filter(|r| r["outcome"]["status"] != "success")
@@ -458,6 +470,9 @@ async fn fixed_rate_six_operations() {
     .unwrap();
     println!("MIXED_PACED_RESULT {result}");
     assert_eq!(completed.len() as u64 + not_sent, total);
+    if !publication.is_null() {
+        assert_eq!(publication["mismatches"], 0);
+    }
     assert_eq!(mismatches, 0);
     assert_eq!(errors, 0);
     assert_eq!(not_sent, 0);

@@ -60,3 +60,13 @@ UTC 14:24:25（北京时间 22:24:25）结束，容器退出 0、OOM=false。三
 总速率保持 4 次/秒（每 publisher 2 次/秒），仍是一个领取循环，不声称两个 worker 并发。统计开关、预热/采样及三轮顺序沿用前述设计，短测独立标记。与此前单 publisher 的比较同时改变了筛选条件和分组键布局，因此只能分别报告测得成本，不把差异全归因于 publisher 数量。它也不替代多 publisher 的九种分布全组合或整体应用负载对照。
 
 复测：宿主 `bash deploy/remote-test/launch_p07.sh <全新RunId>`；正式默认 120/300 秒、3 轮。短测可覆盖 `P07_WARMUP_SECONDS/P07_SAMPLE_SECONDS/P07_ROUNDS`，结果不会标记为完整计时。结束后拉回 `outbox_<RunId>`，运行 `node tools/analyze_p07.mjs <证据目录>`，并核实容器退出状态、12 个成功阶段和资源记录。Windows 定向 Clippy、格式/差异检查、Linux 编译和短测、bash 语法检查通过。
+
+## 应用发布核对基础（2026-09-30）
+
+已核对正式启动代码：默认一个 Outbox worker 已执行真实 Redis 发布，存储指标循环每5秒调用 Outbox stats；既有六类业务每20请求产生一个 Outbox，但此前末尾仅核对PG效果内容，不能据此声称已逐条核对Redis发布。
+
+新增 MIX_OUTBOX_AUDIT=1 仅验收驱动开关，将事件放入当前RunId专用topic，保留默认生产worker和统计。mixed_outbox_audit.rs在业务账本核对后有界等待30秒PG发布确认，逐条比较真实XRANGE的event_id、operation_id、partition_key、payload、occurred_at与PG，正常场景要求每事件恰好一条消息，无未知额外消息。保存outbox-publication.json中的PG确认、Redis流ID及核对结果。各事件使用独立分区键，不声称全局顺序或同键多事件顺序已测。
+
+新库oaud_0930a三轮2秒预热/5秒采样，共420业务请求、1497业务快照、21条真实发布，三次1 passed、UTC02:53:22容器exit0/OOMfalse。每轮7条Redis消息与7条PG已确认效果一致、零业务错误漏发差异；原始证据已拉回target/server_20260929/fault_process_oaud_0930a_r{0,1,2}及同级oaud_0930a.*，分析全部SMOKE_ONLY。缓存修复未开启。独立副本篡改核对结果的负例被分析器REJECTED_LOAD，历史P06证据兼容分析通过。cargo check、定向Clippy -D warnings、fmt、node语法及bash语法通过。没有改生产协议或生成代码。
+
+这一步是应用发布可核查基础，不是正式P07成本通过。下一步仍需明确统计/领取并行对照的变量、队列连续趋势、同键顺序和有界输入；现有生产5秒统计不能误称关闭。不得将另开数据库连接的统计成本冒充同一维护连接的竞争。

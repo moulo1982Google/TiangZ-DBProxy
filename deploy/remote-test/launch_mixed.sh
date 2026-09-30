@@ -27,6 +27,7 @@ finish() {
 trap finish EXIT
 docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cpus 4 \
     --memory 16g --memory-swap 16g -e CARGO_BUILD_JOBS=4 \
+    -e MIX_OUTBOX_AUDIT="${MIX_OUTBOX_AUDIT:-0}" \
     -e MIX_REPAIR="${MIX_REPAIR:-none}" \
     -e MIX_BASELINE="${MIX_BASELINE:-B2}" \
     -e MIX_PAIR_RATES="${MIX_PAIR_RATES:-64 96}" \
@@ -42,6 +43,7 @@ docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cp
 docker exec "$WB" sha256sum /src/crates/dbproxy-server/tests/support/mixed_paced.rs \
     /src/crates/dbproxy-server/tests/support/mixed_workload.rs \
     /src/crates/dbproxy-server/tests/support/mixed_repair.rs \
+    /src/crates/dbproxy-server/tests/support/mixed_outbox_audit.rs \
     /src/crates/dbproxy-server/src/server_process.rs \
     /src/crates/dbproxy-server/src/main.rs \
     /src/crates/dbproxy-server/examples/acceptance_baseline.rs >"$DATA/evidence/$RUN_ID.sources.sha256"
