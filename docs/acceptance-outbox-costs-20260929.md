@@ -372,3 +372,13 @@ rspf事件观察器到期后再次拉回，仍只有自身start/die、stderr空�
 阶段顺序：先新库、小数据（1000级）、2/5秒无stats验证基础并发/有界停止/账本，分析器正负例通过后再扩展九分布。九分布须每场景新库独立保留，ready/dense-ready应保留足够连续样本，backoff/leased/head-blocked应有按publisher分隔的独立可领取组，none/all-blocked必须持续空领取且确认数0。不要从单次100001行探针推断持续分布不变：正式窗口应保存各类队列计数、耗尽/分布漂移则拒绝。统计对照后续再加，明确统计共享哪一worker连接，不能隐式变更为独立连接。此次只是代码路径核对和具体工具设计，尚未实现/实测，不标多worker性能或全分布完成。
 
 rhdf_0930a事件观察器到期后已重拉完整文件：仍仅该工作台start/die两条，stderr空；非容器活动仍不排除。当前实际只有5基础服务，没有新增验收负载，原资源与不升压限制不变。
+
+## P07 双独立连接首次短测 p7ps_0930a（2026-10-01北京时间）
+
+工具990530d新增独立outbox_parallel_poll测试、run/launch_p07_parallel入口与严格JSONL分析器，不调用旧十万行诊断、不修改生产SQL。两worker分别connect_existing，每500ms两次claim（总4次/s），逐波交替两个publisher；每publisher两个FIFO分区，分区名跨publisher相同。两个claim都返回后才ack，两个ack都完成后才下波。每次操作先同步started日志，保存实际调用起止；5秒timeout/error写unknown、不重试，join等待双方结果后才拒绝。100ms调度guard停止新波。同步账本IO有成本，本组不用于生产性能结论；当前硬编码2/5秒、1000行、无stats。
+
+本地目标Clippy -D warnings、fmt、Node语法及一个正夹具/11个负例通过（缺失、重复、unknown、归属、FIFO、token、最终PG、ack边界、guard、重叠计数、末尾换行）。三个上传文件SHA256核对一致。新库p7ps_0930a容器UTC2026-09-30 16:48:04.948至16:48:20.560，exit0/OOMfalse，1 passed及P07_PARALLEL_SMOKE_COMPLETED。14波28次claim/ack，短采样窗口20次claim；14波实际调用区间全部重叠。1000行最终核对，28条唯一事件已发布、972条仍未发布；两个publisher归属、同key前驱确认、token及PG状态全部严格通过，离线PARALLEL_CLAIMS_CHECKED/SMOKE_ONLY。完整原始在target/server_20260929/parallel_p7ps_0930a及p7ps_0930a.*。
+
+启动前/结束后实际均只有5基础服务，启动前进程检索无cargo/rustc/fault_process/outbox_poll；PG限制仍4CPU/8GiB及14-17,42-45。仅两条资源采样、一个观察区间，PG max/oom/oom_kill增量0、scan/steal各5776；采样稀疏，不能排除未采样峰值或宿主非容器活动。本轮未建立连续外部Docker事件订阅，不能声称整个窗口无其他活动。资源回收仍在，不解除不升压边界。
+
+尚未实测新工具guard停止或claim/ack真实未知路径，也未完成九分布/统计开销/多worker正式性能。下一步先补此工具有界停止与双方未知结果留档的异步测试及严格分析负例，再分步扩展小数据九分布，显式核对可领取/受阻分布与样本不耗尽。不要重复本轮正常短测或直接扩大到十万/容量矩阵。所有旧失败和P06/P09缺口保留。
