@@ -567,3 +567,13 @@ parallel_environment.mjs要求完整LF/五条记录/30秒内采集、真实资�
 此方案验证“客户端超时后，已发送ack继续执行并最终发布”这一具体路径；即使通过，也不能称“PG提交完成后响应丢失”精确故障已覆盖。全流程连接/建库/文件IO仍没有统一硬期限。下一步实现独立ignored测试和封存账本适配、先Clippy/fmt及本地边界负例，再专用入口的新库实测；不改正常入口吞unknown、不重试未知ack、不升压。
 
 旧p7ct_0930a事件观察器已到期重拉，仅自身start/die两条、stderr空，无需再等待。实际docker ps仍5基础服务，无其他编译或验收进程；宿主非容器活动未排除。旧失败和正式九分布/P06高积压/P09容量缺口保持。
+
+## P07 独立ack超时注入与封存分析工具完成（56f460e，仅本地）
+
+新增parallel_ack_timeout::real_ack_timeout独立ignored测试：p7at_前缀与URL数据库名完全匹配、迁移前public无表；只预置本新库两行，两独立连接先领取30秒真实租约。专属blocker对两行FOR UPDATE，2秒锁等待、12秒idle事务超时、Drop连接关闭。原observed5秒同时发两ack并join，监测实际双PID锁等待；超时后释放前再有界读取阻塞证明和MVCC原租约状态，再2秒ROLLBACK，确认释放后才作结果断言。释放后5秒内等两个PG请求不再active并读取最终两行，最终快照先封存再严格断言已发布/token不变/owner与until清空；不重试unknown。未改变生产ack或正常性能入口。
+
+analyze_ack_timeout.mjs严格读10条原始journal与bytes/SHA256/LF封存，关联领取基线、双started/unknown、两次阻塞证明、释放和最终逐行快照，再调用e696e9c核对契约。两种合法完成顺序及17封存/缺项/错操作/重复worker/状态/释放负例通过，加原33契约负例。数据库目标本地正负例、Clippy目标-Dwarnings、fmt通过。首次本地编译发现register_publisher/register_route属于queue而非store，已修正为outbox_queue后全部检查通过，没有上传这个编译失败版本。
+
+因为outbox_parallel_poll现在编译新子模块，两个现有launcher和配对分析器来源清单增加parallel_ack_timeout模块，未来13文件；旧12文件claim与11文件配对证据不回填，仍保留原工具版本结果。旧单轮及九模式配对合成检查通过。当前实际仍5基础服务，无其他编译/验收进程。
+
+本阶段未上传任何源码、未新建服务器库、未实测ack故障，不报真实ack未知已覆盖。下一步实际补专用ack runner/launcher（exact parallel_ack_timeout::real_ack_timeout、p7at_、禁止P07覆盖、原环境/来源/资源/事件证据），先本地入口拒绝检查，再新RunId新库串行一次必要实测。运行失败保持原证据和断言；完成后原unknown仍是unknown，仅以最终PG状态作独立核对。该路径不是“已经提交后响应丢失”精确注入，也不是全流程有界；正式九分布/P06高积压/P09容量缺口不变，继续不升压。
