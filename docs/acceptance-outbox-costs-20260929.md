@@ -460,3 +460,17 @@ outbox_parallel_poll将INSERT上界/受阻分区边界、FIFO首项、独立key�
 目标Clippy -D warnings、fmt、全部既有Node正负例（含schema5九模式99负例）通过；旧p7seal原始schema5重新严格分析通过。未上传本阶段源码、未创建新库、未启动新负载，参数化INSERT尚待真实新库验证。p7seal观察器到期已补拉，仅自身start/die两条stderr空，实际docker ps仍5基础服务；不排除宿主其他活动，不解除升压边界。
 
 下一步实际补stats开关：与worker0共享其已有queue/连接，统计调用与两worker领取并行的时序及结果单独记账，两组均保留相同调用/分布/封存观测；先本地严格正负例，再串行专属新库1000行2/5秒新工具off/on短测，同时验证参数化INSERT。不要重复无新工具的九分布短测，不直接启动33600行正式矩阵；正式九分布性能、真实超时、P06高积压/P09容量仍缺。
+
+## P07 worker0共享连接stats工具及新库off/on短测（562bbba）
+
+schema7允许P07_STATS=0/1，其余执行入口仍1000行2/5秒、两worker总4调用/s、单轮，正式关闭。偶数波每秒一个stats槽，直接调用worker0的first.stats()，与两个claim置于同一join并等待三者返回后才ack；没有新建stats连接。两组都记录stats_slot/result（off counts=null）；on额外记录原5秒observed started/completed，timeout/error记unknown且拒绝、不重试。guard拒绝后不会发起该波任何stats/claim。封存仍在全部调用/最终核对结束并关闭writer后发布。
+
+分析器严格检查槽完整唯一、worker0归属、时序、真实stats/claim区间重叠、总未发布计数与已确认前缀一致、死信/processing范围、整数age、off无查询及on必有成功结果；未知/缺项/重复/错归属/错计数均拒绝。九模式off/on合成正例与135负例、旧完整测试、预算测试、Clippy/fmt、真实Bash preflight正负例通过。实现初次本地预算测试仍将stats=1当旧负例而失败，已按新契约把1移为正例、2为非法值，重跑通过；未降低调用/数据断言。四个上传文件SHA一致，主test为4b8ecbd8639b95883043493f21e3bfcf4fc678db3c10b044af49ec3feebf0ab1。
+
+两专属新库leased-heads串行验证了参数化INSERT及stats协议：p7soff_0930a UTC18:59:30.540→18:59:46.643；p7son_0930a UTC19:00:14.387→19:00:30.363。均exit0/OOMfalse、1 passed/P07_PARALLEL_SMOKE_COMPLETED。每轮1000行2/5秒、28唯一领取/ack、14波真实claim重叠、20短采样、1000最终PG一致，受阻发布0、两publisher可领余量各50→36。off为7跳过槽0stats调用；on7stats调用全部成功，7次与claim真实区间重叠。退出后完整封存及严格PARALLEL_CLAIMS_CHECKED/SMOKE_ONLY通过，原始/容器/镜像/源码/日志/资源已全部回收。
+
+本工具stats相位固定偶数波即publisher-a，不能称两publisher对称统计干扰；join还让ack等待stats完成，观察范围包含该协调语义。on额外同步started/operation日志有开销，不能把两组全部差异解释成生产stats SQL净成本。共同的claim/ack/分布/封存观测保持一致，但不是零成本观测。当前仅协议短测，不给性能结论。
+
+前中后实际5基础服务、启动前无其他编译验收；各2资源样本单区间PG max/oom/reclaim0，不能排除未采样峰值、不解除原升压边界。p7stats_0930a.events首轮前180秒约19:02:30自然结束，收集时仅两个自身容器start/die四条、stderr空；到期后补拉，不停止监听，宿主非容器活动未排除。
+
+下一步先消除正式比较的固定publisher相位偏置并明确统计协调/日志成本口径，补对称相位与严格账本验证；评估在原边界下充分但有界的同版本九分布统计对照，不直接扩大到33600行/120/300。已完成此off/on新工具短测不重复。真实数据库超时、九分布正式性能、P06高积压/P09容量仍缺，历史失败保留。
