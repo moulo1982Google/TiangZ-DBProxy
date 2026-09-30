@@ -114,3 +114,7 @@ d34ca03接入业务guard到修复生成器的停止通知，schema2区分领取�
 ### 当前基线正常短测完成
 
 rgbnorm_0930a六轮新库2/5秒UTC14:41:05至14:42:48 exit0/OOMfalse，840请求零差异，三repair组42次显式重复入队，六轮基线/journal严格SMOKE_ONLY。基线缺项/版本/matches/非空队列负例通过；非空预置排空仍未命中。下一步实际实现服务启动前预置陈旧缓存及专属队列available_at延后、测量时逐项enqueue放行的夹具，分别核对held后缀和已放行前缀。方案见repair-costs，尚未实测，不标P06成本/高积压完成；不删队列/缓存、不升压。
+
+### 陈旧缓存夹具及停止路径新库短测完成
+
+工具62c1151将修复预置移到验收服务启动前，schema3区分held/eligible/leased/dead，启动前后核验陈旧缓存未抢跑。更正旧方案：普通enqueue不重置available_at，实际使用两组相同的验收条件UPDATE逐项放行，不改生产行为。rhds_0930a六轮新库2/5秒正常短测840业务请求零差异，42项陈旧缓存从revision1修复到revision2，严格SMOKE_ONLY。rhdstop_0930a_r0独立guard负例5项完成、9项仍held且完整缓存保持revision1，所有修复/队列核对零差异；原100未发送断言保留exit1，严格离线REJECTED_LOAD。原始全回收，详见repair-costs。尚非性能/高积压/容量通过；当前无正式负载，仍不升压，下一步评估同速新夹具正式对照，不重复旧无新观测矩阵。

@@ -153,3 +153,21 @@ rgbas_0930a_r0新库于UTC2026-09-30 14:26:53至14:27:43结束，容器exit1/OOM
 源码设计核对：现有cache_repair_end_to_end.rs组件测试在StorageBackend构造后手动调用process_cache_repair_once，预置时没有后台worker，因而可保留revision1缓存和revision2权威；当前混合驱动在预置前启动真实服务，不能直接照搬。cache_repair_claim.sql显式要求available_at<=statement_timestamp，enqueue路径会重置available_at为当前时间。
 
 下一步陈旧缓存夹具方案（尚未实现/实测）：把专属新库修复预置移至验收服务启动前；两次save产生自动队列后，仅对该RunId专属记录设置未来available_at，保存基线：PG revision2、cache revision1、未租用、全部暂不可领取。真实服务照常启动，测量时按2项/秒显式enqueue放行（已有SQL重置available_at），业务guard停止后保留未放行后缀及其revision1缓存；已放行前缀要求revision2并完成确认。control组缓存预先同步revision2但同样保留受控队列条件。分析须分别记录held/eligible/leased/dead和已放行前缀，不能把held当排空遗漏或把全队列0作为唯一条件；新的范围另schema，旧失败断言不改。必须先新库短测验证启动后不抢跑、停止后后缀保持、自动队列完整性和放行后权威一致，再考虑正式对照。不删除队列/缓存、不停止共享服务或生产worker、不引入生产关闭开关、不升压。
+
+## 陈旧缓存夹具实现：held_stale_release（62c1151）
+
+更正上一节设计中的源码判断：普通 enqueue_sql 的 ON CONFLICT 仅更新 target_revision，不重置 available_at；重置时间的是另一条 dead-letter requeue 路径。因此不能依靠普通 enqueue 放行未来任务，生产实现无须为验收改变。
+
+新夹具在验收服务启动前执行两次 save，缓存保留 revision1（repair）或预先同步 revision2（control）。只在本次新库/RunId namespace，将完整自动队列设置 available_at 为一天后，要求目标版本2、未租用、未死信、attempt_count0。服务启动前与启动后各逐项核对完整缓存快照及队列保持条件，并记录两阶段基线；所有基线检查完成后才进入业务计时。两组均以每秒2项执行同样的条件 UPDATE 放行，严格要求影响1行。此操作是验收夹具放行，不是生产 enqueue 吞吐测试；两组都运行正常修复 worker，差异为陈旧/当前缓存。
+
+schema3 区分 held、eligible、leased、dead；放行前持久化 started，5秒超时/错误仍记未知并失败，不重试。已放行前缀要求完整缓存等于权威PG且队列项已确认消失；未放行后缀要求完整缓存不变且仍 held。held 项保留在原新库，不删除、不算作已排空；remaining 只描述 eligible/leased/dead，另由严格逐项及总数断言检查 held。租约过期但未处理仍计 leased，不虚报完成。排空及核对期限仍不覆盖预置/文件IO的硬期限。
+
+本地 Clippy（fault_process，-D warnings）、fmt、2个异步停止/未知结果测试通过；Node 6个正常/停止/零放行组合以及缺基线、陈旧版本错误、提前放行、残留eligible、后缀改变、计数异常及缺换行负例通过。历史 rgbnorm 六轮分析兼容通过。两上传文件SHA256与本地一致。新库短测 rhds_0930a 正在串行运行，未据此宣称通过或启动正式矩阵。
+
+### rhds_0930a / rhdstop_0930a 新库验证结果
+
+rhds_0930a 六轮 control/repair 交替，UTC2026-09-30 15:03:51至15:05:38，exit0/OOMfalse，六次1 passed、REPAIR_PAIRS_COMPLETED。840业务请求零错误/未发送/核对差异、guard=null；每轮14项全部放行并确认完成，最终held/eligible/leased/dead全0，完整缓存/队列核对差异0。三组repair共42项在服务启动后基线仍为revision1，放行后全部revision2；control全程revision2。严格六轮SMOKE_ONLY、两阶段基线与操作journal均通过。全部原始六目录、资源、镜像、源码摘要及容器日志已拉回；派生rhds_0930a.review.json保留逐轮摘要。
+
+rhdstop_0930a_r0 独立新库，UTC15:06:12至15:07:03，exit1/OOMfalse，保留原not_sent==0失败。n40 dispatch153656us触发原业务guard，40响应、100未发、已发业务错误/核对差异0。修复admitted5、not_injected9、stopped=true；前5项完整缓存等于PG revision2且队列记录已确认消失；后9项完整缓存仍等于预置revision1且仍held/未租用/attempt0。remaining0、mismatches0、untouched_mismatches0、queue_mismatches0，最终total9/held9/eligible0/leased0/dead0。离线全部一致性断言通过后生成REJECTED_LOAD并退出1，是预期停止负例，不是业务验收通过。全部原始已拉回；原rgstop的9项失败不修改。
+
+两次短测均完成资源分析，仍有回收，不据此解除升压边界。当前仅5基础服务，没有新正式负载。新组只能证明受控陈旧缓存放行/停止语义，不能冒充生产enqueue成本、持续高积压或容量结论。下一步可在同20业务/s、2放行/s、并发8和原资源限制下评估首次新夹具120/300三对正式对照的必要性，并将其与旧current-cache/预置干扰组分别报告；启动前必须再次核实资源与外部任务。不得自动重跑旧Outbox低速矩阵，旧性能失败、rspf完整性失败、多publisher/并发worker、高积压和容量缺口继续保留。
