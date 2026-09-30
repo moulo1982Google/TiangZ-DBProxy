@@ -171,3 +171,11 @@ rhds_0930a 六轮 control/repair 交替，UTC2026-09-30 15:03:51至15:05:38，ex
 rhdstop_0930a_r0 独立新库，UTC15:06:12至15:07:03，exit1/OOMfalse，保留原not_sent==0失败。n40 dispatch153656us触发原业务guard，40响应、100未发、已发业务错误/核对差异0。修复admitted5、not_injected9、stopped=true；前5项完整缓存等于PG revision2且队列记录已确认消失；后9项完整缓存仍等于预置revision1且仍held/未租用/attempt0。remaining0、mismatches0、untouched_mismatches0、queue_mismatches0，最终total9/held9/eligible0/leased0/dead0。离线全部一致性断言通过后生成REJECTED_LOAD并退出1，是预期停止负例，不是业务验收通过。全部原始已拉回；原rgstop的9项失败不修改。
 
 两次短测均完成资源分析，仍有回收，不据此解除升压边界。当前仅5基础服务，没有新正式负载。新组只能证明受控陈旧缓存放行/停止语义，不能冒充生产enqueue成本、持续高积压或容量结论。下一步可在同20业务/s、2放行/s、并发8和原资源限制下评估首次新夹具120/300三对正式对照的必要性，并将其与旧current-cache/预置干扰组分别报告；启动前必须再次核实资源与外部任务。不得自动重跑旧Outbox低速矩阵，旧性能失败、rspf完整性失败、多publisher/并发worker、高积压和容量缺口继续保留。
+
+### rhdf_0930a：首次修正陈旧夹具正式对照启动
+
+UTC2026-09-30 15:11:42启动dbproxy-mixed-rhdf_0930a，代码62c1151，短测报告23fd18d。这是held_stale_release范围首次120秒预热/300秒采样、三对control/repair交替正式对照；每轮20业务/s、2项放行/s、并发8、四SDK连接，预期8400业务请求（6000正式）及840队列放行。两组正常worker和条件UPDATE相同，区别为启动后已验证的当前/陈旧缓存。不是生产enqueue成本、高积压或容量测试，不与旧夹具混合，旧性能和证据失败仍保留。
+
+启动前实际docker ps只有5基础服务，进程检查未见其他编译/验收，PG当前约2.378GiB/8GiB、宿主可用39609MiB。DockerRootDir=/sas/docker，PG/Redis数据仍/data，原CPU/内存/挂载不变；工作台4CPU/16GiB、cpuset20-27,48-55。该余量只用于本次同速测量，不解除升压边界。环境保存rhdf_0930a.environment-before.txt。连续只读Docker事件PID3125201窗口15:11:42至16:16:42自动退出，目前已捕获本轮start且stderr空；不停止监听，非容器活动未排除。
+
+当前仅确认容器running及第一轮r0_c已开始，预计UTC15:58附近结束，尚无验收结果。运行中不改挂载源码、不并行编译/负载。结束后核对exit/OOM、六次1 passed和REPAIR_PAIRS_COMPLETED，拉回六轮完整原始、所有rhdf_0930a.*、资源/镜像/源码摘要/日志；严格跑analyze_repair_pairs和资源分析，检查每轮两阶段840项基线、完整release/read journal、最终缓存/queue零差异、guard=null，并报告六类每对与中位P99。逐对20%越线保留，不能用中位掩盖异常，也不能把held预置计成可领取高积压。
