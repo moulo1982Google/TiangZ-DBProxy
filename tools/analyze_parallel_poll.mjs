@@ -15,13 +15,13 @@ export function analyze(raw) {
   let mode = 'ready';
   let mixed = false;
   function distribution(phase) {
-    assert.deepEqual(take('distribution'), {kind:'distribution',phase,total:1000,future_leased:mode==='none'?1000:mode==='leased'?900:0,dead:mode==='all-blocked'?4:0,future_available:mode==='backoff'?900:0,owned:0});
+    assert.deepEqual(take('distribution'), {kind:'distribution',phase,total:1000,future_leased:mode==='none'?1000:mode==='leased'?900:mode==='leased-heads'?4:0,dead:['all-blocked','dead-heads'].includes(mode)?4:0,future_available:mode==='backoff'?900:mode==='backoff-heads'?4:0,owned:0});
     if(mixed) for(const publisher of ['parallel-a','parallel-b']) assert.deepEqual(take('reserve'),{kind:'reserve',phase,publisher,blocked:450,ready_pending:phase==='before'?50:36,blocked_published:0});
   }
   if(versioned) {
     const f=take('fixture'); mode=f.mode;
-    assert(['ready','none','all-blocked','leased','backoff'].includes(mode));
-    mixed=['leased','backoff'].includes(mode);
+    assert(['ready','none','all-blocked','leased','backoff','leased-heads','backoff-heads','dead-heads'].includes(mode));
+    mixed=['leased','backoff','leased-heads','backoff-heads','dead-heads'].includes(mode);
     if(mixed) for(const n of next) {n[0]=450;n[1]=451;}
     assert.equal(f.schema,mixed?3:2);assert.equal(f.rows,1000);assert.equal(f.claim_calls,28);
     distribution('before');

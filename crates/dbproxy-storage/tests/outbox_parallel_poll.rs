@@ -187,7 +187,14 @@ async fn two_workers_fixed_budget() {
     let mode = std::env::var("P07_PARALLEL_MODE").unwrap_or_else(|_| "ready".into());
     assert!(matches!(
         mode.as_str(),
-        "ready" | "none" | "all-blocked" | "leased" | "backoff"
+        "ready"
+            | "none"
+            | "all-blocked"
+            | "leased"
+            | "backoff"
+            | "leased-heads"
+            | "backoff-heads"
+            | "dead-heads"
     ));
     let store = PostgresSnapshotStore::connect(&url).await.unwrap();
     let setup = store.outbox_queue();
@@ -204,7 +211,10 @@ async fn two_workers_fixed_budget() {
     );
     sql.batch_execute("SET statement_timeout='5s'; INSERT INTO dbproxy_operation_claims(operation_id,operation_kind) VALUES('parallel','multi')").await.unwrap();
     let publishers = ["parallel-a", "parallel-b"];
-    let mixed = matches!(mode.as_str(), "leased" | "backoff");
+    let mixed = matches!(
+        mode.as_str(),
+        "leased" | "backoff" | "leased-heads" | "backoff-heads" | "dead-heads"
+    );
     for publisher in publishers {
         setup
             .register_publisher(publisher, "isolated-no-mq-test")
@@ -221,6 +231,15 @@ async fn two_workers_fixed_budget() {
         sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms) SELECT $1::text||'-'||n,'parallel',$2,CASE WHEN $3 AND n<450 THEN 'blocked-key-' ELSE 'key-' END||(n%2),'',0 FROM generate_series(0,499) n ORDER BY n", &[&publisher, &route.key(), &mixed]).await.unwrap();
     }
     match mode.as_str() {
+        "leased-heads" => {
+            sql.execute("UPDATE dbproxy_outbox SET lease_until=clock_timestamp()+interval '1 day' WHERE event_id IN ('parallel-a-0','parallel-a-1','parallel-b-0','parallel-b-1')", &[]).await.unwrap();
+        }
+        "backoff-heads" => {
+            sql.execute("UPDATE dbproxy_outbox SET available_at=clock_timestamp()+interval '1 day' WHERE event_id IN ('parallel-a-0','parallel-a-1','parallel-b-0','parallel-b-1')", &[]).await.unwrap();
+        }
+        "dead-heads" => {
+            sql.execute("UPDATE dbproxy_outbox SET dead_lettered_at=clock_timestamp() WHERE event_id IN ('parallel-a-0','parallel-a-1','parallel-b-0','parallel-b-1')", &[]).await.unwrap();
+        }
         "leased" => {
             sql.execute("UPDATE dbproxy_outbox SET lease_until=clock_timestamp()+interval '1 day' WHERE partition_key LIKE 'blocked-%'", &[]).await.unwrap();
         }
@@ -398,14 +417,32 @@ async fn distribution(sql: &tokio_postgres::Client, journal: &Journal, mode: &st
         match mode {
             "none" => 1000,
             "leased" => 900,
+            "leased-heads" => 4,
             _ => 0,
         }
     );
-    assert_eq!(counts[2], if mode == "all-blocked" { 4 } else { 0 });
-    assert_eq!(counts[3], if mode == "backoff" { 900 } else { 0 });
+    assert_eq!(
+        counts[2],
+        if matches!(mode, "all-blocked" | "dead-heads") {
+            4
+        } else {
+            0
+        }
+    );
+    assert_eq!(
+        counts[3],
+        match mode {
+            "backoff" => 900,
+            "backoff-heads" => 4,
+            _ => 0,
+        }
+    );
     assert_eq!(counts[4], 0);
     journal.record(json!({"kind":"distribution","phase":phase,"total":counts[0],"future_leased":counts[1],"dead":counts[2],"future_available":counts[3],"owned":counts[4]}));
-    if matches!(mode, "leased" | "backoff") {
+    if matches!(
+        mode,
+        "leased" | "backoff" | "leased-heads" | "backoff-heads" | "dead-heads"
+    ) {
         for publisher in ["parallel-a", "parallel-b"] {
             let row = sql.query_one("SELECT count(*) FILTER(WHERE partition_key LIKE 'blocked-%'), count(*) FILTER(WHERE partition_key NOT LIKE 'blocked-%' AND published_at IS NULL), count(*) FILTER(WHERE partition_key LIKE 'blocked-%' AND published_at IS NOT NULL) FROM dbproxy_outbox WHERE event_id LIKE $1", &[&format!("{publisher}-%")]).await.unwrap();
             let blocked: i64 = row.get(0);

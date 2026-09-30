@@ -61,9 +61,9 @@ for(const mode of ['none','all-blocked']) {
   ]){const x=structuredClone(empty);mutate(x);assert.throws(()=>analyze(encode(x)));}
 }
 console.log('empty fixtures: two valid modes + 12 rejected mutations');
-for(const mode of ['leased','backoff']) {
+for(const mode of ['leased','backoff','leased-heads','backoff-heads','dead-heads']) {
   const boundary=phase=>[
-    {kind:'distribution',phase,total:1000,future_leased:mode==='leased'?900:0,dead:0,future_available:mode==='backoff'?900:0,owned:0},
+    {kind:'distribution',phase,total:1000,future_leased:mode==='leased'?900:mode==='leased-heads'?4:0,dead:mode==='dead-heads'?4:0,future_available:mode==='backoff'?900:mode==='backoff-heads'?4:0,owned:0},
     ...['parallel-a','parallel-b'].map(publisher=>({kind:'reserve',phase,publisher,blocked:450,ready_pending:phase==='before'?50:36,blocked_published:0}))
   ];
   const mixed=[{kind:'fixture',schema:3,mode,rows:1000,claim_calls:28},...boundary('before')];
@@ -82,4 +82,4 @@ for(const mode of ['leased','backoff']) {
     x=>x.splice(x.findIndex(v=>v.kind==='reserve'),1),
   ]) { const x=structuredClone(mixed);mutate(x);assert.throws(()=>analyze(encode(x))); }
 }
-console.log('mixed fixtures: two valid modes + 10 rejected mutations');
+console.log('mixed fixtures: five valid modes + 25 rejected mutations');
