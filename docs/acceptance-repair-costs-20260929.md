@@ -125,3 +125,13 @@ repair.json schema2记录admitted、not_injected、stopped、untouched_mismatche
 rgs_0930a新库六轮2/5秒（control/repair、repair/control、control/repair）UTC2026-09-30 13:58:44至14:00:26，exit0/OOMfalse，六次1 passed与REPAIR_PAIRS_COMPLETED，原始六目录及rgs_0930a.*已拉回。840业务请求零错误/未发送/核对差异，每轮14个领取项、not_injected=0、remaining=0、mismatches=0、untouched_mismatches=0，三修复组共42条真实修复注入；六轮SMOKE_ONLY。无guard触发，此实测只验证schema2正常路径，不验证真实停止路径、不作性能结论。
 
 下一步补新库低速、确定性触发业务guard的独立负例，核对停止后的已领取前缀/未注入后缀、保留预期REJECTED_LOAD并验证部分修复完成；先完善已开始注入及核对超时的未知结果留档，避免取消后误判未注入。不能直接开展高积压故障、重复正式低速矩阵或解除升压边界。当前只有5基础服务，无验收负载；生产源码未改，旧性能/证据失败仍保留。
+
+## rgstop_0930a确定性guard负例：停止生效，夹具隔离失败
+
+工具395858c增加repair-operations.jsonl：enqueue前持久化started；成功返回记录completed，5秒超时或错误记录timeout_unknown/error_unknown并失败，未有终态的started也视为未知，不重试、不算未注入。最终PG/cache逐项核对共用30秒截止时间并逐项记账。此期限不覆盖建库及预置阶段，文件系统sync失败/卡住也不能据此声称全流程硬期限。分析器要求成功路径完整、顺序一致的操作账本；缺项/重复/未知负例通过，超时留档异步测试、Clippy和fmt通过。
+
+仅验收驱动增加MIX_GUARD_DELAY_AT，限制为2/5秒、20/s、并发8短测，在指定时隙等150ms触发现有100ms调度guard，不改变guard阈值。三上传文件SHA256一致。rgstop_0930a_r0于UTC2026-09-30 14:12:53至14:13:43运行，容器exit1/OOMfalse，原始全拉回。n40 dispatch152493us触发dispatch_over_100ms，40响应、100未发送，业务错误/已发核对差异0；原测试按not_sent==0断言失败并保留，未继续第二/第三轮。修复admitted5、not_injected9、stopped=true、remaining0、已领取mismatches0，但untouched_mismatches=9。离线分析严格在9!=0失败，尚未生成合格REJECTED_LOAD诊断，不能把该负例当完整通过。
+
+源码提供夹具干扰线索：PostgresSnapshotStore::save路径在保存事务内部调用cache_repair::enqueue_in_transaction；prepare先启动服务再预置两次save，后台worker已可处理这些自动队列项。因此“只有显式500ms enqueue才会修复、未注入后缀保持原缓存”这个假设无效。当前未保留每项预置前后队列/缓存时间线，不能仅凭源码断言9项变化的精确时刻与持有者，但足以拒绝隔离成本结论。之前rgs三组42次显式enqueue不等于42次唯一修复执行；历史P06组数据正确性事实保留，单独归因显式注入负载的成本结论需重新限定，不删除旧报告。
+
+下一步先设计并验证新库夹具建立边界，显式记录自动预置修复的完成状态、开始测量时队列与缓存基线，避免后台预置修复混入观测；不能通过删除队列/缓存、放宽untouched断言或生产关闭开关绕过。原rgstop失败完整保留，不盲目重跑。停止信号生效只是本次部分结论；高积压故障、容量及隔离修复成本均未通过。当前无新验收负载，仍不升压。
