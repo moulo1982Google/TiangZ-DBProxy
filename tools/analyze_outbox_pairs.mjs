@@ -13,9 +13,9 @@ for(const [i,e] of entries.entries()){
   assert.equal(e.mode,['off','on','on','off','off','on'][i]);
   assert(/^[a-z][a-z0-9_]+$/.test(e.run));
   const dir=path.join(root,'..',`fault_process_${e.run}`,'mixed-paced');
-  const checked=spawnSync(process.execPath,[analyzer,dir],{encoding:'utf8'});
+  const checked=spawnSync(process.execPath,[analyzer,dir],{encoding:'utf8',stdio:['ignore','ignore','pipe']});
   assert.equal(checked.status,0,`${e.run}: ${checked.stderr}`);
-  const a=JSON.parse(checked.stdout),m=a.manifest;
+  const a=JSON.parse(fs.readFileSync(path.join(dir,'analysis.json'),'utf8')),m=a.manifest;
   assert.equal(m.baseline,'B2');assert.equal(m.outbox_stats_mode,e.mode);
   assert.equal(m.repair_mode,'none');assert(m.outbox_audit);
   assert.equal(m.rate,20);assert.equal(m.concurrency,8);assert.equal(m.connections,4);
