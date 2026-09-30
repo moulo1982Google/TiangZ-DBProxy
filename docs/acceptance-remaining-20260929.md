@@ -110,3 +110,7 @@ d34ca03接入业务guard到修复生成器的停止通知，schema2区分领取�
 ### 当前缓存基线guard负例完成
 
 5c2711e建立预置自动修复排空及PG/cache revision2一致基线。rgbas_0930a_r0新库短测UTC14:26:53至14:27:43容器exit1/OOMfalse；40响应/100未发送、5领取/9未注入、全部核对及未注入保持检查零差异。离线严格生成REJECTED_LOAD且退出1，符合停止负例；旧rgstop失败保留。仅current_cache_reenqueue范围，不是陈旧缓存修复成本/高积压通过；非空预置队列等待分支本次未命中。下一步无guard正常路径、基线分析负例及陈旧修复夹具设计，禁止升压/盲目正式重复。详见repair-costs报告。
+
+### 当前基线正常短测完成
+
+rgbnorm_0930a六轮新库2/5秒UTC14:41:05至14:42:48 exit0/OOMfalse，840请求零差异，三repair组42次显式重复入队，六轮基线/journal严格SMOKE_ONLY。基线缺项/版本/matches/非空队列负例通过；非空预置排空仍未命中。下一步实际实现服务启动前预置陈旧缓存及专属队列available_at延后、测量时逐项enqueue放行的夹具，分别核对held后缀和已放行前缀。方案见repair-costs，尚未实测，不标P06成本/高积压完成；不删队列/缓存、不升压。

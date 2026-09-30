@@ -143,3 +143,13 @@ rgs_0930a新库六轮2/5秒（control/repair、repair/control、control/repair�
 rgbas_0930a_r0新库于UTC2026-09-30 14:26:53至14:27:43结束，容器exit1/OOMfalse，原始全拉回。基线队列观测为0，14项均与PG revision2一致，baseline_ready pending0。n40 dispatch153533us触发原guard，40响应、100未发送，已发业务错误及核对差异0。repair admitted5/not_injected9/stoppedtrue/remaining0/mismatches0/untouched_mismatches0，完整操作意图/完成账本严格对应。离线分析顺利完成全部一致性断言并生成REJECTED_LOAD，退出1；测试仍在原not_sent==0断言失败，不把预期guard负例改成正常负载通过。
 
 本轮验证了停止通知、已领取前缀排空和未领取后缀保持稳定的组合路径；此前rgstop的9项不符与失败原样保留。初次队列观测已为0，因此本轮没有实际覆盖“等待非空预置队列排空”的分支。尚未验证真实enqueue超时的提交未知结果，只已有本地超时账本测试。下一步优先补无guard当前基线正常路径与分析器基线负例，并设计真正陈旧缓存修复的可观测夹具，不能通过降低未注入断言或把当前缓存重复入队算陈旧修复来结束P06。保持不升压、不重复正式低速矩阵。
+
+## rgbnorm_0930a正常路径及陈旧修复夹具设计
+
+工具仍为5c2711e，没有重复修改生产或观测代码。rgbnorm_0930a六轮新库control/repair交替2/5秒于UTC2026-09-30 14:41:05至14:42:48结束，exit0/OOMfalse，六次1 passed及REPAIR_PAIRS_COMPLETED。原始六目录及全部rgbnorm_0930a.*已拉回；840业务请求零错误/未发送/核对差异，各14项admitted、not_injected0、remaining0、mismatches0、untouched0，三repair组42次显式重复入队，六轮严格SMOKE_ONLY。基线和操作意图/完成账本均通过；六轮首次preparation_queue均0，仍未实测非空预置队列等待分支。范围仅current_cache_reenqueue，不能当陈旧缓存修复成本或高积压通过。
+
+复制rgbas原始夹具验证基线分析负例：删除一项、revision错误、matches=false、最终pending非0均触发AssertionError；未变夹具仍正常输出REJECTED_LOAD、exit1且无解析断言错误，保留guard拒绝语义。所有原始证据未改。
+
+源码设计核对：现有cache_repair_end_to_end.rs组件测试在StorageBackend构造后手动调用process_cache_repair_once，预置时没有后台worker，因而可保留revision1缓存和revision2权威；当前混合驱动在预置前启动真实服务，不能直接照搬。cache_repair_claim.sql显式要求available_at<=statement_timestamp，enqueue路径会重置available_at为当前时间。
+
+下一步陈旧缓存夹具方案（尚未实现/实测）：把专属新库修复预置移至验收服务启动前；两次save产生自动队列后，仅对该RunId专属记录设置未来available_at，保存基线：PG revision2、cache revision1、未租用、全部暂不可领取。真实服务照常启动，测量时按2项/秒显式enqueue放行（已有SQL重置available_at），业务guard停止后保留未放行后缀及其revision1缓存；已放行前缀要求revision2并完成确认。control组缓存预先同步revision2但同样保留受控队列条件。分析须分别记录held/eligible/leased/dead和已放行前缀，不能把held当排空遗漏或把全队列0作为唯一条件；新的范围另schema，旧失败断言不改。必须先新库短测验证启动后不抢跑、停止后后缀保持、自动队列完整性和放行后权威一致，再考虑正式对照。不删除队列/缓存、不停止共享服务或生产worker、不引入生产关闭开关、不升压。
