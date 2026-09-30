@@ -9,7 +9,8 @@ WB=dbproxy-mixed-$RUN_ID
 case ${MIX_SUITE:-baseline} in
     baseline) runner=run_mixed_rounds.sh ;;
     paired) runner=run_mixed_pairs.sh ;;
-    *) echo 'MIX_SUITE must be baseline or paired'; exit 2 ;;
+    repair) runner=run_repair_pairs.sh ;;
+    *) echo 'MIX_SUITE must be baseline, paired or repair'; exit 2 ;;
 esac
 OUT=$DATA/evidence/fault_process_${RUN_ID}_r0
 [[ ! -e $OUT ]] || { echo 'Use a new RunId'; exit 2; }
