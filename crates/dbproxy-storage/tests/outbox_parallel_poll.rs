@@ -184,6 +184,8 @@ async fn two_workers_fixed_budget() {
     let warmup = 2_u64;
     let sample = 5_u64;
     let waves = (warmup + sample) * 2;
+    let mode = std::env::var("P07_PARALLEL_MODE").unwrap_or_else(|_| "ready".into());
+    assert!(matches!(mode.as_str(), "ready" | "none" | "all-blocked"));
     let store = PostgresSnapshotStore::connect(&url).await.unwrap();
     let setup = store.outbox_queue();
     let (sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
@@ -214,6 +216,22 @@ async fn two_workers_fixed_budget() {
         // Two FIFO partitions per publisher; names deliberately shared across publishers.
         sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms) SELECT $1::text||'-'||n,'parallel',$2,'key-'||(n%2),'',0 FROM generate_series(0,499) n ORDER BY n", &[&publisher, &route.key()]).await.unwrap();
     }
+    match mode.as_str() {
+        "none" => {
+            sql.execute(
+                "UPDATE dbproxy_outbox SET lease_until=clock_timestamp()+interval '1 day'",
+                &[],
+            )
+            .await
+            .unwrap();
+        }
+        "all-blocked" => {
+            sql.execute("UPDATE dbproxy_outbox SET dead_lettered_at=clock_timestamp() WHERE event_id IN ('parallel-a-0','parallel-a-1','parallel-b-0','parallel-b-1')", &[]).await.unwrap();
+        }
+        _ => {}
+    }
+    journal.record(json!({"kind":"fixture","schema":2,"mode":mode,"rows":1000,"claim_calls":28}));
+    distribution(&sql, &journal, &mode, "before").await;
     sql.batch_execute("ANALYZE dbproxy_outbox").await.unwrap();
     let first = PostgresSnapshotStore::connect_existing(&url)
         .await
@@ -256,6 +274,17 @@ async fn two_workers_fixed_budget() {
                 second.claim_for_publisher("parallel-worker-1", 30_000, Some(publisher))
             )
         );
+        if mode != "ready" {
+            assert!(a.expect("claim outcome unknown").is_none());
+            assert!(b.expect("claim outcome unknown").is_none());
+            for worker in [0, 1] {
+                journal.record(
+                    json!({"kind":"empty","wave":wave,"worker":worker,"publisher":publisher}),
+                );
+            }
+            journal.record(json!({"kind":"wave_completed","wave":wave,"begin_us":before,"end_us":start.elapsed().as_micros()}));
+            continue;
+        }
         let leases = [
             a.expect("claim outcome unknown")
                 .expect("ready partition required"),
@@ -317,6 +346,7 @@ async fn two_workers_fixed_budget() {
         assert_eq!(published, seen.contains(&event));
         journal.record(json!({"kind":"final","event":event,"published":published}));
     }
+    distribution(&sql, &journal, &mode, "after").await;
     // Actual overlap is checked using operation boundaries, not join!/barrier presence.
     let raw = std::fs::read_to_string(output.join("journal.jsonl")).unwrap();
     let values: Vec<Value> = raw
@@ -343,4 +373,15 @@ async fn two_workers_fixed_budget() {
     assert!(overlaps > 0, "no observed concurrent claim intervals");
     journal.record(json!({"kind":"result","status":"SMOKE_ONLY","workers":2,"publishers":2,"rows":1000,"waves":waves,"claims":seen.len(),"overlap_waves":overlaps,"warmup_seconds":warmup,"sample_seconds":sample,"stats":false}));
     connection.abort();
+}
+
+async fn distribution(sql: &tokio_postgres::Client, journal: &Journal, mode: &str, phase: &str) {
+    let row = sql.query_one("SELECT count(*), count(*) FILTER(WHERE lease_until>statement_timestamp()), count(*) FILTER(WHERE dead_lettered_at IS NOT NULL), count(*) FILTER(WHERE available_at>statement_timestamp()), count(*) FILTER(WHERE lease_owner IS NOT NULL) FROM dbproxy_outbox", &[]).await.unwrap();
+    let counts: Vec<i64> = (0..5).map(|i| row.get(i)).collect();
+    assert_eq!(counts[0], 1000);
+    assert_eq!(counts[1], if mode == "none" { 1000 } else { 0 });
+    assert_eq!(counts[2], if mode == "all-blocked" { 4 } else { 0 });
+    assert_eq!(counts[3], 0);
+    assert_eq!(counts[4], 0);
+    journal.record(json!({"kind":"distribution","phase":phase,"total":counts[0],"future_leased":counts[1],"dead":counts[2],"future_available":counts[3],"owned":counts[4]}));
 }

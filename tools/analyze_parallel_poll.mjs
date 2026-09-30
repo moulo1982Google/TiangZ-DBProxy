@@ -11,6 +11,17 @@ export function analyze(raw) {
   const uint = v => assert(Number.isSafeInteger(v) && v >= 0, 'invalid timing/count');
   const seen = new Set(), next = [[0, 1], [0, 1]];
   const claims = [];
+  const versioned = rows[0]?.kind === 'fixture';
+  let mode = 'ready';
+  function distribution(phase) {
+    assert.deepEqual(take('distribution'), {kind:'distribution',phase,total:1000,future_leased:mode==='none'?1000:0,dead:mode==='all-blocked'?4:0,future_available:0,owned:0});
+  }
+  if(versioned) {
+    const f=take('fixture'); mode=f.mode;
+    assert(['ready','none','all-blocked'].includes(mode));
+    assert.equal(f.schema,2);assert.equal(f.rows,1000);assert.equal(f.claim_calls,28);
+    distribution('before');
+  }
   for (let wave = 0; wave < 14; wave++) {
     const w = take('wave'), publisher = `parallel-${wave % 2 ? 'b' : 'a'}`;
     assert.equal(w.wave, wave); assert.equal(w.publisher, publisher);
@@ -39,6 +50,8 @@ export function analyze(raw) {
       return [completed.get(0), completed.get(1)];
     }
     const c = operations('claim');
+    let a = c;
+    if(mode==='ready') {
     const keys = new Set();
     for (let worker = 0; worker < 2; worker++) {
       const l = take('lease'); assert.equal(l.wave, wave); assert.equal(l.worker, worker);
@@ -50,8 +63,11 @@ export function analyze(raw) {
       next[wave % 2][key] += 2;
       assert(!seen.has(l.event)); seen.add(l.event);
     }
-    const a = operations('ack', Math.max(...c.map(v => v.end_us)));
+    a = operations('ack', Math.max(...c.map(v => v.end_us)));
     for (const ack of a) assert(ack.begin_us >= Math.max(...c.map(v => v.end_us)));
+    } else {
+      for(const worker of [0,1]) assert.deepEqual(take('empty'),{kind:'empty',wave,worker,publisher});
+    }
     const end = take('wave_completed'); assert.equal(end.wave, wave);
     uint(end.begin_us); uint(end.end_us);
     assert(end.begin_us >= w.dispatch_us && end.begin_us <= Math.min(...c.map(v => v.begin_us)));
@@ -65,13 +81,14 @@ export function analyze(raw) {
     assert.equal(v.published, seen.has(v.event));
   }
   for (const publisher of ['a','b']) for (let n = 0; n < 500; n++) assert(final.has(`parallel-${publisher}-${n}`));
+  if(versioned) distribution('after');
   const result = take('result');
   assert.equal(result.status, 'SMOKE_ONLY'); assert.equal(result.waves,14);
   assert.equal(result.workers,2); assert.equal(result.publishers,2); assert.equal(result.rows,1000);
-  assert.equal(result.claims,28); assert.equal(result.stats,false);
+  assert.equal(result.claims,mode==='ready'?28:0); assert.equal(result.stats,false);
   assert.equal(result.warmup_seconds,2); assert.equal(result.sample_seconds,5);
   assert(overlaps > 0); assert.equal(result.overlap_waves,overlaps); assert.equal(cursor,rows.length);
-  return {status:'SMOKE_ONLY', validation:'PARALLEL_CLAIMS_CHECKED', waves:14, claims:28, formal_claims:20, overlap_waves:overlaps, claims_timing:claims};
+  return {status:'SMOKE_ONLY', validation:'PARALLEL_CLAIMS_CHECKED', mode, waves:14, claim_calls:28, returned:seen.size, formal_claim_calls:20, overlap_waves:overlaps, claims_timing:claims};
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const dir = process.argv[2];

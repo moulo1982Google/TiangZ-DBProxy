@@ -40,3 +40,24 @@ const mutations=[
 for(const mutate of mutations){const x=structuredClone(rows);mutate(x);assert.throws(()=>analyze(encode(x)));}
 assert.throws(()=>analyze(encode(rows).trimEnd()));
 console.log(`parallel ledger: valid fixture + ${mutations.length+1} rejected mutations`);
+for(const mode of ['none','all-blocked']) {
+  const snapshot=phase=>({kind:'distribution',phase,total:1000,future_leased:mode==='none'?1000:0,dead:mode==='all-blocked'?4:0,future_available:0,owned:0});
+  const empty=[{kind:'fixture',schema:2,mode,rows:1000,claim_calls:28},snapshot('before')];
+  for(const r of structuredClone(rows)) {
+    if(r.operation==='ack')continue;
+    if(r.kind==='lease'){empty.push({kind:'empty',wave:r.wave,worker:r.worker,publisher:r.publisher});continue;}
+    if(r.kind==='final')r.published=false;
+    if(r.kind==='result'){empty.push(snapshot('after'));r.claims=0;}
+    empty.push(r);
+  }
+  assert.equal(analyze(encode(empty)).returned,0);
+  for(const mutate of [
+    x=>x.find(v=>v.kind==='empty').publisher='wrong',
+    x=>x.splice(x.findIndex(v=>v.kind==='empty'),1),
+    x=>x.find(v=>v.kind==='distribution'&&v.phase==='after').owned=1,
+    x=>x.find(v=>v.kind==='distribution'&&v.phase==='before').dead=999,
+    x=>x.find(v=>v.kind==='final').published=true,
+    x=>x.at(-1).claims=28,
+  ]){const x=structuredClone(empty);mutate(x);assert.throws(()=>analyze(encode(x)));}
+}
+console.log('empty fixtures: two valid modes + 12 rejected mutations');

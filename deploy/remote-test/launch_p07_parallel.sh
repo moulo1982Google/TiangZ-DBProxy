@@ -21,6 +21,7 @@ finish() {
 trap finish EXIT
 docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cpus 4 \
     --memory 16g --memory-swap 16g -e CARGO_BUILD_JOBS=4 \
+    -e P07_PARALLEL_MODE="${P07_PARALLEL_MODE:-ready}" \
     -e P07_PUBLISHERS="${P07_PUBLISHERS:-1}" \
     -e P07_WARMUP_SECONDS="${P07_WARMUP_SECONDS:-120}" \
     -e P07_SAMPLE_SECONDS="${P07_SAMPLE_SECONDS:-300}" -e P07_ROUNDS="${P07_ROUNDS:-3}" \
