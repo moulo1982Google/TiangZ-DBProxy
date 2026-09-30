@@ -531,3 +531,15 @@ parallel_environment.mjs要求完整LF/五条记录/30秒内采集、真实资�
 各轮仅2资源样本/单区间，PG max/oom/oom_kill及scan/steal增量0，不排除未采样峰值、不解除停止升压边界。连续Docker事件p7pair_0930a.events首轮前240秒订阅，约20:00:26自然结束；当前已拉回8条自身start/die、stderr空，到期后补拉，不停止监听；宿主非容器活动未排除。每轮前后实际5基础服务，目前无新负载。
 
 这组必要的新证据协议短测已完成，不再重复。正式规模仍不能从数学预算直接批准；后续优先核对并准备独立新库、原5秒超时阈值的真实PG领取未知负例（只影响本RunId数据库，双方结果均留档、不重试），补本地future模拟以外的缺口；实施前验证锁作用域及有界释放，不停止共享服务、不升压。它也不能证明提交后ack超时或全流程故障有界。正式九分布、P06高积压及P09容量缺口继续保留。
+
+## P07 真实PG领取超时独立负例工具准备（e60a5c8，尚未实测）
+
+新增parallel_claim_timeout独立ignored测试real_claim_timeout，不被正常two_workers_fixed_budget入口选择。仅允许P07_TIMEOUT_RUN_ID以p7ct_开头且与解析URL的数据库名完全相同，迁移前要求public没有表；不接受已有验收库。初始化空outbox后创建两独立worker连接、一个blocker及监测连接，blocker只在该专属库对dbproxy_outbox持ACCESS EXCLUSIVE事务锁。锁获取期限2秒，服务端idle_in_transaction_session_timeout=12秒；连接任务以Drop guard关闭，显式ROLLBACK再加2秒等待。未改生产SQL/限额/共享服务。
+
+只发起一波两次真实claim，复用原5秒observed和双方join，不重试、不ack、不发下一波。2秒内通过pg_stat_activity的当前数据库、两个固定application_name、Lock等待和pg_blocking_pids包含本blocker PID证明两个请求确实被该PG事务阻塞，不能只凭耗时猜测。双方unknown必须是原5秒timeout错误，全部留档后释放锁。Future取消不被解释为PG请求取消；释放后最多5秒等待该库两worker不再active，再核对空表仍0。单独封存EXPECTED_CLAIM_TIMEOUT_ONLY账本，不喂正常性能分析器，不把unknown变成empty或成功业务结果。此为空表关系锁超时，不能证明有消息提交后的未知结果、ack超时或全流程有界（连接、迁移、文件IO没有统一硬期限）。
+
+新增analyze_claim_timeout.mjs严格验证完整封存、9条账本、实际双PID阻塞证明、两个唯一started/unknown、原5秒时长、双方完成后的确认rollback及最终0行/0重试/0ack。合成两种合法完成顺序及19缺证明/错PID/提前返回/错结果/释放失败负例通过。数据库目标本地正负例、Clippy -Dwarnings/fmt通过；旧配对全部正负例通过。源指纹未来增加该Rust模块为第12文件，历史11文件组仍保留其工具版本报告，不回填源码。
+
+本阶段未上传源码、未建库、未执行真实PG故障；不能报告真实timeout覆盖。p7pair事件到期补拉仍8条自身start/die，stderr空；实际5基础服务无编译/验收负载，工作区其他人的roadmap保留。
+
+下一步实际添加专用runner/launcher（严格exact parallel_claim_timeout::real_claim_timeout，独立RunId前缀，原工作台资源、环境/源码/事件/资源证据），先本地入口拒绝检查再一个新空库执行；不得通过改正常入口或放宽正常未知拒绝来跑。失败保留，先核实双方真实阻塞/5秒unknown/有界释放及最终核对，再决定后续范围。不重复已完成的配对短测，不升压；正式九分布、提交后未知、P06高积压/P09容量仍缺。
