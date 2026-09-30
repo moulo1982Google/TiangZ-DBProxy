@@ -105,3 +105,9 @@ opairf_0930a于UTC2026-09-30 03:56:43（北京时间11:56:43）结束，exit0/OO
 分析器首次汇总失败是本地子进程默认stdout缓存不足：420条消息原始payload导致超过1MiB，诊断error=ENOBUFS/status=null/SIGTERM，保存opairf_0930a.analyzer-buffer-diagnostic.json。修正父分析器忽略子stdout、检查退出状态并读取子分析器已写analysis.json，未改证据或断言、未放宽门槛；六轮正式及历史六轮短测分析均通过，node语法检查通过。无需服务器重跑。
 
 用户准备迁移220的Docker数据目录：/var/lib/docker根盘116G已用103G剩7.2G，/data剩1.8T。所有本轮验收已结束且原始证据在本机；没有停止Docker或共享服务，没有新建后续负载。等待用户明确迁移完成并允许恢复后再继续。迁移可能改变IO环境，后续结果必须记录新环境，不直接无条件合并。
+
+## 迁移后恢复复核
+
+用户于北京时间2026-09-30 12:34明确要求继续。只读检查确认DockerRootDir已变为/sas/docker（/dev/md1 ext4剩5.7T），根盘剩84G；PG/两个Redis healthy，PG4CPU/8GiB及原cpuset和/data绑定挂载未变。基础服务UTC04:26:36重启，工作台镜像仍ae3b3d8e17608b277067e3a44ee3e45056a987655b023aad4b025dc0f6811470。迁移前后IO路径/缓存状态不同，结果分组报告，不能简单合并或归因为代码性能变化。环境及服务/源码标识保存在target/server_20260929/opairf_0930b.environment-before.txt。
+
+不升压、保持原工具，追加六轮opairf_0930b已UTC04:34:55（北京时间12:34:55）启动，容器dbproxy-mixed-opairf_0930b，4CPU/16GiB、cpuset20-27,48-55核实。每轮全新库、120秒预热300秒采样，20请求/秒、并发8四连接，默认统计与同维护连接附加1Hz交替；预计北京时间13:21附近完成，以实际退出为准。关注原第二对单读/单事务尾延迟是否复现，保留原全部轮次，不用新结果覆盖旧波动。运行中只读且不并行测试。
