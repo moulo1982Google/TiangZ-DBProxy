@@ -438,3 +438,15 @@ p7spread_0930a新库UTC17:58:06.011至17:58:21.816，exit0/OOMfalse、1 passed/�
 本地两项Rust预算/环境测试通过（边界、旧小数据不足、越界/溢出、非法时长和配置）；目标Clippy -D warnings、fmt通过。新增Node调用真实Bash preflight/launcher/runner，默认/显式短测参数通过，120个非法参数组合均exit2且在外部操作前拒绝，未知分布拒绝。未上传源码、未新建数据库、未启动或重复已通过短测；本阶段没有生产变更及代码生成。
 
 p7spread到期观察文件已补拉，仅自身start/die两条、stderr空；实际docker ps仍5基础服务，非容器活动不排除。不升压。下一步继续实际实现统一参数驱动的分布/逐项最终账本及完整封存、严格分析器正负例，然后共享worker0现有连接的stats开关（两组一致观测）；新工具小数据验证完成前不启用正式矩阵。九分布正式性能、真实未知路径、P06高积压/P09容量仍缺。
+
+## P07 统一schema5与关闭写入后的封存（72e386d）
+
+九种模式统一fixture schema5，明确实际warmup/sample、两worker/两publisher、总4调用/s、行数/调用数、stats=false及seal_required=true。仍仅1000行2/5秒执行，预算模块f4cac3f一起上传；正式参数和stats开关尚未启用。Journal::seal消耗唯一writer，flush/sync_all后关闭文件，再读完整字节生成SHA256及字节数，sync确认文件后原子rename发布journal-sealed.json；未完成或失败不能产生完成封存。分析器对schema5强制要求封存字段、字节数、SHA256、末尾换行及原有完整账本全部匹配，历史schema保持原规则，不修旧原始。
+
+本地真实文件关闭/封存Rust测试通过，Node九种schema5正例及99个封存/配置负例通过，旧18+12+25+5负例仍通过；目标Clippy -D warnings及fmt通过。五个上传文件远端SHA256与本地一致，主test为9fcdb24264b390d917c3a85fa6a5637c5bab0c7cd6960d4a44081707b78ba9a4；launcher源码清单新增预算模块与preflight，生产代码无改动。
+
+必要的新工具短测p7seal_0930a，leased-heads专属新库UTC18:28:26.102至18:28:41.918，exit0/OOMfalse、1 passed/P07_PARALLEL_SMOKE_COMPLETED。1000行2/5秒总4调用/s、14波全部真实重叠、28唯一领取确认、20短采样；两publisher可领取余量各50→36、900受阻未发布、4租约头起止保持，最终1000PG一致。退出后严格PARALLEL_CLAIMS_CHECKED/SMOKE_ONLY，封存78391字节SHA256 3e6a0db68e5067909f3bccfef9081219ef4c1ac019ff962908f5ead09efbf37b匹配，全部原始目录及容器/镜像/源码/日志/资源已回收。此为封存协议验证，不是重复性能测量或九分布正式通过。
+
+前后实际5基础服务，启动前无其他编译/验收；2资源样本单区间PG max/oom/reclaim0，不排除未采样峰值且不解除原升压边界。连续只读p7seal_0930a.events订阅首轮前启动120秒，约18:30:26自然退出，当前仅自身start/die两条stderr空；到期补拉，不停止，宿主非容器活动未排除。
+
+下一步实际将预置规模、分布计数、逐项最终账本从固定数值改为统一预算参数驱动，并在严格分析器中校验同一预算；保持当前执行入口不启用正式。随后补共享worker0已有连接的stats开关和相同观测成本，再必要新工具小数据验证。尚未实现大样本分布稳定性/正式stats对照；既有失败、真实数据库未知结果/P06高积压/P09容量缺口保留。
