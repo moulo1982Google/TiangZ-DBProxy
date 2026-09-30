@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {createHash} from 'node:crypto';
 
-export function analyze(raw) {
+export function analyze(raw, seal) {
   assert(raw.endsWith('\n'), 'journal must be sealed with a final newline');
   const rows = raw.trimEnd().split('\n').map(s => JSON.parse(s));
   let cursor = 0, previousEnd = 0, overlaps = 0;
@@ -24,7 +25,11 @@ export function analyze(raw) {
     assert(['ready','spread-ready','none','all-blocked','leased','backoff','leased-heads','backoff-heads','dead-heads'].includes(mode));
     mixed=['leased','backoff','leased-heads','backoff-heads','dead-heads'].includes(mode);
     if(mixed) for(const n of next) {n[0]=450;n[1]=451;}
-    assert.equal(f.schema,mode==='spread-ready'?4:mixed?3:2);assert.equal(f.rows,1000);assert.equal(f.claim_calls,28);
+    if(f.schema===5) {
+      assert.deepEqual(f,{kind:'fixture',schema:5,mode,rows:1000,claim_calls:28,warmup_seconds:2,sample_seconds:5,workers:2,publishers:2,claims_per_second:4,stats:false,seal_required:true});
+      assert.deepEqual(seal,{schema:1,file:'journal.jsonl',bytes:Buffer.byteLength(raw),sha256:createHash('sha256').update(raw).digest('hex')},'missing or inconsistent journal seal');
+    } else assert.equal(f.schema,mode==='spread-ready'?4:mixed?3:2);
+    assert.equal(f.rows,1000);assert.equal(f.claim_calls,28);
     distribution('before');
   }
   for (let wave = 0; wave < 14; wave++) {
@@ -104,7 +109,8 @@ export function analyze(raw) {
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const dir = process.argv[2];
-  const result = analyze(fs.readFileSync(path.join(dir,'journal.jsonl'),'utf8'));
+  const sealPath=path.join(dir,'journal-sealed.json');
+  const result = analyze(fs.readFileSync(path.join(dir,'journal.jsonl'),'utf8'),fs.existsSync(sealPath)?JSON.parse(fs.readFileSync(sealPath,'utf8')):undefined);
   fs.writeFileSync(path.join(dir,'analysis.json'),JSON.stringify(result,null,2)+'\n');
   console.log(JSON.stringify(result));
 }

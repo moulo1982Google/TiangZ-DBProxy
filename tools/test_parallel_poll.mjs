@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import {analyze} from './analyze_parallel_poll.mjs';
+import {createHash} from 'node:crypto';
+const versionedFixtures=[];
 const rows=[], seen=new Set(), next=[[0,1],[0,1]];
 for(let wave=0;wave<14;wave++) {
   const t=wave*500000, publisher=`parallel-${wave%2?'b':'a'}`;
@@ -51,6 +53,7 @@ for(const mode of ['none','all-blocked']) {
     empty.push(r);
   }
   assert.equal(analyze(encode(empty)).returned,0);
+  versionedFixtures.push(empty);
   for(const mutate of [
     x=>x.find(v=>v.kind==='empty').publisher='wrong',
     x=>x.splice(x.findIndex(v=>v.kind==='empty'),1),
@@ -74,6 +77,7 @@ for(const mode of ['leased','backoff','leased-heads','backoff-heads','dead-heads
     mixed.push(r);
   }
   assert.equal(analyze(encode(mixed)).returned,28);
+  versionedFixtures.push(mixed);
   for(const mutate of [
     x=>x.find(v=>v.kind==='reserve').ready_pending=0,
     x=>x.find(v=>v.kind==='reserve'&&v.phase==='after').blocked_published=1,
@@ -108,3 +112,22 @@ for(const mutate of [
   x=>x.filter(v=>v.kind==='lease')[2].event='parallel-a-0',
 ]){const x=structuredClone(spread);mutate(x);assert.throws(()=>analyze(encode(x)));}
 console.log('spread: two legal return orders + 5 rejected mutations');
+versionedFixtures.push(spread);
+const dense=[{kind:'fixture',schema:2,mode:'ready',rows:1000,claim_calls:28},spreadBoundary('before')[0],...structuredClone(rows)];
+dense.splice(dense.length-1,0,spreadBoundary('after')[0]);
+versionedFixtures.push(dense);
+const sealOf=raw=>({schema:1,file:'journal.jsonl',bytes:Buffer.byteLength(raw),sha256:createHash('sha256').update(raw).digest('hex')});
+for(const fixture of versionedFixtures){
+  const current=structuredClone(fixture);
+  Object.assign(current[0],{schema:5,warmup_seconds:2,sample_seconds:5,workers:2,publishers:2,claims_per_second:4,stats:false,seal_required:true});
+  const raw=encode(current), seal=sealOf(raw);
+  assert.equal(analyze(raw,seal).validation,'PARALLEL_CLAIMS_CHECKED');
+  for(const invalid of [undefined,{...seal,schema:2},{...seal,file:'other.jsonl'},{...seal,bytes:seal.bytes-1},{...seal,sha256:'0'.repeat(64)}]) assert.throws(()=>analyze(raw,invalid));
+  assert.throws(()=>analyze(raw+'\n',seal));
+  assert.throws(()=>analyze(raw.trimEnd(),sealOf(raw.trimEnd())));
+  for(const [key,value] of [['claim_calls',1680],['warmup_seconds',120],['workers',4],['seal_required',false]]) {
+    const changed=structuredClone(current); changed[0][key]=value;
+    const bad=encode(changed);assert.throws(()=>analyze(bad,sealOf(bad)));
+  }
+}
+console.log('schema5: nine distributions + 99 seal/configuration rejections');

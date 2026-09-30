@@ -1,5 +1,6 @@
 //! Small, fixed-budget two-connection claim acceptance; never a capacity test.
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{collections::HashSet, fs::File, future::Future, io::Write, sync::Mutex, time::Duration};
 use tiangz_dbproxy_storage::{OutboxRoute, PostgresSnapshotStore};
 use tokio::time::{Instant, sleep_until, timeout};
@@ -12,6 +13,28 @@ impl Journal {
         let mut file = self.0.lock().unwrap();
         writeln!(file, "{value}").unwrap();
         file.sync_data().unwrap();
+    }
+
+    // Consumes the sole writer. Publish confirmation only after flush, sync and close.
+    fn seal(self, directory: &std::path::Path) {
+        let mut file = self.0.into_inner().unwrap();
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let bytes = std::fs::read(directory.join("journal.jsonl")).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        let seal = json!({"schema":1,"file":"journal.jsonl","bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(&bytes))});
+        let pending = directory.join("journal-sealed.pending");
+        let mut confirmation = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&pending)
+            .unwrap();
+        writeln!(confirmation, "{seal}").unwrap();
+        confirmation.sync_all().unwrap();
+        drop(confirmation);
+        assert!(!directory.join("journal-sealed.json").exists());
+        std::fs::rename(pending, directory.join("journal-sealed.json")).unwrap();
     }
 }
 
@@ -81,6 +104,38 @@ fn journal_rows(path: &std::path::Path) -> Vec<Value> {
     raw.lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+#[test]
+fn journal_seal_matches_closed_file() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../target/parallel-local-tests/seal-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let journal = Journal(Mutex::new(
+        File::options()
+            .create_new(true)
+            .write(true)
+            .open(directory.join("journal.jsonl"))
+            .unwrap(),
+    ));
+    journal.record(json!({"kind":"fixture","label":"完整性"}));
+    journal.record(json!({"kind":"result"}));
+    assert!(!directory.join("journal-sealed.json").exists());
+    journal.seal(&directory);
+    let bytes = std::fs::read(directory.join("journal.jsonl")).unwrap();
+    let seal: Value =
+        serde_json::from_slice(&std::fs::read(directory.join("journal-sealed.json")).unwrap())
+            .unwrap();
+    assert_eq!(seal["bytes"], bytes.len());
+    assert_eq!(seal["sha256"], format!("{:x}", Sha256::digest(&bytes)));
+    assert_eq!(journal_rows(&directory.join("journal.jsonl")).len(), 2);
+    assert!(!directory.join("journal-sealed.pending").exists());
 }
 
 #[tokio::test]
@@ -264,7 +319,7 @@ async fn two_workers_fixed_budget() {
         }
         _ => {}
     }
-    journal.record(json!({"kind":"fixture","schema":if mode == "spread-ready" {4} else if mixed {3} else {2},"mode":mode,"rows":1000,"claim_calls":28}));
+    journal.record(json!({"kind":"fixture","schema":5,"mode":mode,"rows":budget.rows,"claim_calls":budget.calls,"warmup_seconds":warmup,"sample_seconds":sample,"workers":2,"publishers":2,"claims_per_second":4,"stats":false,"seal_required":true}));
     distribution(&sql, &journal, &mode, "before").await;
     sql.batch_execute("ANALYZE dbproxy_outbox").await.unwrap();
     let first = PostgresSnapshotStore::connect_existing(&url)
@@ -415,6 +470,7 @@ async fn two_workers_fixed_budget() {
     }
     assert!(overlaps > 0, "no observed concurrent claim intervals");
     journal.record(json!({"kind":"result","status":"SMOKE_ONLY","workers":2,"publishers":2,"rows":1000,"waves":waves,"claims":seen.len(),"overlap_waves":overlaps,"warmup_seconds":warmup,"sample_seconds":sample,"stats":false}));
+    journal.seal(&output);
     connection.abort();
 }
 

@@ -31,6 +31,8 @@ docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cp
     -v "$DATA/src/deploy/remote-test:/src/deploy/remote-test:ro" \
     "$IMAGE" bash /src/deploy/remote-test/run_p07_parallel.sh "$RUN_ID" >/dev/null
 docker exec "$WB" sha256sum /src/crates/dbproxy-storage/tests/outbox_parallel_poll.rs \
+    /src/crates/dbproxy-storage/tests/parallel_budget/mod.rs \
+    /src/deploy/remote-test/p07_parallel_preflight.sh \
     /src/crates/dbproxy-storage/src/outbox_claim.sql >"$DATA/evidence/$RUN_ID.sources.sha256"
 docker image inspect "$IMAGE" >"$DATA/evidence/$RUN_ID.image.json"
 bash "$DATA/src/deploy/remote-test/sample_containers.sh" "$DATA/evidence/$RUN_ID.containers.jsonl" "$WB" 10 >/dev/null 2>&1 &
