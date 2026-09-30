@@ -26,6 +26,11 @@ pub fn enable() {
     ENABLED.store(true, Ordering::Relaxed);
 }
 
+/// Whether the acceptance example explicitly enabled tracing.
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
 pub async fn capture<T>(operation_id: &str, future: impl Future<Output = T>) -> T {
     if !ENABLED.load(Ordering::Relaxed) {
         return future.await;
@@ -43,7 +48,7 @@ pub async fn capture<T>(operation_id: &str, future: impl Future<Output = T>) -> 
                     let t = cell.borrow();
                     let total_us = t.start.elapsed().as_micros();
                     let output_at = Instant::now();
-                    let row = serde_json::json!({"schema_version":2,"operation_sha256":digest,
+                    let row = serde_json::json!({"schema_version":3,"operation_sha256":digest,
                 "total_us":total_us,"spans":t.spans});
                     tracing::info!("ACCEPTANCE_TX_TRACE {}", row);
                     let output_us = output_at.elapsed().as_micros();

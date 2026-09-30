@@ -1622,6 +1622,18 @@ async fn serve_requests(
             break Err(ConnectionError::MissingHandshake);
         };
         let admitted_at = std::time::Instant::now();
+        #[cfg(feature = "acceptance-trace")]
+        let response_trace = if tiangz_dbproxy_storage::acceptance_trace::enabled() {
+            match request.body.as_ref() {
+                Some(wire::request_envelope::Body::ApplyTransaction(tx)) => {
+                    use sha2::{Digest, Sha256};
+                    Some(format!("{:x}", Sha256::digest(tx.operation_id.as_bytes())))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let operation = observability::RpcOperation::from_body(request.body.as_ref());
         let (predecessors, completion) = ordering.admit(order_keys(request.body.as_ref()));
         let backend = Arc::clone(&backend);
@@ -1655,6 +1667,16 @@ async fn serve_requests(
                     handler_at.elapsed(),
                 );
                 drop(completion);
+                #[cfg(feature = "acceptance-trace")]
+                let response = (
+                    response,
+                    response_trace.map(|digest| ResponseTrace {
+                        digest,
+                        admitted_at,
+                        handler_at,
+                        queued_at: Instant::now(),
+                    }),
+                );
                 // 写出任务已退出时连接已失效，丢弃响应。 / The writer has failed, so the connection is gone.
                 let _ = responses.send(response).await;
             }
@@ -1713,13 +1735,43 @@ async fn dispatch_isolated(
     })
 }
 
+#[cfg(not(feature = "acceptance-trace"))]
+type OutgoingResponse = wire::ServerFrame;
+#[cfg(feature = "acceptance-trace")]
+type OutgoingResponse = (wire::ServerFrame, Option<ResponseTrace>);
+#[cfg(feature = "acceptance-trace")]
+struct ResponseTrace {
+    digest: String,
+    admitted_at: Instant,
+    handler_at: Instant,
+    queued_at: Instant,
+}
+
 async fn write_responses(
     mut writer: OwnedWriteHalf,
-    mut outgoing: mpsc::Receiver<wire::ServerFrame>,
+    mut outgoing: mpsc::Receiver<OutgoingResponse>,
     maximum: usize,
 ) -> Result<(), ProtocolError> {
     while let Some(response) = outgoing.recv().await {
+        #[cfg(feature = "acceptance-trace")]
+        let (response, trace) = response;
+        #[cfg(feature = "acceptance-trace")]
+        let write_at = Instant::now();
         write_message(&mut writer, &response, maximum).await?;
+        #[cfg(feature = "acceptance-trace")]
+        if let Some(t) = trace {
+            let finished_at = Instant::now();
+            tracing::info!(
+                "ACCEPTANCE_TX_RESPONSE {}",
+                serde_json::json!({
+                    "schema_version":1,"operation_sha256":t.digest,
+                    "handler_begin_us":t.handler_at.duration_since(t.admitted_at).as_micros(),
+                    "queued_us":t.queued_at.duration_since(t.admitted_at).as_micros(),
+                    "write_begin_us":write_at.duration_since(t.admitted_at).as_micros(),
+                    "write_end_us":finished_at.duration_since(t.admitted_at).as_micros()
+                })
+            );
+        }
     }
     Ok(())
 }
