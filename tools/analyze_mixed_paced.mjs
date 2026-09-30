@@ -67,7 +67,26 @@ if(m.outbox_audit){
  assert.equal(publication.stream,'dbproxy:outbox:mix-'+m.run);
 }
 const accepted=result.errors===0&&result.not_sent===0&&result.reconciliation_mismatches===0&&(!repair||(repair.remaining===0&&repair.mismatches===0));
+let stats=null;
+if(m.outbox_stats_mode && m.outbox_stats_mode!=='none'){
+ assert(m.outbox_audit);assert.equal(m.baseline,'B2');assert.equal(m.repair_mode,'none');
+ assert.equal(publication.ordered,true);assert.deepEqual(publication.redis_order,publication.pg_order);
+ assert.equal(publication.messages.length,publication.pg_rows);
+ for(const msg of publication.messages){
+   const n=Number(msg.event_id.slice((m.run+'-').length,-2)); assert.equal(kind(n),5);assert(intents.has(n));
+   assert.equal(msg.event_id,m.run+'-'+n+'-0');assert.equal(msg.operation_id,msg.event_id);assert.equal(msg.partition_key,'ordered');assert.equal(msg.occurred_at_unix_ms,1);
+   assert.deepEqual(msg.payload,Array.from({length:1024},(_,i)=>(n+i)%251));
+ }
+ const start=rows.find(r=>r.kind==='measurement_start').unix_ms;
+ const all=read('outbox-stats.jsonl').trim().split(/\r?\n/).map(JSON.parse);
+ assert(all.length>0);assert(all.every(s=>s.enabled===(m.outbox_stats_mode==='on')));
+ stats=all.filter(s=>s.unix_ms>=start+m.warmup*1000&&s.unix_ms<start+(m.warmup+m.sample)*1000);
+ assert(stats.length>=Math.max(1,m.sample-2),'missing timed stats ticks');
+ assert(all.every(s=>!s.result?.error));
+ if(m.outbox_stats_mode==='on')assert(all.every(s=>s.result.pending>=0&&s.result.processing>=0&&s.result.dead_lettered===0));
+ else assert(all.every(s=>s.result===null));
+}
 const publicationValid=!publication||(publication.mismatches===0&&publication.redis_rows===publication.pg_rows&&publication.entries.every(e=>e.valid&&e.published&&e.redis_ids.length===1));
-const analysis={publication,status:accepted&&publicationValid?(result.full_timing?'COMPLETE_SINGLE_TIMED_ROUND':'SMOKE_ONLY'):'REJECTED_LOAD',manifest:m,result,perOperation,capacity_proven:false};
+const analysis={stats,publication,status:accepted&&publicationValid?(result.full_timing?'COMPLETE_SINGLE_TIMED_ROUND':'SMOKE_ONLY'):'REJECTED_LOAD',manifest:m,result,perOperation,capacity_proven:false};
 fs.writeFileSync(path.join(root,'analysis.json'),JSON.stringify(analysis,null,2));console.log(JSON.stringify(analysis,null,2));
 if(!accepted||!publicationValid)process.exitCode=1;

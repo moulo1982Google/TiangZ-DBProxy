@@ -211,13 +211,17 @@ async fn fixed_rate_six_operations() {
     let deploy = deployment(&dir, &endpoint, &["A"]);
     let baseline = std::env::var("MIX_BASELINE").unwrap_or_else(|_| "B2".into());
     assert!(baseline == "B1" || baseline == "B2");
-    let mut server = if baseline == "B1" {
+    let stats_mode = std::env::var("MIX_OUTBOX_STATS").unwrap_or_else(|_| "none".into());
+    assert!(["none", "off", "on"].contains(&stats_mode.as_str()));
+    assert!(stats_mode == "none" || (baseline == "B2" && repair_mode == "none"));
+    let mut server = if baseline == "B1" || stats_mode != "none" {
         let binary = std::env::var("DBPROXY_ACCEPTANCE_HOST_BINARY")
             .expect("B1 requires the explicitly built test host");
         Server(
             Command::new(binary)
                 .arg("--tenants")
                 .arg(&deploy)
+                .env("MIX_OUTBOX_STATS_LOG", dir.join("outbox-stats.jsonl"))
                 .env("FAULT_PG_A", &url)
                 .env("FAULT_AUTH_A", TOKEN_A)
                 .env("FAULT_REDIS_A", &env.redis[0])
@@ -260,7 +264,11 @@ async fn fixed_rate_six_operations() {
     let mut ledger = std::fs::File::create(dir.join("requests.jsonl")).unwrap();
     append(
         &mut ledger,
-        &json!({"kind":"manifest","outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
+        &json!({"kind":"manifest","outbox_stats_mode":stats_mode,"outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
+    );
+    append(
+        &mut ledger,
+        &json!({"kind":"measurement_start","unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()}),
     );
     let start = tokio::time::Instant::now();
     if let Some(trigger) = repair_start {
@@ -470,6 +478,19 @@ async fn fixed_rate_six_operations() {
     .unwrap();
     println!("MIXED_PACED_RESULT {result}");
     assert_eq!(completed.len() as u64 + not_sent, total);
+    if stats_mode != "none" {
+        let rows = std::fs::read_to_string(dir.join("outbox-stats.jsonl")).unwrap();
+        let observations: Vec<Value> = rows
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert!(!observations.is_empty());
+        assert!(
+            observations
+                .iter()
+                .all(|v| v["result"].get("error").is_none())
+        );
+    }
     if !publication.is_null() {
         assert_eq!(publication["mismatches"], 0);
     }

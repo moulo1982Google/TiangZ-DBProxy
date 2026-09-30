@@ -54,5 +54,16 @@ pub async fn verify(pg: &tokio_postgres::Client, redis_url: &str, run: &str) -> 
         entries.push(json!({"event_id":id,"published":row.get::<_,bool>(5),"redis_ids":matches.iter().map(|m| &m.id).collect::<Vec<_>>(),"valid":valid}));
     }
     mismatches += u64::from(messages.ids.len() != rows.len());
-    json!({"stream":stream,"pg_rows":rows.len(),"redis_rows":messages.ids.len(),"mismatches":mismatches,"drain_samples":pending_samples,"entries":entries,"scope":"default publisher and worker; distinct partition keys, no global order guarantee"})
+    let ordered = matches!(
+        std::env::var("MIX_OUTBOX_STATS").as_deref(),
+        Ok("off" | "on")
+    );
+    let pg_order: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    let redis_order: Vec<Option<String>> = messages.ids.iter().map(|m| m.get("event_id")).collect();
+    if ordered {
+        mismatches +=
+            u64::from(pg_order.iter().cloned().map(Some).collect::<Vec<_>>() != redis_order);
+    }
+    let raw_messages: Vec<Value> = messages.ids.iter().map(|m| json!({"id":m.id,"event_id":m.get::<String>("event_id"),"operation_id":m.get::<String>("operation_id"),"partition_key":m.get::<String>("partition_key"),"payload":m.get::<Vec<u8>>("payload"),"occurred_at_unix_ms":m.get::<i64>("occurred_at_unix_ms")})).collect();
+    json!({"ordered":ordered,"pg_order":pg_order,"redis_order":redis_order,"messages":raw_messages,"stream":stream,"pg_rows":rows.len(),"redis_rows":messages.ids.len(),"mismatches":mismatches,"drain_samples":pending_samples,"entries":entries,"scope":"default publisher and worker; order checked only for explicit same-key experiment"})
 }

@@ -19,6 +19,18 @@ use tracing_subscriber::EnvFilter;
 // Shared by production (always true) and the opt-in acceptance example.
 // This is not a production command-line or configuration switch.
 pub fn main(receipt_cleanup: bool) -> Result<(), Box<dyn Error>> {
+    main_with_acceptance_worker(receipt_cleanup, None)
+}
+
+pub type AcceptanceWorker = fn(
+    Arc<StorageBackend>,
+    watch::Receiver<bool>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+pub fn main_with_acceptance_worker(
+    receipt_cleanup: bool,
+    acceptance_worker: Option<AcceptanceWorker>,
+) -> Result<(), Box<dyn Error>> {
     let args = env::args().collect::<Vec<_>>();
     if args.get(1).is_some_and(|a| a == "--check-config") {
         if args.len() != 3 {
@@ -67,6 +79,7 @@ pub fn main(receipt_cleanup: bool) -> Result<(), Box<dyn Error>> {
                 tenants,
                 Some((deployment.listen_addr, deployment.max_connections)),
                 receipt_cleanup,
+                acceptance_worker,
             )
             .await
         });
@@ -81,7 +94,7 @@ pub fn main(receipt_cleanup: bool) -> Result<(), Box<dyn Error>> {
         .worker_threads(config.runtime_worker_threads)
         .enable_all()
         .build()?;
-    runtime.block_on(run(config, receipt_cleanup))
+    runtime.block_on(run(config, receipt_cleanup, acceptance_worker))
 }
 
 type BackendPair = (Arc<dyn DbProxyBackend>, Option<Arc<StorageBackend>>);
@@ -92,12 +105,17 @@ type TenantRuntime = (
     Option<Arc<StorageBackend>>,
 );
 
-async fn run(config: ResolvedDbProxyConfig, receipt_cleanup: bool) -> Result<(), Box<dyn Error>> {
+async fn run(
+    config: ResolvedDbProxyConfig,
+    receipt_cleanup: bool,
+    acceptance_worker: Option<AcceptanceWorker>,
+) -> Result<(), Box<dyn Error>> {
     let (backend, durable) = prepare_backend(&config).await?;
     run_servers(
         vec![(None, config, backend, durable)],
         None,
         receipt_cleanup,
+        acceptance_worker,
     )
     .await
 }
@@ -197,6 +215,7 @@ async fn run_servers(
     tenants: Vec<TenantRuntime>,
     shared: Option<(std::net::SocketAddr, usize)>,
     receipt_cleanup: bool,
+    acceptance_worker: Option<AcceptanceWorker>,
 ) -> Result<(), Box<dyn Error>> {
     let config = &tenants[0].1;
     let grace = config.shutdown_grace;
@@ -282,6 +301,9 @@ async fn run_servers(
         // Every worker of this tenant logs inside its span (none for a single-tenant process).
         let span = tenant_span(id.as_deref());
         if let Some(backend) = durable_backend {
+            if let Some(worker) = acceptance_worker {
+                workers.spawn(worker(Arc::clone(&backend), shutdown_rx.clone()));
+            }
             if receipt_cleanup {
                 workers.spawn(
                     tiangz_dbproxy_server::run_receipt_cleanup_worker(

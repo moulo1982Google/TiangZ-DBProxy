@@ -93,7 +93,14 @@ fn effects(w: &SnapshotWrite) -> CommitEffects {
             } else {
                 "accept-mixed".into()
             },
-            partition_key: w.record.key.clone(),
+            partition_key: if matches!(
+                std::env::var("MIX_OUTBOX_STATS").as_deref(),
+                Ok("off" | "on")
+            ) {
+                "ordered".into()
+            } else {
+                w.record.key.clone()
+            },
             payload: w.payload.clone(),
             occurred_at_unix_ms: 1,
         }],

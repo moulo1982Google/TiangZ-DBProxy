@@ -70,3 +70,13 @@ UTC 14:24:25（北京时间 22:24:25）结束，容器退出 0、OOM=false。三
 新库oaud_0930a三轮2秒预热/5秒采样，共420业务请求、1497业务快照、21条真实发布，三次1 passed、UTC02:53:22容器exit0/OOMfalse。每轮7条Redis消息与7条PG已确认效果一致、零业务错误漏发差异；原始证据已拉回target/server_20260929/fault_process_oaud_0930a_r{0,1,2}及同级oaud_0930a.*，分析全部SMOKE_ONLY。缓存修复未开启。独立副本篡改核对结果的负例被分析器REJECTED_LOAD，历史P06证据兼容分析通过。cargo check、定向Clippy -D warnings、fmt、node语法及bash语法通过。没有改生产协议或生成代码。
 
 这一步是应用发布可核查基础，不是正式P07成本通过。下一步仍需明确统计/领取并行对照的变量、队列连续趋势、同键顺序和有界输入；现有生产5秒统计不能误称关闭。不得将另开数据库连接的统计成本冒充同一维护连接的竞争。
+
+## 应用统计竞争对照工具
+
+测试宿主acceptance_outbox复用server_process完整启动逻辑、清理及所有正式后台。生产入口继续传入None，不读取验收统计开关；仅测试例子传入一个附加worker，在同一StorageBackend上调用outbox_stats，竞争生产领取使用的维护连接。两组均保留原约5秒存储指标轮询：off表示无附加统计，on表示额外1次/秒，不能称全部统计关闭/开启。两组同样每秒写一条探针日志，on保存实际统计耗时、pending/processing/dead_lettered和失败；off记录null，不把缺失队列值当零。对照仅一个默认publisher/worker，不覆盖多worker。
+
+业务保持20请求/秒、并发8、四SDK连接、六类比例不变，每秒一条业务Outbox消息；统一同topic同partition_key=ordered，最大420条/轮。无额外生成器，不会在业务guard停止后继续注入。Redis消息完整字段原始数组与流ID保存于outbox-publication.json，对照PG enqueue_order逐条核对同键发布顺序及确认，不允许漏发/重复或内容差异。outbox-stats.jsonl保存连续观察，requests.jsonl的measurement_start用于筛选300秒正式区间，分析器核对采样覆盖和统计调用无错误。
+
+run_outbox_pairs.sh按off→on、on→off、off→on串行六个新库，MIX_SUITE=outbox入口；analyze_outbox_pairs.mjs核对完整顺序和业务账本、消息内容/顺序、统计样本，再汇总六类P99三轮中位及绝对/百分比差。默认120秒预热300秒采样。矩阵完整仅代表测量完成，超过20%参考线必须保留分析，不自动判性能通过。
+
+组织短测opairs_0930a已完成：UTC2026-09-30 03:10:35 exit0/OOMfalse，六次1 passed及OUTBOX_PAIRS_COMPLETED。每轮2/5秒、140业务请求、499快照、7个同键Outbox，共840请求/42消息，全部Redis内容/PG确认/顺序核对一致；每轮正式短区间5条探针日志，on观测pending峰0，off值缺失按null处理。原始六目录与资源镜像容器/源码摘要已拉回target/server_20260929，analyze_outbox_pairs.mjs=SMOKE_ONLY。篡改Redis顺序和清空统计记录的副本均被分析器拒绝；历史发布核对回归通过。Rust定向Clippy -D warnings/格式、Node/bash语法和diff检查通过。生产协议与生成代码未变；测试例子之外不启用附加worker。

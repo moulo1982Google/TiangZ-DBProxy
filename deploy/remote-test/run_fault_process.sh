@@ -35,6 +35,11 @@ if [[ ${MIX_BASELINE:-B2} == B1 ]]; then
     export DBPROXY_ACCEPTANCE_HOST_BINARY="$SRC/target/release/examples/acceptance_baseline"
     json_sha256 "$DBPROXY_ACCEPTANCE_HOST_BINARY" >"$OUT/host-binary.json"
 fi
+if [[ ${MIX_OUTBOX_STATS:-none} != none ]]; then
+    cargo build --release --locked -p tiangz-dbproxy-server --example acceptance_outbox >"$OUT/outbox-host-build.log" 2>&1
+    export DBPROXY_ACCEPTANCE_HOST_BINARY="$SRC/target/release/examples/acceptance_outbox"
+    json_sha256 "$DBPROXY_ACCEPTANCE_HOST_BINARY" >"$OUT/host-binary.json"
+fi
 status=0
 TESTS=${FAULT_TESTS:-f09_postgres_connection_limit_fails_clearly_and_recovers f15_tenant_a_postgres_fault_leaves_tenant_b_serving f04_kill_server_during_cleanup_keeps_invariants}
 for test in $TESTS; do
