@@ -61,3 +61,25 @@ for(const mode of ['none','all-blocked']) {
   ]){const x=structuredClone(empty);mutate(x);assert.throws(()=>analyze(encode(x)));}
 }
 console.log('empty fixtures: two valid modes + 12 rejected mutations');
+for(const mode of ['leased','backoff']) {
+  const boundary=phase=>[
+    {kind:'distribution',phase,total:1000,future_leased:mode==='leased'?900:0,dead:0,future_available:mode==='backoff'?900:0,owned:0},
+    ...['parallel-a','parallel-b'].map(publisher=>({kind:'reserve',phase,publisher,blocked:450,ready_pending:phase==='before'?50:36,blocked_published:0}))
+  ];
+  const mixed=[{kind:'fixture',schema:3,mode,rows:1000,claim_calls:28},...boundary('before')];
+  for(const r of structuredClone(rows)) {
+    if(r.kind==='lease')r.event=r.event.replace(/\d+$/,n=>String(Number(n)+450));
+    if(r.kind==='final'){const n=Number(r.event.match(/\d+$/)[0]);r.published=n>=450&&n<464;}
+    if(r.kind==='result')mixed.push(...boundary('after'));
+    mixed.push(r);
+  }
+  assert.equal(analyze(encode(mixed)).returned,28);
+  for(const mutate of [
+    x=>x.find(v=>v.kind==='reserve').ready_pending=0,
+    x=>x.find(v=>v.kind==='reserve'&&v.phase==='after').blocked_published=1,
+    x=>x.find(v=>v.kind==='distribution').future_available=1,
+    x=>x.find(v=>v.kind==='lease').event='parallel-a-0',
+    x=>x.splice(x.findIndex(v=>v.kind==='reserve'),1),
+  ]) { const x=structuredClone(mixed);mutate(x);assert.throws(()=>analyze(encode(x))); }
+}
+console.log('mixed fixtures: two valid modes + 10 rejected mutations');

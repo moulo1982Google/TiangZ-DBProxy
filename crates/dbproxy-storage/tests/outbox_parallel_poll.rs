@@ -185,7 +185,10 @@ async fn two_workers_fixed_budget() {
     let sample = 5_u64;
     let waves = (warmup + sample) * 2;
     let mode = std::env::var("P07_PARALLEL_MODE").unwrap_or_else(|_| "ready".into());
-    assert!(matches!(mode.as_str(), "ready" | "none" | "all-blocked"));
+    assert!(matches!(
+        mode.as_str(),
+        "ready" | "none" | "all-blocked" | "leased" | "backoff"
+    ));
     let store = PostgresSnapshotStore::connect(&url).await.unwrap();
     let setup = store.outbox_queue();
     let (sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
@@ -216,7 +219,18 @@ async fn two_workers_fixed_budget() {
         // Two FIFO partitions per publisher; names deliberately shared across publishers.
         sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms) SELECT $1::text||'-'||n,'parallel',$2,'key-'||(n%2),'',0 FROM generate_series(0,499) n ORDER BY n", &[&publisher, &route.key()]).await.unwrap();
     }
+    let mixed = matches!(mode.as_str(), "leased" | "backoff");
+    if mixed {
+        // Keep the last 50 rows per publisher on independent FIFO partitions.
+        sql.execute("UPDATE dbproxy_outbox SET partition_key='blocked-'||partition_key WHERE split_part(event_id,'-',3)::integer<450", &[]).await.unwrap();
+    }
     match mode.as_str() {
+        "leased" => {
+            sql.execute("UPDATE dbproxy_outbox SET lease_until=clock_timestamp()+interval '1 day' WHERE partition_key LIKE 'blocked-%'", &[]).await.unwrap();
+        }
+        "backoff" => {
+            sql.execute("UPDATE dbproxy_outbox SET available_at=clock_timestamp()+interval '1 day' WHERE partition_key LIKE 'blocked-%'", &[]).await.unwrap();
+        }
         "none" => {
             sql.execute(
                 "UPDATE dbproxy_outbox SET lease_until=clock_timestamp()+interval '1 day'",
@@ -230,7 +244,7 @@ async fn two_workers_fixed_budget() {
         }
         _ => {}
     }
-    journal.record(json!({"kind":"fixture","schema":2,"mode":mode,"rows":1000,"claim_calls":28}));
+    journal.record(json!({"kind":"fixture","schema":if mixed {3} else {2},"mode":mode,"rows":1000,"claim_calls":28}));
     distribution(&sql, &journal, &mode, "before").await;
     sql.batch_execute("ANALYZE dbproxy_outbox").await.unwrap();
     let first = PostgresSnapshotStore::connect_existing(&url)
@@ -243,7 +257,11 @@ async fn two_workers_fixed_budget() {
         .outbox_queue();
     let start = Instant::now();
     let mut seen = HashSet::new();
-    let mut next = [[0_u64, 1_u64]; 2];
+    let mut next = if mixed {
+        [[450_u64, 451_u64]; 2]
+    } else {
+        [[0_u64, 1_u64]; 2]
+    };
     let mut overlaps = 0;
     let mut guard = WaveGuard::default();
     for wave in 0..waves {
@@ -274,7 +292,7 @@ async fn two_workers_fixed_budget() {
                 second.claim_for_publisher("parallel-worker-1", 30_000, Some(publisher))
             )
         );
-        if mode != "ready" {
+        if matches!(mode.as_str(), "none" | "all-blocked") {
             assert!(a.expect("claim outcome unknown").is_none());
             assert!(b.expect("claim outcome unknown").is_none());
             for worker in [0, 1] {
@@ -379,9 +397,28 @@ async fn distribution(sql: &tokio_postgres::Client, journal: &Journal, mode: &st
     let row = sql.query_one("SELECT count(*), count(*) FILTER(WHERE lease_until>statement_timestamp()), count(*) FILTER(WHERE dead_lettered_at IS NOT NULL), count(*) FILTER(WHERE available_at>statement_timestamp()), count(*) FILTER(WHERE lease_owner IS NOT NULL) FROM dbproxy_outbox", &[]).await.unwrap();
     let counts: Vec<i64> = (0..5).map(|i| row.get(i)).collect();
     assert_eq!(counts[0], 1000);
-    assert_eq!(counts[1], if mode == "none" { 1000 } else { 0 });
+    assert_eq!(
+        counts[1],
+        match mode {
+            "none" => 1000,
+            "leased" => 900,
+            _ => 0,
+        }
+    );
     assert_eq!(counts[2], if mode == "all-blocked" { 4 } else { 0 });
-    assert_eq!(counts[3], 0);
+    assert_eq!(counts[3], if mode == "backoff" { 900 } else { 0 });
     assert_eq!(counts[4], 0);
     journal.record(json!({"kind":"distribution","phase":phase,"total":counts[0],"future_leased":counts[1],"dead":counts[2],"future_available":counts[3],"owned":counts[4]}));
+    if matches!(mode, "leased" | "backoff") {
+        for publisher in ["parallel-a", "parallel-b"] {
+            let row = sql.query_one("SELECT count(*) FILTER(WHERE partition_key LIKE 'blocked-%'), count(*) FILTER(WHERE partition_key NOT LIKE 'blocked-%' AND published_at IS NULL), count(*) FILTER(WHERE partition_key LIKE 'blocked-%' AND published_at IS NOT NULL) FROM dbproxy_outbox WHERE event_id LIKE $1", &[&format!("{publisher}-%")]).await.unwrap();
+            let blocked: i64 = row.get(0);
+            let ready_pending: i64 = row.get(1);
+            let blocked_published: i64 = row.get(2);
+            assert_eq!(blocked, 450);
+            assert_eq!(ready_pending, if phase == "before" { 50 } else { 36 });
+            assert_eq!(blocked_published, 0);
+            journal.record(json!({"kind":"reserve","phase":phase,"publisher":publisher,"blocked":blocked,"ready_pending":ready_pending,"blocked_published":blocked_published}));
+        }
+    }
 }

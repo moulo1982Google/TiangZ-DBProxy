@@ -13,13 +13,17 @@ export function analyze(raw) {
   const claims = [];
   const versioned = rows[0]?.kind === 'fixture';
   let mode = 'ready';
+  let mixed = false;
   function distribution(phase) {
-    assert.deepEqual(take('distribution'), {kind:'distribution',phase,total:1000,future_leased:mode==='none'?1000:0,dead:mode==='all-blocked'?4:0,future_available:0,owned:0});
+    assert.deepEqual(take('distribution'), {kind:'distribution',phase,total:1000,future_leased:mode==='none'?1000:mode==='leased'?900:0,dead:mode==='all-blocked'?4:0,future_available:mode==='backoff'?900:0,owned:0});
+    if(mixed) for(const publisher of ['parallel-a','parallel-b']) assert.deepEqual(take('reserve'),{kind:'reserve',phase,publisher,blocked:450,ready_pending:phase==='before'?50:36,blocked_published:0});
   }
   if(versioned) {
     const f=take('fixture'); mode=f.mode;
-    assert(['ready','none','all-blocked'].includes(mode));
-    assert.equal(f.schema,2);assert.equal(f.rows,1000);assert.equal(f.claim_calls,28);
+    assert(['ready','none','all-blocked','leased','backoff'].includes(mode));
+    mixed=['leased','backoff'].includes(mode);
+    if(mixed) for(const n of next) {n[0]=450;n[1]=451;}
+    assert.equal(f.schema,mixed?3:2);assert.equal(f.rows,1000);assert.equal(f.claim_calls,28);
     distribution('before');
   }
   for (let wave = 0; wave < 14; wave++) {
@@ -51,7 +55,7 @@ export function analyze(raw) {
     }
     const c = operations('claim');
     let a = c;
-    if(mode==='ready') {
+    if(mode==='ready'||mixed) {
     const keys = new Set();
     for (let worker = 0; worker < 2; worker++) {
       const l = take('lease'); assert.equal(l.wave, wave); assert.equal(l.worker, worker);
@@ -85,7 +89,7 @@ export function analyze(raw) {
   const result = take('result');
   assert.equal(result.status, 'SMOKE_ONLY'); assert.equal(result.waves,14);
   assert.equal(result.workers,2); assert.equal(result.publishers,2); assert.equal(result.rows,1000);
-  assert.equal(result.claims,mode==='ready'?28:0); assert.equal(result.stats,false);
+  assert.equal(result.claims,mode==='ready'||mixed?28:0); assert.equal(result.stats,false);
   assert.equal(result.warmup_seconds,2); assert.equal(result.sample_seconds,5);
   assert(overlaps > 0); assert.equal(result.overlap_waves,overlaps); assert.equal(cursor,rows.length);
   return {status:'SMOKE_ONLY', validation:'PARALLEL_CLAIMS_CHECKED', mode, waves:14, claim_calls:28, returned:seen.size, formal_claim_calls:20, overlap_waves:overlaps, claims_timing:claims};
