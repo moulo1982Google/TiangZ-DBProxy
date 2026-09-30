@@ -360,3 +360,15 @@ UTC2026-09-30 12:30:37至13:16:24，exit0/OOMfalse，六次1 passed及OUTBOX_PAI
 seals_0930a六轮新库2/5秒UTC2026-09-30 13:42:28至13:44:40，exit0/OOMfalse，六次1 passed及OUTBOX_PAIRS_COMPLETED。840请求42真实同键消息零错误/未发送/核对差异，guardnull。六份封存确认存在，stats/stage字节数与进程退出后完整原始一致；42条trace/output/response对应，六轮STAGE_INTERVALS_CHECKED/SDK_CALLBACKS_CHECKED/TRANSACTION_TRACES_CHECKED，SMOKE_ONLY。全部原始已拉回。只验证工具协议，不作为性能结论，不修复或覆盖rspf旧证据失败。
 
 rspf事件观察器到期后再次拉回，仍只有自身start/die、stderr空，非容器宿主负载未排除。当前只有5基础服务，无新正式验收。此次没有业务计时新观测，故不自动重跑45分钟矩阵；下一步推进剩余P06工具前置：让修复注入随业务guard停止，并明确已注入/未注入核对语义，先本地验证，不因此授权高压故障或升压。性能诊断仍有跨端未覆盖路径，不能归纯网络；多publisher并发worker和容量缺口继续保留。
+
+## P07并发worker补测边界核对（2026-10-01北京时间）
+
+已核对outbox_poll_costs.rs、outbox_hybrid_plans.rs、outbox_concurrency.rs与run_p07.sh。当前poll工具只有一个领取循环和一个worker名称；两个publisher仅按槽位交替筛选。outbox_queue及其clone共享Arc包裹的同一PG连接互斥锁，直接spawn两个clone不能证明独立PG领取并发。现有8路前缀正确性测试使用各自connect_existing及Barrier，可复用连接建立方式，但该测试没有120/300持续成本记录。九分布诊断是在单事务内执行旧/新SQL并回滚，每个分布只有一次返回验证，不能直接复用为多worker吞吐或公平性结果。run_p07.sh还会无条件重跑已有十万行诊断，新的有界短测不得直接套该入口。
+
+下一步工具明确为独立验收test及独立入口，不修改生产SQL：先两worker各自connect_existing、两个publisher，每500ms一个两任务同步起点，总领取预算仍4次/s；每波两任务筛选同一个publisher，publisher逐波轮换，覆盖同publisher竞争。至少两个可领取partition供每波竞争；同字符串partition跨publisher保留以验证路由隔离。每波需两个claim都返回后再确认，确认结束后才下波，记录实际调用区间而非仅记录spawn/barrier时间；若实际区间未重叠，不能声称本轮验证了重叠领取。不能把每worker各4次/s偷偷翻倍为8次/s。
+
+账本需记录wave/worker/publisher、scheduled/dispatch/claim_begin/claim_end/ack_begin/ack_end、event_id/partition/lease_token及成功/空/未知结果。领取与确认分别5秒有界，超时保留started未知，不重试或当未领取；调度落后和未完成项触发停止后不再发新波，已发项保留。不以全局ready-n返回序列作并发断言：核对唯一event_id、同partition前驱已确认、publisher/destination归属、lease token及最终PG published状态；不要求两个worker平均分配消息冒充公平性证明。
+
+阶段顺序：先新库、小数据（1000级）、2/5秒无stats验证基础并发/有界停止/账本，分析器正负例通过后再扩展九分布。九分布须每场景新库独立保留，ready/dense-ready应保留足够连续样本，backoff/leased/head-blocked应有按publisher分隔的独立可领取组，none/all-blocked必须持续空领取且确认数0。不要从单次100001行探针推断持续分布不变：正式窗口应保存各类队列计数、耗尽/分布漂移则拒绝。统计对照后续再加，明确统计共享哪一worker连接，不能隐式变更为独立连接。此次只是代码路径核对和具体工具设计，尚未实现/实测，不标多worker性能或全分布完成。
+
+rhdf_0930a事件观察器到期后已重拉完整文件：仍仅该工作台start/die两条，stderr空；非容器活动仍不排除。当前实际只有5基础服务，没有新增验收负载，原资源与不升压限制不变。
