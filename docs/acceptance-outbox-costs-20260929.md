@@ -202,3 +202,13 @@ UTC2026-09-30 08:03:17至08:48:26正常退出0/OOMfalse，六次1 passed及OUTBO
 连续Docker事件订阅捕获本容器start与die，错误流为空；截至UTC08:55检查，本容器起止窗口没有其他容器start/die。起止仅基础服务，不能由此排除宿主非容器活动。监听仍按原09:08:17自动截止，不影响后续负载。264条资源中PG峰2.875GiB，主机可用最低39.47GiB，max/oom增量0，pgscan/pgsteal各53889，内存full PSI区间峰0.006495%；存在回收，不声称零压力或解除历史升压边界。
 
 下一步针对单事务handler内部与SDK/RPC等待作代码路径归因和必要的定向观测，不盲目重复同一低速矩阵；尚未证明瓶颈，不先改生产行为。多publisher全分布/并发worker、P06高积压和真正容量仍未完成。
+
+## 调用边界与批量重叠复查
+
+本地新增tools/analyze_mixed_overlap.mjs，仅分析既有账本，不改服务和负载。以intent.scheduled_us+dispatch_us为调用起点，加rpc_us为结束，区间端点相接不算重叠；时间包含发起任务调度、SDK、网络、服务和返回，不是SQL执行区间。校验唯一意图/响应、成功状态、完整请求数和非负时间，拒绝提前停止/未发送。边界相接、重复响应和负耗时负例检查通过。每轮派生overlap-analysis.json保留全部300个正式单事务及重叠批次编号。
+
+stgf六轮按r0 off/on、r1 off/on、r2 off/on，单事务与批量调用重叠数分别290/292、299/293、298/293（每轮300条）；全部单事务RPC P99分别14.412/24.625、25.802/16.317、19.104/14.633ms。几乎全部重叠，非重叠仅1–10条，不能以这小组P99推导独立对照或批量阻塞因果。首轮on也有未重叠但22.824ms的调用，重叠本身并不足以解释所有尾部。
+
+代码边界核验：mixed_workload固定n%20的16/17为批量、18为单事务，20/s时相隔100/50ms；四SDK连接按n%4映射，当前单事务与这两个批次分属不同连接。client::exchange在write_message之后drop(attempt)，不在响应等待期间持writer锁；但仍可能等待槽位/写锁。已有ClientObserver::request_attempt_timed能够分别观测queue_wait/exchange，当前混合驱动尚未接入，不猜测其等待为零。服务handler从dispatch_isolated之前到返回之后，早于responses.send，因此不包含响应队列/网络发送。TieredSnapshotStore::apply先PG事务再synchronize_committed_cache；PG operation计时从request_client锁获取之后开始，含ensure_connected、SQL及commit，跨操作汇总，无法以均值差直接分配单事务时间。
+
+后续应复用SDK现有observer补验收调用分阶段观测，并对事务PG/提交后缓存的边界作必要区分。新观测器回调不得阻塞，不把RecordKey/幂等ID作为指标标签，记录开销两组一致；须先新库短测、账本匹配校验，再决定正式诊断，不能把本次离线复查称实测SDK排队或根因已确定。
