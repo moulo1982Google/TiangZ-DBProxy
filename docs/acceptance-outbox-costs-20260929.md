@@ -512,3 +512,22 @@ parallel_environment.mjs要求完整LF/五条记录/30秒内采集、真实资�
 真实p7env_1940a.boundary.jsonl已拉回并严格验证：UTC19:43:43.401→19:43:43.425，基础服务仍04:26:36同次启动，PG 4CPU/8GiB（swap总8GiB）cpuset14-17,42-45，Redis/cache各2GiB（既有swap总4GiB、NanoCpus0）cpuset18,46 /19,47；PG/Redis/cache实际bind仍/data，DockerRootDir仍/sas/docker。此处记录Redis既有限额，不作升限额。实际docker ps仅5基础服务，无cargo/rustc/本验收进程；即时docker stats PG工作集2.409GiB、host available44147MiB，/data余1.8T、/sas余5.7T。工作集不是原始cgroup峰值；这些瞬时余量不能解除既往8GiB/回收停止升压边界，不排除宿主其他活动。
 
 下一步可在实际核实空闲并校验上传SHA后，使用原1000行2/5秒范围收集必要的同版本互补相位off/on四轮新证据，验证新增启动前后环境采集和完整配对入口；这是证据协议端到端验证，非重复旧单轮性能或正式九分布。仍不得直接33600行120/300，不改现有速率或限额。正式资源规模许可和分布漂移口径仍未解决；真实DB超时、P06高积压/P09容量继续保留。
+
+## P07 同版本互补相位完整证据协议短测（38a66a9工具）
+
+实际核实5基础服务、无其他编译/验收后，上传launcher与capture脚本并校验SHA256一致：af8e95ce39de79a253dc6f8f8005562d4b189be5e36506ca793f3c6012c8ebfc / bc287f014897c672a6096ca744b067a501e9a65aa3127fb829e39cbd6acfaf87；Rust主test仍eb40c77e89b6d5690dd25b6554947120c70a336846e9e60a103649b0f17a06cf。运行期间未修改挂载源码。四个leased-heads新库串行，保持1000行、2/5秒、两worker总4claim/s，phase0按off/on、phase1按on/off执行：
+
+| RunId | UTC开始→结束 | 结果 |
+|---|---|---|
+| p7pair0off_0930a | 19:56:26.496→19:56:42.557 | exit0/OOMfalse |
+| p7pair0on_0930a | 19:56:53.516→19:57:09.364 | exit0/OOMfalse |
+| p7pair1on_0930a | 19:57:21.655→19:57:37.541 | exit0/OOMfalse |
+| p7pair1off_0930a | 19:57:51.461→19:58:07.600 | exit0/OOMfalse |
+
+每轮1 passed/完成标记，28唯一claim/ack、14波实际重叠、20短采样、1000最终PG逐项一致，受阻发布0、每publisher可领50→36；off各7跳过槽、on各7成功stats。四轮完整原始目录、11文件源码指纹、镜像/容器/资源/前后环境及日志均已拉回。新汇总入口直接验证封存原文件和全部证据，输出COMPLEMENTARY_PHASE_PAIRS_CHECKED / SMOKE_PAIRED_LEDGER_ONLY，2对互补相位，formal_performance_complete=false。manifest和完整分组报告位于target/server_20260929/p7pair_0930a.manifest.json及其.analysis.json。不是正式九分布矩阵。
+
+实际新环境采集及配对入口端到端通过：基础服务ID/镜像/启动时间/限额/挂载一致，前后时间包围四轮，工作台只读源码挂载及资源均符合。小样本每worker/publisher采样仅5个claim，不作性能通过结论；报告原样保留phase0六项、phase1两项超过20%的分组P99变化（各含预热/采样、claim/ack/wave各类），不以合并统计抵消。协调等待stats及同步日志开销仍在测量口径内。
+
+各轮仅2资源样本/单区间，PG max/oom/oom_kill及scan/steal增量0，不排除未采样峰值、不解除停止升压边界。连续Docker事件p7pair_0930a.events首轮前240秒订阅，约20:00:26自然结束；当前已拉回8条自身start/die、stderr空，到期后补拉，不停止监听；宿主非容器活动未排除。每轮前后实际5基础服务，目前无新负载。
+
+这组必要的新证据协议短测已完成，不再重复。正式规模仍不能从数学预算直接批准；后续优先核对并准备独立新库、原5秒超时阈值的真实PG领取未知负例（只影响本RunId数据库，双方结果均留档、不重试），补本地future模拟以外的缺口；实施前验证锁作用域及有界释放，不停止共享服务、不升压。它也不能证明提交后ack超时或全流程故障有界。正式九分布、P06高积压及P09容量缺口继续保留。
