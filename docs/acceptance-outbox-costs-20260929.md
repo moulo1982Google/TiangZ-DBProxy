@@ -80,3 +80,5 @@ UTC 14:24:25（北京时间 22:24:25）结束，容器退出 0、OOM=false。三
 run_outbox_pairs.sh按off→on、on→off、off→on串行六个新库，MIX_SUITE=outbox入口；analyze_outbox_pairs.mjs核对完整顺序和业务账本、消息内容/顺序、统计样本，再汇总六类P99三轮中位及绝对/百分比差。默认120秒预热300秒采样。矩阵完整仅代表测量完成，超过20%参考线必须保留分析，不自动判性能通过。
 
 组织短测opairs_0930a已完成：UTC2026-09-30 03:10:35 exit0/OOMfalse，六次1 passed及OUTBOX_PAIRS_COMPLETED。每轮2/5秒、140业务请求、499快照、7个同键Outbox，共840请求/42消息，全部Redis内容/PG确认/顺序核对一致；每轮正式短区间5条探针日志，on观测pending峰0，off值缺失按null处理。原始六目录与资源镜像容器/源码摘要已拉回target/server_20260929，analyze_outbox_pairs.mjs=SMOKE_ONLY。篡改Redis顺序和清空统计记录的副本均被分析器拒绝；历史发布核对回归通过。Rust定向Clippy -D warnings/格式、Node/bash语法和diff检查通过。生产协议与生成代码未变；测试例子之外不启用附加worker。
+
+正式opairf_0930a已UTC2026-09-30 03:11:34启动（北京时间11:11:34），源码089682c，容器dbproxy-mixed-opairf_0930a，4CPU/16GiB、cpuset20-27,48-55核实。六轮各120/300秒，新库opairf_0930a_r{0,1,2}_{off,on}，顺序账本outbox_pairs_opairf_0930a/order.jsonl；每轮8400业务请求、420同键消息，预计UTC03:58附近完成，实际以容器状态为准。目前未形成正式结果，运行中只读且不并行服务器负载。结束拉回原始六目录、同级资源/镜像/容器/源码摘要，核对六次1 passed/OUTBOX_PAIRS_COMPLETED及exit/OOM，再运行配对和压力分析器。
