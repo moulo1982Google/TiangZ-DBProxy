@@ -204,6 +204,7 @@ async fn two_workers_fixed_budget() {
     );
     sql.batch_execute("SET statement_timeout='5s'; INSERT INTO dbproxy_operation_claims(operation_id,operation_kind) VALUES('parallel','multi')").await.unwrap();
     let publishers = ["parallel-a", "parallel-b"];
+    let mixed = matches!(mode.as_str(), "leased" | "backoff");
     for publisher in publishers {
         setup
             .register_publisher(publisher, "isolated-no-mq-test")
@@ -217,12 +218,7 @@ async fn two_workers_fixed_budget() {
         };
         setup.register_route(&route).await.unwrap();
         // Two FIFO partitions per publisher; names deliberately shared across publishers.
-        sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms) SELECT $1::text||'-'||n,'parallel',$2,'key-'||(n%2),'',0 FROM generate_series(0,499) n ORDER BY n", &[&publisher, &route.key()]).await.unwrap();
-    }
-    let mixed = matches!(mode.as_str(), "leased" | "backoff");
-    if mixed {
-        // Keep the last 50 rows per publisher on independent FIFO partitions.
-        sql.execute("UPDATE dbproxy_outbox SET partition_key='blocked-'||partition_key WHERE split_part(event_id,'-',3)::integer<450", &[]).await.unwrap();
+        sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms) SELECT $1::text||'-'||n,'parallel',$2,CASE WHEN $3 AND n<450 THEN 'blocked-key-' ELSE 'key-' END||(n%2),'',0 FROM generate_series(0,499) n ORDER BY n", &[&publisher, &route.key(), &mixed]).await.unwrap();
     }
     match mode.as_str() {
         "leased" => {
