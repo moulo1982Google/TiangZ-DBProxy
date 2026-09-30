@@ -37,6 +37,14 @@ if(m.repair_mode && m.repair_mode!=='none') {
     assert.equal(repair.untouched_mismatches,0);
     if(!repair.stopped)assert.equal(repair.admitted,repair.targets);
   }else assert.equal(repair.observations.length,repair.targets);
+  if(m.repair_journal){
+    const journal=read('repair-operations.jsonl');assert(journal.endsWith('\n'));
+    const entries=journal.trim().split(/\r?\n/).map(JSON.parse);
+    const expected=[];
+    if(m.repair_mode==='repair')for(let n=0;n<repair.admitted;n++)expected.push([n,'enqueue']);
+    for(let n=0;n<repair.targets;n++)expected.push([n,'read_authoritative'],[n,'read_cache']);
+    assert.deepEqual(entries,expected.flatMap(([n,phase])=>[{n,phase,outcome:'started'},{n,phase,outcome:'completed'}]),'repair journal missing/unknown/reordered operation');
+  }
   repair.observations.forEach((r,i)=>{assert.equal(r.n,i);assert(r.pending>=0);});
 }
 assert.equal(m.cleanup,baseline==='B1'?'test-host-disabled':'production-enabled');

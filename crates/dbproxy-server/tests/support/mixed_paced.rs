@@ -187,6 +187,16 @@ async fn fixed_rate_six_operations() {
             && (1..=64).contains(&concurrency)
     );
     let total = (warm + sample) * rate;
+    let guard_delay_at = std::env::var("MIX_GUARD_DELAY_AT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.parse::<u64>().unwrap());
+    if let Some(n) = guard_delay_at {
+        assert!(
+            n < total && warm == 2 && sample == 5 && rate == 20 && concurrency == 8,
+            "guard delay is short-test only"
+        );
+    }
     assert_eq!(total % 20, 0, "complete mix cycles required");
     let env = env();
     let db = format!("{}_pace", env.run_id);
@@ -276,6 +286,7 @@ async fn fixed_rate_six_operations() {
         &env.cache[0],
         &env.run_id,
         warm + sample,
+        &dir,
         &repair_mode,
         repair_stop_rx,
     )
@@ -283,7 +294,7 @@ async fn fixed_rate_six_operations() {
     let mut ledger = std::fs::File::create(dir.join("requests.jsonl")).unwrap();
     append(
         &mut ledger,
-        &json!({"kind":"manifest","probe_seal":stats_mode!="none","tx_audit":tx_audit,"sdk_audit":sdk_audit,"stage_audit":stage_audit,"outbox_stats_mode":stats_mode,"outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
+        &json!({"kind":"manifest","guard_delay_at":guard_delay_at,"repair_journal":repair_mode!="none","probe_seal":stats_mode!="none","tx_audit":tx_audit,"sdk_audit":sdk_audit,"stage_audit":stage_audit,"outbox_stats_mode":stats_mode,"outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
     );
     append(
         &mut ledger,
@@ -306,6 +317,9 @@ async fn fixed_rate_six_operations() {
     for n in 0..total {
         let scheduled = start + Duration::from_secs_f64(n as f64 / rate as f64);
         tokio::time::sleep_until(scheduled).await;
+        if guard_delay_at == Some(n) {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
         while let Some(row) = tasks.try_join_next() {
             let row = row.unwrap();
             pending.remove(&row["n"].as_u64().unwrap());

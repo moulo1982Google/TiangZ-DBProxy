@@ -8,6 +8,7 @@ pub(super) async fn prepare(
     cache_url: &str,
     run: &str,
     seconds: u64,
+    evidence: &std::path::Path,
     mode: &str,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> (
@@ -58,6 +59,12 @@ pub(super) async fn prepare(
         initial_cache.push(cache.get(&w.record).await.unwrap());
         records.push(w.record);
     }
+    let journal_path = evidence.join("repair-operations.jsonl");
+    let mut journal = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(journal_path)
+        .unwrap();
     let mode = mode.to_string();
     let pg = sql(url).await;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -74,7 +81,14 @@ pub(super) async fn prepare(
             // Admission precedes any await: a stop lets this one admitted item finish.
             let sent = Instant::now();
             if mode == "repair" {
-                queue.enqueue(record, Revision(2)).await.unwrap();
+                recorded(
+                    &mut journal,
+                    n,
+                    "enqueue",
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    queue.enqueue(record, Revision(2)),
+                )
+                .await;
             }
             let pending: i64 = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -110,9 +124,25 @@ pub(super) async fn prepare(
         let mut mismatches = 0;
         let admitted = observations.len();
         let mut untouched_mismatches = 0;
+        let reconcile_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         for (n, record) in records.iter().enumerate() {
-            let authoritative = store.load(record).await.unwrap().unwrap();
-            let actual = cache.get(record).await.unwrap();
+            let authoritative = recorded(
+                &mut journal,
+                n,
+                "read_authoritative",
+                reconcile_deadline,
+                store.load(record),
+            )
+            .await
+            .unwrap();
+            let actual = recorded(
+                &mut journal,
+                n,
+                "read_cache",
+                reconcile_deadline,
+                cache.get(record),
+            )
+            .await;
             if n < admitted || mode == "control" {
                 mismatches += u64::from(actual.as_ref() != Some(&authoritative));
             } else {
@@ -159,4 +189,68 @@ async fn repair_admission_stops_before_due_and_never_resumes() {
             .unwrap()
             .unwrap()
     );
+}
+
+// Persist intent before polling a possibly committing operation. Timeouts are unknown,
+// never proof of no commit. A missing terminal record after process loss is unknown too.
+async fn recorded<T, E: std::fmt::Debug>(
+    journal: &mut std::fs::File,
+    n: usize,
+    phase: &str,
+    deadline: tokio::time::Instant,
+    operation: impl std::future::Future<Output = Result<T, E>>,
+) -> T {
+    append(journal, &json!({"n":n,"phase":phase,"outcome":"started"}));
+    journal.sync_data().unwrap();
+    match tokio::time::timeout_at(deadline, operation).await {
+        Ok(Ok(value)) => {
+            append(journal, &json!({"n":n,"phase":phase,"outcome":"completed"}));
+            journal.sync_data().unwrap();
+            value
+        }
+        other => {
+            let outcome = if other.is_err() {
+                "timeout_unknown"
+            } else {
+                "error_unknown"
+            };
+            append(journal, &json!({"n":n,"phase":phase,"outcome":outcome}));
+            journal.sync_data().unwrap();
+            panic!("repair {phase} {outcome}: inspect retained operation journal; do not retry");
+        }
+    }
+}
+
+#[tokio::test]
+async fn repair_timeout_keeps_started_item_unknown() {
+    let dir = std::env::temp_dir().join(format!(
+        "dbproxy-repair-timeout-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("operations.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    let task = tokio::spawn(async move {
+        recorded(
+            &mut file,
+            0,
+            "enqueue",
+            tokio::time::Instant::now() + Duration::from_millis(1),
+            std::future::pending::<Result<(), ()>>(),
+        )
+        .await;
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    let rows: Vec<Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["outcome"], "started");
+    assert_eq!(rows[1]["outcome"], "timeout_unknown");
 }

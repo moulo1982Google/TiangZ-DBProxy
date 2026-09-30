@@ -33,6 +33,7 @@ docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cp
     -e MIX_TX_AUDIT="${MIX_TX_AUDIT:-0}" \
     -e MIX_SDK_AUDIT="${MIX_SDK_AUDIT:-0}" \
     -e MIX_STAGE_AUDIT="${MIX_STAGE_AUDIT:-0}" \
+    -e MIX_GUARD_DELAY_AT="${MIX_GUARD_DELAY_AT:-}" \
     -e MIX_REPAIR="${MIX_REPAIR:-none}" \
     -e MIX_BASELINE="${MIX_BASELINE:-B2}" \
     -e MIX_PAIR_RATES="${MIX_PAIR_RATES:-64 96}" \
