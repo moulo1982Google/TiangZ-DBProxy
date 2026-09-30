@@ -45,7 +45,7 @@ export function analyzeOverlap(rows) {
     const ys = xs.map(x => x.rpc_us).sort((a, b) => a - b);
     return { count: ys.length, rpc_p99_us: ys.length ? ys[Math.ceil(ys.length * .99) - 1] : null };
   };
-  return { run: m.run, scope: 'Intervals start at driver sent timestamp before task spawn and end at its RPC timing read. Includes SDK, network, server and return. Overlap is not causal attribution; no shared server connection or SQL lock inferred.',
+  return { run: m.run, scope: 'Intervals start at driver sent timestamp inside the spawned task before issue and end at its RPC timing read. Includes SDK, network, server and return. Overlap is not causal attribution; no shared server connection or SQL lock inferred.',
     transactions, all: stats(transactions),
     overlapping: stats(transactions.filter(x => x.overlapping_batches.length)),
     non_overlapping: stats(transactions.filter(x => !x.overlapping_batches.length)) };

@@ -205,10 +205,16 @@ UTC2026-09-30 08:03:17至08:48:26正常退出0/OOMfalse，六次1 passed及OUTBO
 
 ## 调用边界与批量重叠复查
 
-本地新增tools/analyze_mixed_overlap.mjs，仅分析既有账本，不改服务和负载。以intent.scheduled_us+dispatch_us为调用起点，加rpc_us为结束，区间端点相接不算重叠；时间包含发起任务调度、SDK、网络、服务和返回，不是SQL执行区间。校验唯一意图/响应、成功状态、完整请求数和非负时间，拒绝提前停止/未发送。边界相接、重复响应和负耗时负例检查通过。每轮派生overlap-analysis.json保留全部300个正式单事务及重叠批次编号。
+本地新增tools/analyze_mixed_overlap.mjs，仅分析既有账本，不改服务和负载。以intent.scheduled_us+dispatch_us为调用起点，加rpc_us为结束，区间端点相接不算重叠；时间起点在已spawn任务内、调用issue之前，包含调用准备、SDK、网络、服务和返回（发压调度另计dispatch_us），不是SQL执行区间。校验唯一意图/响应、成功状态、完整请求数和非负时间，拒绝提前停止/未发送。边界相接、重复响应和负耗时负例检查通过。每轮派生overlap-analysis.json保留全部300个正式单事务及重叠批次编号。
 
 stgf六轮按r0 off/on、r1 off/on、r2 off/on，单事务与批量调用重叠数分别290/292、299/293、298/293（每轮300条）；全部单事务RPC P99分别14.412/24.625、25.802/16.317、19.104/14.633ms。几乎全部重叠，非重叠仅1–10条，不能以这小组P99推导独立对照或批量阻塞因果。首轮on也有未重叠但22.824ms的调用，重叠本身并不足以解释所有尾部。
 
 代码边界核验：mixed_workload固定n%20的16/17为批量、18为单事务，20/s时相隔100/50ms；四SDK连接按n%4映射，当前单事务与这两个批次分属不同连接。client::exchange在write_message之后drop(attempt)，不在响应等待期间持writer锁；但仍可能等待槽位/写锁。已有ClientObserver::request_attempt_timed能够分别观测queue_wait/exchange，当前混合驱动尚未接入，不猜测其等待为零。服务handler从dispatch_isolated之前到返回之后，早于responses.send，因此不包含响应队列/网络发送。TieredSnapshotStore::apply先PG事务再synchronize_committed_cache；PG operation计时从request_client锁获取之后开始，含ensure_connected、SQL及commit，跨操作汇总，无法以均值差直接分配单事务时间。
 
 后续应复用SDK现有observer补验收调用分阶段观测，并对事务PG/提交后缓存的边界作必要区分。新观测器回调不得阻塞，不把RecordKey/幂等ID作为指标标签，记录开销两组一致；须先新库短测、账本匹配校验，再决定正式诊断，不能把本次离线复查称实测SDK排队或根因已确定。
+
+## SDK逐调用计时短测
+
+cb4049a接入现有ClientObserver::request_attempt_timed，不改生产SDK行为。MIX_SDK_AUDIT=1要求阶段采样同时开启；验收task-local保留最多两次回调，无锁/通道/文件IO或await，不以业务键作指标标签。每条response保存sdk_attempts，包含操作、endpoint、结果、queue_wait_us和exchange_us；种子写入在scope外不记录。严格分析要求每调用恰好一次成功回调、正确操作、endpoint0、非负整数、SDK总量不超过包围调用rpc_us；重试保留原始但不接受为普通无错误性能样本。六轮要求开关一致，历史未启用数据兼容。
+
+本地并发task-local隔离测试、Clippy、fmt、Node负例（缺回调、重复、错误操作、负耗时、超出调用、失败结果）、历史stgf兼容分析通过。确认220仅基础服务后上传三个文件并比对SHA256，新库sdks_0930a六轮2/5秒短测UTC09:27:22至09:28:55 exit0/OOMfalse，六次1 passed及结束标记；840请求、42真实消息核对零差异。全部原始已拉回，配对SMOKE_ONLY，六轮SDK_CALLBACKS_CHECKED及STAGE_INTERVALS_CHECKED。正式5秒样本的SDK queue最大18–52us仅是短测观测，不外推正式尾延迟。记录回调会增加少量开销，后续两组同开且与旧组分开报告。
