@@ -1,7 +1,7 @@
 //! Bounded, unique repair targets alongside the normal mixed application workload.
 use super::*;
 use tiangz_dbproxy_core::AsyncSnapshotStore;
-use tiangz_dbproxy_storage::{PostgresSnapshotStore, RedisSnapshotCache};
+use tiangz_dbproxy_storage::{PostgresSnapshotStore, RedisSnapshotCache, SnapshotCacheConfig};
 
 pub(super) async fn prepare(
     url: &str,
@@ -19,7 +19,19 @@ pub(super) async fn prepare(
     }
     assert!(mode == "control" || mode == "repair");
     let mut store = PostgresSnapshotStore::connect(url).await.unwrap();
-    let cache = RedisSnapshotCache::connect(cache_url).await.unwrap();
+    // Match the explicit experimental server policy: fixture entries must outlive
+    // the seven-minute sample and final reconciliation, not expire at five minutes.
+    let cache = RedisSnapshotCache::connect_with_metrics_and_policy(
+        cache_url,
+        Default::default(),
+        SnapshotCacheConfig {
+            ttl: Duration::from_secs(1800),
+            ttl_jitter: Duration::ZERO,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     let queue = store.cache_repair_queue();
     let namespace = format!("mixed-repair-{run}");
     let count = seconds * 2;

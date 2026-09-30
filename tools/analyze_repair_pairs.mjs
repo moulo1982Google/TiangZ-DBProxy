@@ -17,6 +17,7 @@ for(const [i,e] of entries.entries()){
   assert.equal(checked.status,0,`${e.run}: ${checked.stderr}`);
   const a=JSON.parse(checked.stdout),m=a.manifest;
   assert.equal(m.baseline,'B2');assert.equal(m.repair_mode,e.mode);
+  assert.equal(m.repair_cache_ttl_ms,1800000,'explicit shared experimental TTL required');
   assert.equal(m.rate,20);assert.equal(m.concurrency,8);assert.equal(m.connections,4);
   assert.deepEqual(m.mix,[40,20,20,10,5,5]);
   if(i)for(const key of ['warmup','sample','batch','payload_bytes','payload_rule','shards','read_connections','runtime_workers','repair_rows'])assert.equal(m[key],runs[0].analysis.manifest[key]);

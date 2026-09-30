@@ -61,3 +61,13 @@ run_repair_pairs.sh 固定正式 B2、20 业务请求/秒、并发8、四SDK连�
 首个组织短测 rpairs_0930a 在真正测试前因子RunId后缀过长被拒绝，exit=2，原始容器和顺序记录保留并拉回；没有修改标识符校验。后缀改为c/r，前缀长度同步限制，新编号 rpairs_0930b 六轮短测通过：各140业务请求、14夹具记录，实际六次1 passed，exit=0/OOM=false，业务与缓存核对均零差异，原始已拉回，汇总SMOKE_ONLY。分析器对首轮不完整的一条顺序记录正确拒绝。
 
 正式 rpairf_0930a 于 UTC2026-09-30 00:23:02 启动，容器 dbproxy-mixed-rpairf_0930a，固定20业务请求/秒、2修复目标/秒、并发8，control/repair三对交替，各120秒预热300秒采样。每轮正常8400业务请求、840夹具记录，六轮预计约45分钟含准备/核对。证据 repair_pairs_rpairf_0930a/order.jsonl、fault_process_rpairf_0930a_r{0,1,2}_{c,r}/mixed-paced 与同级 rpairf_0930a.*。运行中只读，不改挂载源码或并行其他服务器验收。短测8份连续采样中的PG max/oom事件增量与内存full PSI增量均零；仅作允许维持低速的短区间依据，不用于支持升压。
+
+### 首轮正式对照失败：夹具缓存自然过期
+
+rpairf_0930a 于 UTC00:31:06 exit=1/OOM=false，在首个control轮次结束后停止，未运行其余五轮。8400业务响应、28170业务快照、840效果全部一致，错误/未发送均零；repair.json 的840条夹具缓存核对全部失败，队列为零。原始目录、容器和资源已完整拉回，单轮分析器明确REJECTED_LOAD；业务result.json中的full_timing=true仅表示业务计时完整，不能覆盖夹具失败或视作验收通过。
+
+夹具使用RedisSnapshotCache默认300000ms TTL及最多30000ms抖动，记录在负载前写入，而正式计时420秒后才核对；control不再写缓存，因此末尾已超过所有夹具生存期。cache采样evicted_keys始终0，expired_keys累计增加26856（共享缓存总数，不能全归因夹具）。短测7秒未暴露该问题。
+
+修正仅影响MIX_REPAIR实验：正式服务测试配置与夹具连接同时显式设cacheTtlMs=1800000、jitter=0，两组完全相同，manifest记录repair_cache_ttl_ms，配对分析器要求该值。生产默认配置不变，不接受缺失缓存作为成功、不放宽零差异断言；对照结论需注明30分钟实验TTL，不再直接与默认TTL历史轮次合并。新编号rpairs_0930c先验证六轮短测，再使用全新RunId重跑完整计时，原失败保留。
+
+修正后rpairs_0930c六轮短测实际通过，exit=0/OOM=false，原始已拉回，配对分析SMOKE_ONLY，业务/缓存核对均零差异。Windows指定测试Clippy、格式/差异检查与Linux重编译短测通过；短测仅验证配置接入，缓存跨7分钟的检查仍需正式重跑。

@@ -198,6 +198,14 @@ async fn fixed_rate_six_operations() {
     std::fs::create_dir(&dir).unwrap();
     let endpoint = free_port();
     tenant_config(&dir, "A", &endpoint, &free_port());
+    let repair_mode = std::env::var("MIX_REPAIR").unwrap_or_else(|_| "none".into());
+    if repair_mode != "none" {
+        let path = dir.join("A.json");
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["storage"]["cacheTtlMs"] = json!(1_800_000);
+        config["storage"]["cacheTtlJitterMs"] = json!(0);
+        std::fs::write(path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    }
     let deploy = deployment(&dir, &endpoint, &["A"]);
     let baseline = std::env::var("MIX_BASELINE").unwrap_or_else(|_| "B2".into());
     assert!(baseline == "B1" || baseline == "B2");
@@ -239,7 +247,6 @@ async fn fixed_rate_six_operations() {
             }
         );
     }
-    let repair_mode = std::env::var("MIX_REPAIR").unwrap_or_else(|_| "none".into());
     let (repair_rows, repair_task, repair_start) = repair::prepare(
         &url,
         &env.cache[0],
@@ -251,7 +258,7 @@ async fn fixed_rate_six_operations() {
     let mut ledger = std::fs::File::create(dir.join("requests.jsonl")).unwrap();
     append(
         &mut ledger,
-        &json!({"kind":"manifest","run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
+        &json!({"kind":"manifest","run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
     );
     let start = tokio::time::Instant::now();
     if let Some(trigger) = repair_start {
