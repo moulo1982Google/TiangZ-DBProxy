@@ -193,6 +193,20 @@ for(const source of versionedFixtures)for(const enabled of [false,true]){
     current.splice(current.findIndex(v=>v.wave===wave&&v.kind==='wave')+1,0,...records);
   }
   const raw=encode(current);assert.equal(analyze(raw,sealOf(raw)).stats_calls,enabled?7:0);
+  for(const phase of [0,1]){
+    const newer=structuredClone(current);newer[0].schema=8;newer[0].stats_phase=phase;
+    if(phase===1){
+      const selected=newer.filter(v=>v.kind.startsWith('stats_')||v.operation==='stats');
+      for(const v of selected)newer.splice(newer.indexOf(v),1);
+      for(let wave=1;wave<14;wave+=2){
+        const group=selected.filter(v=>v.wave===wave-1);
+        for(const v of group){v.wave=wave;for(const k of ['scheduled_us','at_us','begin_us','end_us'])if(k in v)v[k]+=500000;if(v.counts&&!['none','all-blocked'].includes(source[0].mode))v.counts.pending-=2;}
+        newer.splice(newer.findIndex(v=>v.kind==='wave'&&v.wave===wave)+1,0,...group);
+      }
+    }
+    const newRaw=encode(newer);assert.equal(analyze(newRaw,sealOf(newRaw)).stats_phase,phase);
+    for(const mutate of [x=>x[0].stats_phase=2,x=>x[0].stats_phase=1-phase,x=>x.find(v=>v.kind==='stats_slot').scheduled_us+=500000]){const bad=structuredClone(newer);mutate(bad);const text=encode(bad);assert.throws(()=>analyze(text,sealOf(text)));}
+  }
   for(const mutate of [
     x=>x.splice(x.findIndex(v=>v.kind==='stats_result'),1),
     x=>x.find(v=>v.kind==='stats_slot').worker=1,

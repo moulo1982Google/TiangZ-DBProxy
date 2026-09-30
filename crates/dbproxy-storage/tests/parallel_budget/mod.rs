@@ -38,6 +38,29 @@ pub fn validate(warmup: u64, sample: u64, rows: u64, mixed: bool) -> Result<Budg
     })
 }
 
+pub fn stats_phase(value: Option<String>) -> Result<u64, &'static str> {
+    match value.as_deref() {
+        None | Some("0") => Ok(0),
+        Some("1") => Ok(1),
+        _ => Err("stats phase must be 0 or 1"),
+    }
+}
+
+#[test]
+fn phases_preserve_frequency_and_balance_across_runs() {
+    for value in ["", "2", "-1", "NaN"] {
+        assert!(stats_phase(Some(value.into())).is_err());
+    }
+    for seconds in [7_u64, 420] {
+        for phase in [0, 1] {
+            let slots: Vec<_> = (0..seconds * 2).filter(|wave| wave % 2 == phase).collect();
+            assert_eq!(slots.len() as u64, seconds);
+            assert!(slots.windows(2).all(|pair| pair[1] - pair[0] == 2));
+            assert!(slots.iter().all(|wave| wave % 2 == phase));
+        }
+    }
+}
+
 pub fn smoke_environment(get: impl Fn(&str) -> Option<String>) -> Result<Budget, &'static str> {
     // Fail before creating evidence or connecting to PostgreSQL. Older launchers
     // passed unused formal parameters, which must no longer be silently ignored.
@@ -59,6 +82,7 @@ pub fn smoke_environment(get: impl Fn(&str) -> Option<String>) -> Result<Budget,
     if get("P07_STATS").is_some_and(|v| v != "0" && v != "1") {
         return Err("stats must be 0 or 1");
     }
+    stats_phase(get("P07_STATS_PHASE"))?;
     validate(2, 5, 1000, true)
 }
 

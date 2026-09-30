@@ -12,6 +12,7 @@ p07_parallel_preflight() {
             return 2
         fi
     done
+    case ${P07_STATS_PHASE-0} in 0|1) ;; *) echo "Rejected P07_STATS_PHASE: require 0 or 1" >&2; return 2 ;; esac
     case ${P07_STATS-0} in 0|1) ;; *) echo "Rejected P07_STATS: require 0 or 1" >&2; return 2 ;; esac
     case ${P07_PARALLEL_MODE-ready} in
         ready|spread-ready|none|all-blocked|leased|backoff|leased-heads|backoff-heads|dead-heads) ;;

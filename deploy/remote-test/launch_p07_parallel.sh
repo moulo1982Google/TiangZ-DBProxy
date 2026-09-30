@@ -25,7 +25,7 @@ docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cp
     -e P07_PARALLEL_MODE="${P07_PARALLEL_MODE:-ready}" \
     -e P07_PUBLISHERS=2 -e P07_WORKERS=2 -e P07_ROWS=1000 \
     -e P07_WARMUP_SECONDS=2 -e P07_SAMPLE_SECONDS=5 -e P07_ROUNDS=1 \
-    -e P07_CLAIMS_PER_SECOND=4 -e P07_STATS="${P07_STATS:-0}" \
+    -e P07_CLAIMS_PER_SECOND=4 -e P07_STATS="${P07_STATS:-0}" -e P07_STATS_PHASE="${P07_STATS_PHASE:-0}" \
     -v "$DATA/evidence:/evidence" -v "$DATA/pglog:/pglog:ro" \
     -v "$DATA/src/crates/dbproxy-storage/tests:/src/crates/dbproxy-storage/tests:ro" \
     -v "$DATA/src/deploy/remote-test:/src/deploy/remote-test:ro" \

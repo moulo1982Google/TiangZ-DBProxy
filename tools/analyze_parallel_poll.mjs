@@ -16,10 +16,16 @@ export function validateBudget(warmup, sample, total, mixed) {
 export function analyze(raw, seal) {
   assert(raw.endsWith('\n'), 'journal must be sealed with a final newline');
   const allRows = raw.trimEnd().split('\n').map(s => JSON.parse(s));
-  const schema7=allRows[0]?.schema===7;
+  const schema7=[7,8].includes(allRows[0]?.schema);
+  const statsPhase=allRows[0]?.schema===8?allRows[0].stats_phase:0;
+  assert([0,1].includes(statsPhase));
   const isStats=v=>['stats_slot','stats_result'].includes(v.kind)||v.operation==='stats';
   const statsRows=schema7?allRows.filter(isStats):[];
   const rows=schema7?allRows.filter(v=>!isStats(v)):allRows;
+  for(const v of statsRows) {
+    const index=allRows.indexOf(v), begin=allRows.findIndex(r=>r.kind==='wave'&&r.wave===v.wave), end=allRows.findIndex(r=>r.kind==='wave_completed'&&r.wave===v.wave);
+    assert(begin>=0&&index>begin&&end>index,'stats record outside its wave');
+  }
   let statsCursor=0,statsOverlaps=0;
   const statsEnabled=schema7?allRows[0].stats:false;
   if(schema7) assert.equal(typeof statsEnabled,'boolean');
@@ -45,8 +51,8 @@ export function analyze(raw, seal) {
     budget=validateBudget(f.schema>=6?f.warmup_seconds:2,f.schema>=6?f.sample_seconds:5,f.schema>=6?f.rows:1000,mixed);
     status=budget.sample===5?'SMOKE_ONLY':'BOUNDED_LEDGER_ONLY';
     if(mixed) for(const n of next) {n[0]=budget.blocked;n[1]=budget.blocked+1;}
-    if([5,6,7].includes(f.schema)) {
-      assert.deepEqual(f,{kind:'fixture',schema:f.schema,mode,rows:budget.total,claim_calls:budget.calls,warmup_seconds:budget.warmup,sample_seconds:budget.sample,workers:2,publishers:2,claims_per_second:4,stats:statsEnabled,seal_required:true});
+    if([5,6,7,8].includes(f.schema)) {
+      assert.deepEqual(f,{...(f.schema===8?{stats_phase:statsPhase}:{}),kind:'fixture',schema:f.schema,mode,rows:budget.total,claim_calls:budget.calls,warmup_seconds:budget.warmup,sample_seconds:budget.sample,workers:2,publishers:2,claims_per_second:4,stats:statsEnabled,seal_required:true});
       assert.deepEqual(seal,{schema:1,file:'journal.jsonl',bytes:Buffer.byteLength(raw),sha256:createHash('sha256').update(raw).digest('hex')},'missing or inconsistent journal seal');
     } else assert.equal(f.schema,mode==='spread-ready'?4:mixed?3:2);
     assert.equal(f.rows,budget.total);assert.equal(f.claim_calls,budget.calls);
@@ -81,7 +87,7 @@ export function analyze(raw, seal) {
     }
     const c = operations('claim');
     let statsEnd=0;
-    if(schema7&&wave%2===0) {
+    if(schema7&&wave%2===statsPhase) {
       const takeStats=kind=>{const v=statsRows[statsCursor++];assert.equal(v?.kind,kind);assert.equal(v.wave,wave);assert.equal(v.worker,0);return v;};
       assert.deepEqual(takeStats('stats_slot'),{kind:'stats_slot',wave,worker:0,enabled:statsEnabled,scheduled_us:w.scheduled_us});
       if(statsEnabled){
@@ -151,7 +157,7 @@ export function analyze(raw, seal) {
   assert(overlaps > 0); assert.equal(result.overlap_waves,overlaps); assert.equal(cursor,rows.length);
   assert.equal(statsCursor,statsRows.length);
   if(statsEnabled)assert(statsOverlaps>0,'no actual stats/claim overlap');
-  return {stats_calls:statsEnabled?statsCursor/4:0,stats_overlap_waves:statsOverlaps,status, validation:'PARALLEL_CLAIMS_CHECKED', mode, waves:budget.waves, claim_calls:budget.calls, returned:seen.size, formal_claim_calls:budget.sample*4, overlap_waves:overlaps, claims_timing:claims};
+  return {stats_phase:statsPhase,stats_calls:statsEnabled?statsCursor/4:0,stats_overlap_waves:statsOverlaps,status, validation:'PARALLEL_CLAIMS_CHECKED', mode, waves:budget.waves, claim_calls:budget.calls, returned:seen.size, formal_claim_calls:budget.sample*4, overlap_waves:overlaps, claims_timing:claims};
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const dir = process.argv[2];
