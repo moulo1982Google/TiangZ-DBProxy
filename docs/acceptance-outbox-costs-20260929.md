@@ -294,3 +294,13 @@ UTC2026-09-30 10:48:48至11:34:28，exit0/OOMfalse，六次1 passed及OUTBOX_PAI
 267条资源样本，PG峰4.352GiB、主机可用最低38.637GiB；max/oom/oom_kill增量0，pgscan/pgsteal各48997，内存full PSI区间峰0.008335%。有回收，不解除升压限制。连续事件记录已包含自身start/die且stderr空，截至本次收集无其他容器事件；不排除宿主非容器负载。监听按原计划11:53:48自然退出。
 
 下一步先离线核对单事务request_client的共享范围、maintenance连接与批量业务连接关系，并分析同请求trace外剩余时间和批量重叠；不凭猜测改SQL/锁，不重复无新观测的低速矩阵。多publisher并发worker、P06高积压和容量范围仍未完成。
+
+## txf离线连接与计时边界复查
+
+源码核对：server/lib.rs中每个Tiered shard独立连接，maintenance另经PostgresSnapshotStore::connect创建；outbox_stats调用该维护队列stats（outbox.rs独立self.client锁），不直接占用业务shard的request_client互斥锁。单事务按record路由，批量save按首条record选一个shard，克隆保留同一Arc<Mutex>；因此可能竞争同一业务连接，但当前trace没有锁持有者/路由关联，不能断言某次等待由某批次或stats引起。共享数据库CPU/IO等间接影响未排除。
+
+capture的total_us在tracing::info输出之前读取，摘要及部分调用边界也在trace外；server的handler计时结束后才responses.send，独立writer串行write_message。因此同一请求rpc_us-total_us仅为未覆盖路径总差，含日志、调度、响应和网络，不是网络独占时间。六轮每300正式事务的该差P99（执行顺序off/on/on/off/off/on）为15243/1096/1083/1159/1142/892us，最大15879/1177/1507/1860/1424/1308us；r0_off存在显著未覆盖尾部，不能靠PG优化解释所有慢请求。
+
+复用既有overlap分析器核验全部六轮：事务与批量RPC重叠298/270/299/291/298/292条；非重叠仅2/30/1/9/2/8，不是随机或平衡对照，不能从差值推出锁因果。同请求剩余时间和各轮最慢五项保存在target/server_20260929/txf_0930a.boundary-review.json，全部原始交易和请求账本保留。没有运行新负载或更改生产行为。事件订阅结束后文件再次拉回，仍仅本轮start/die且stderr空。
+
+下一项定向观测应优先补trace日志输出耗时及服务响应队列/写出边界的同请求关联，避免把剩余时间归网络；如需确认业务连接等待持有者，应显式记录验收分片索引与锁区间，不能由RPC重叠代替。新观测先本地校验及短测，不直接再跑同一正式矩阵，不增加业务标识指标标签。
