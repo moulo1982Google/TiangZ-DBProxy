@@ -41,9 +41,19 @@ pub async fn capture<T>(operation_id: &str, future: impl Future<Output = T>) -> 
                 let result = future.await;
                 TRACE.with(|cell| {
                     let t = cell.borrow();
-                    let row = serde_json::json!({"schema_version":1,"operation_sha256":digest,
-                "total_us":t.start.elapsed().as_micros(),"spans":t.spans});
+                    let total_us = t.start.elapsed().as_micros();
+                    let output_at = Instant::now();
+                    let row = serde_json::json!({"schema_version":2,"operation_sha256":digest,
+                "total_us":total_us,"spans":t.spans});
                     tracing::info!("ACCEPTANCE_TX_TRACE {}", row);
+                    let output_us = output_at.elapsed().as_micros();
+                    // This second record's own output remains outside the measured interval.
+                    tracing::info!(
+                        "ACCEPTANCE_TX_OUTPUT {}",
+                        serde_json::json!({
+                            "schema_version":1,"operation_sha256":digest,"output_us":output_us
+                        })
+                    );
                 });
                 result
             },
