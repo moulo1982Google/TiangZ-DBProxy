@@ -408,3 +408,13 @@ b89072c将分区直接确定在INSERT，保留生产不可变触发器，未绕�
 leased起止900future_leased，backoff起止900future_available；受阻发布0，owner0，各publisher独立可领取余量50→36。防耗尽与publisher/FIFO/最终28published严格通过，PARALLEL_CLAIMS_CHECKED/SMOKE_ONLY；边界快照不代表连续分布采样，不是九分布正式性能。全部三轮原始已回收target/server_20260929。成功两轮各2资源样本、单区间PG max/oom0，scan/steal分别7843和14262，有回收不升压，不排除未采样峰值。
 
 前中后实际均仅5基础服务；连续事件p7mixed_0930a.events在首失败轮前启动、timeout180秒约17:30:34自然退出，收集时保留本组容器事件，需到期后补拉，不停止。上一p7empty事件窗口到期后已重拉仍4条自身start/die，stderr空。非容器活动不排除。下一步补小数据leased-heads/backoff-heads/dead-heads及明确dense-ready与分散ready差别，继续新库/有界预算/严格账本，不重复这两正常短测。保留首轮失败，真实数据库超时、多worker正式性能、P06高积压/P09容量仍缺。
+
+## P07 三种头阻塞混合短测（5a554cd）
+
+小数据leased-heads/backoff-heads/dead-heads各1000行，两publisher各450行受阻FIFO（各2个头）加50行独立可领取FIFO；只有4个头设置未来租约、未来available或死信，896后继不设该状态。分区仍在INSERT时确定，保留不可变约束；schema3每publisher reserve起止50→36、blocked_published0，28领取确认事件的FIFO/归属及最终PG完整核对。工具目标Clippy/fmt及原18+空12+混合25负例通过；上传SHA256 a86000340786ff2a8041efa317d2a70001ced8de491ec5d1690f81581ad8941b一致。
+
+三个独立新库串行：p7hl_0930a UTC17:41:59.067→17:42:15.235，p7hb_0930a17:42:20.440→17:42:37.375，p7hd_0930a17:42:41.881→17:42:57.637。各exit0/OOMfalse、1 passed/结束标记，2/5秒两worker共4调用/s无stats，14波均实际重叠、28返回/确认、短采样20调用，1000最终PG一致；各900受阻分区记录无发布、两publisher可领余量各36，4个受阻头对应状态起止计数保持。严格PARALLEL_CLAIMS_CHECKED/SMOKE_ONLY，所有原始及容器/镜像/源码/资源已回收，不作为正式性能或高积压结论。
+
+各仅2资源样本，PG max/oom增量0，scan/steal分别9461、4841、8404，有回收不升压，不排除采样外峰值。前/中/后实际均5基础服务；连续事件p7heads_0930a在首轮前开始、240秒约17:45:59自然结束，结束后补拉，不停止。旧p7mixed观察器到期文件已重拉，只有3轮自身start/die共6条、stderr空，宿主非容器负载不排除。
+
+现有工具名ready实际每publisher仅2个FIFO分区、每分区250行，对应密集ready而不是旧hybrid的独立key ready；不能把名字当覆盖两分布。下一步实际补独立key ready夹具与严格合法返回顺序核对，明确保留历史ready=密集语义，再评估正式统计对照所需防耗尽/分布观测。三种头阻塞短测不重复；九分布正式性能、真实超时、P06高积压/P09容量仍缺，全部旧失败保留。
