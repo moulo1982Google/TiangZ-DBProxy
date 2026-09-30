@@ -34,7 +34,7 @@ pub(super) async fn prepare(
     )
     .await
     .unwrap();
-    let queue = store.cache_repair_queue();
+
     let namespace = format!("mixed-repair-{run}");
     let count = seconds * 2;
     let mut records = Vec::new();
@@ -57,39 +57,16 @@ pub(super) async fn prepare(
                 .unwrap();
         }
 
+        initial_cache.push(cache.get(&w.record).await.unwrap());
         records.push(w.record);
     }
-    // Automatic repair created by save must finish before explicit re-enqueue tests.
-    // This fixture has CURRENT caches; it does not measure stale-cache recovery.
+    // No acceptance worker exists yet. Hold only this fresh RunId's automatic rows.
     let pg = sql(url).await;
-    let baseline_path = evidence.join("repair-baseline.jsonl");
-    let mut baseline = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(baseline_path)
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let pending: i64 = pg.query_one("SELECT count(*) FROM dbproxy_cache_repairs WHERE namespace=$1", &[&namespace]).await.unwrap().get(0);
-            append(&mut baseline, &json!({"kind":"preparation_queue","pending":pending}));
-            baseline.sync_data().unwrap();
-            if pending == 0 { break; }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        for (n, record) in records.iter().enumerate() {
-            let authoritative = store.load(record).await.unwrap().unwrap();
-            let actual = cache.get(record).await.unwrap();
-            let matches = actual.as_ref() == Some(&authoritative);
-            append(&mut baseline, &json!({"kind":"cache_baseline","n":n,"revision":authoritative.revision.0,"matches":matches}));
-            baseline.sync_data().unwrap();
-            assert!(matches, "automatic repair did not establish current cache");
-            initial_cache.push(actual);
-        }
-        let pending: i64 = pg.query_one("SELECT count(*) FROM dbproxy_cache_repairs WHERE namespace=$1", &[&namespace]).await.unwrap().get(0);
-        append(&mut baseline, &json!({"kind":"baseline_ready","pending":pending,"targets":count,"scope":"current_cache_reenqueue"}));
-        baseline.sync_data().unwrap();
-        assert_eq!(pending,0);
-    }).await.expect("repair baseline preparation timed out; retain evidence");
+    let held = pg.execute("UPDATE dbproxy_cache_repairs SET available_at=clock_timestamp()+interval '1 day' WHERE namespace=$1 AND target_revision=2 AND lease_until IS NULL AND lease_owner IS NULL AND dead_lettered_at IS NULL AND attempt_count=0", &[&namespace]).await.unwrap();
+    assert_eq!(held, count);
+    let snapshots = evidence.join("repair-fixture.json");
+    std::fs::write(&snapshots, serde_json::to_vec(&initial_cache).unwrap()).unwrap();
+    verify_baseline(url, cache_url, run, evidence, mode, "prepared").await;
     let journal_path = evidence.join("repair-operations.jsonl");
     let mut journal = std::fs::OpenOptions::new()
         .write(true)
@@ -110,50 +87,36 @@ pub(super) async fn prepare(
             }
             // Admission precedes any await: a stop lets this one admitted item finish.
             let sent = Instant::now();
-            if mode == "repair" {
-                recorded(
-                    &mut journal,
-                    n,
-                    "enqueue",
-                    tokio::time::Instant::now() + Duration::from_secs(5),
-                    queue.enqueue(record, Revision(2)),
-                )
-                .await;
-            }
-            let pending: i64 = tokio::time::timeout(
-                Duration::from_secs(5),
-                pg.query_one(
-                    "SELECT count(*) FROM dbproxy_cache_repairs WHERE namespace=$1",
-                    &[&namespace],
-                ),
-            )
-            .await
-            .expect("repair pending query timed out; evidence incomplete")
-            .unwrap()
-            .get(0);
-            observations.push(json!({"n":n,"elapsed_ms":started.elapsed().as_millis(),"enqueue_and_probe_us":sent.elapsed().as_micros(),"pending":pending}));
+            // Both groups perform the same conditional fixture release. Ordinary enqueue
+            // preserves available_at, so must NOT be used as a release mechanism.
+            let released = recorded(&mut journal, n, "release", tokio::time::Instant::now()+Duration::from_secs(5),
+                pg.execute("UPDATE dbproxy_cache_repairs SET available_at=clock_timestamp() WHERE namespace=$1 AND record_key=$2 AND target_revision=2 AND available_at>statement_timestamp() AND lease_until IS NULL AND lease_owner IS NULL AND dead_lettered_at IS NULL AND attempt_count=0", &[&namespace, &record.key])).await;
+            assert_eq!(
+                released, 1,
+                "held repair release did not affect exactly one row"
+            );
+            let state = queue_state(&pg, &namespace).await;
+            observations.push(json!({"n":n,"elapsed_ms":started.elapsed().as_millis(),"release_and_probe_us":sent.elapsed().as_micros(),"pending":state["total"],"queue":state}));
         }
         let deadline = Instant::now() + Duration::from_secs(30);
-        let remaining = loop {
-            let pending: i64 = tokio::time::timeout(
-                Duration::from_secs(5),
-                pg.query_one(
-                    "SELECT count(*) FROM dbproxy_cache_repairs WHERE namespace=$1",
-                    &[&namespace],
-                ),
-            )
-            .await
-            .expect("repair drain query timed out; evidence incomplete")
-            .unwrap()
-            .get(0);
-            if pending == 0 || Instant::now() >= deadline {
-                break pending;
+        let final_queue = loop {
+            let state = queue_state(&pg, &namespace).await;
+            let active = state["eligible"].as_u64().unwrap()
+                + state["leased"].as_u64().unwrap()
+                + state["dead"].as_u64().unwrap();
+            if active == 0 || Instant::now() >= deadline {
+                break state;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
+        let remaining = final_queue["eligible"].as_u64().unwrap()
+            + final_queue["leased"].as_u64().unwrap()
+            + final_queue["dead"].as_u64().unwrap();
         let mut mismatches = 0;
         let admitted = observations.len();
         let mut untouched_mismatches = 0;
+        let mut queue_mismatches = 0;
+        let mut final_items = Vec::new();
         let reconcile_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         for (n, record) in records.iter().enumerate() {
             let authoritative = recorded(
@@ -173,15 +136,81 @@ pub(super) async fn prepare(
                 cache.get(record),
             )
             .await;
-            if n < admitted || mode == "control" {
+            let held_row = recorded(&mut journal, n, "read_queue", reconcile_deadline,
+                pg.query_opt("SELECT target_revision=2 AND available_at>statement_timestamp() AND lease_until IS NULL AND lease_owner IS NULL AND dead_lettered_at IS NULL AND attempt_count=0 FROM dbproxy_cache_repairs WHERE namespace=$1 AND record_key=$2", &[&namespace,&record.key])).await;
+            let queue_valid = if n < admitted {
+                held_row.is_none()
+            } else {
+                held_row.as_ref().is_some_and(|r| r.get::<_, bool>(0))
+            };
+            queue_mismatches += u64::from(!queue_valid);
+            final_items.push(json!({"n":n,"released":n<admitted,"queue_valid":queue_valid,"cache_revision":actual.as_ref().map(|v|v.revision.0),"authority_revision":authoritative.revision.0}));
+            if n < admitted {
                 mismatches += u64::from(actual.as_ref() != Some(&authoritative));
             } else {
                 untouched_mismatches += u64::from(actual != initial_cache[n]);
             }
         }
-        json!({"baseline_scope":"current_cache_reenqueue","schema_version":2,"admitted":admitted,"not_injected":count-admitted as u64,"stopped":stopped,"untouched_mismatches":untouched_mismatches,"mode":mode,"targets":count,"remaining":remaining,"mismatches":mismatches,"seconds":started.elapsed().as_secs_f64(),"observations":observations})
+        json!({"baseline_scope":"held_stale_release","schema_version":3,"final_queue":final_queue,"queue_mismatches":queue_mismatches,"final_items":final_items,"admitted":admitted,"not_injected":count-admitted as u64,"stopped":stopped,"untouched_mismatches":untouched_mismatches,"mode":mode,"targets":count,"remaining":remaining,"mismatches":mismatches,"seconds":started.elapsed().as_secs_f64(),"observations":observations})
     });
     (count, Some(task), Some(tx))
+}
+
+// These counters are exclusive: expired leases remain leased until consumed/reset.
+async fn queue_state(pg: &tokio_postgres::Client, namespace: &str) -> Value {
+    let row = tokio::time::timeout(Duration::from_secs(5), pg.query_one(
+        "SELECT count(*), count(*) FILTER (WHERE dead_lettered_at IS NOT NULL), count(*) FILTER (WHERE dead_lettered_at IS NULL AND lease_until IS NOT NULL), count(*) FILTER (WHERE dead_lettered_at IS NULL AND lease_until IS NULL AND available_at>statement_timestamp()), count(*) FILTER (WHERE dead_lettered_at IS NULL AND lease_until IS NULL AND available_at<=statement_timestamp()) FROM dbproxy_cache_repairs WHERE namespace=$1", &[&namespace])).await.expect("repair queue query timed out").unwrap();
+    json!({"total":row.get::<_,i64>(0),"dead":row.get::<_,i64>(1),"leased":row.get::<_,i64>(2),"held":row.get::<_,i64>(3),"eligible":row.get::<_,i64>(4)})
+}
+
+pub(super) async fn verify_started(
+    url: &str,
+    cache_url: &str,
+    run: &str,
+    evidence: &std::path::Path,
+    mode: &str,
+) {
+    if mode != "none" {
+        verify_baseline(url, cache_url, run, evidence, mode, "started").await;
+    }
+}
+
+async fn verify_baseline(
+    url: &str,
+    cache_url: &str,
+    run: &str,
+    evidence: &std::path::Path,
+    mode: &str,
+    phase: &str,
+) {
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(evidence.join("repair-baseline.jsonl"))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let snapshots: Vec<Option<tiangz_dbproxy_core::SnapshotEnvelope>>=serde_json::from_slice(&std::fs::read(evidence.join("repair-fixture.json")).unwrap()).unwrap();
+        let store=PostgresSnapshotStore::connect(url).await.unwrap();
+        let cache=RedisSnapshotCache::connect(cache_url).await.unwrap();
+        let pg=sql(url).await;
+        let namespace=format!("mixed-repair-{run}");
+        for (n, expected) in snapshots.iter().enumerate() {
+            let expected=expected.as_ref().unwrap();
+            let authoritative=store.load(&expected.record).await.unwrap().unwrap();
+            let actual=cache.get(&expected.record).await.unwrap();
+            let matches=actual.as_ref()==Some(expected);
+            let queue=pg.query_one("SELECT target_revision=2 AND available_at>statement_timestamp() AND lease_until IS NULL AND lease_owner IS NULL AND dead_lettered_at IS NULL AND attempt_count=0 FROM dbproxy_cache_repairs WHERE namespace=$1 AND record_key=$2", &[&namespace,&expected.record.key]).await.unwrap().get::<_,bool>(0);
+            append(&mut file,&json!({"kind":"cache_baseline","phase":phase,"n":n,"revision":authoritative.revision.0,"cache_revision":actual.as_ref().map(|v|v.revision.0),"matches":matches,"held":queue}));
+            file.sync_data().unwrap();
+            assert_eq!(authoritative.revision,Revision(2));
+            assert_eq!(expected.revision,Revision(if mode=="repair" {1} else {2}));
+            assert!(matches && queue,"fixture changed before release");
+        }
+        let state=queue_state(&pg,&namespace).await;
+        append(&mut file,&json!({"kind":"baseline_ready","phase":phase,"targets":snapshots.len(),"scope":"held_stale_release","queue":state}));
+        file.sync_data().unwrap();
+        assert_eq!(state,json!({"total":snapshots.len(),"held":snapshots.len(),"eligible":0,"leased":0,"dead":0}));
+    }).await.expect("held repair baseline timed out; retain evidence");
 }
 
 // A successful return is admission, not completion; do not cancel an admitted enqueue.

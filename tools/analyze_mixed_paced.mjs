@@ -1,3 +1,4 @@
+import {checkHeldRepair} from './analyze_held_repair.mjs';
 import {analyzeTransactions} from './analyze_mixed_transaction.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -28,7 +29,7 @@ if(m.repair_mode && m.repair_mode!=='none') {
   assert.equal(repair.mode,m.repair_mode);
   assert.equal(repair.targets,(m.warmup+m.sample)*2);
   assert.equal(m.repair_rows,repair.targets);
-  if(repair.schema_version===2){
+  if([2,3].includes(repair.schema_version)){
     assert(Number.isSafeInteger(repair.admitted)&&repair.admitted>=0&&repair.admitted<=repair.targets);
     assert.equal(repair.observations.length,repair.admitted);
     assert.equal(repair.not_injected,repair.targets-repair.admitted);
@@ -37,7 +38,8 @@ if(m.repair_mode && m.repair_mode!=='none') {
     assert.equal(repair.untouched_mismatches,0);
     if(!repair.stopped)assert.equal(repair.admitted,repair.targets);
   }else assert.equal(repair.observations.length,repair.targets);
-  if(repair.baseline_scope){
+  if(repair.schema_version===3)checkHeldRepair(repair,read('repair-baseline.jsonl'));
+  else if(repair.baseline_scope){
     assert.equal(repair.baseline_scope,'current_cache_reenqueue');
     const baseline=read('repair-baseline.jsonl').trim().split(/\r?\n/).map(JSON.parse);
     const caches=baseline.filter(x=>x.kind==='cache_baseline');assert.equal(caches.length,repair.targets);
@@ -49,8 +51,9 @@ if(m.repair_mode && m.repair_mode!=='none') {
     const journal=read('repair-operations.jsonl');assert(journal.endsWith('\n'));
     const entries=journal.trim().split(/\r?\n/).map(JSON.parse);
     const expected=[];
-    if(m.repair_mode==='repair')for(let n=0;n<repair.admitted;n++)expected.push([n,'enqueue']);
-    for(let n=0;n<repair.targets;n++)expected.push([n,'read_authoritative'],[n,'read_cache']);
+    if(repair.schema_version===3)for(let n=0;n<repair.admitted;n++)expected.push([n,'release']);
+    else if(m.repair_mode==='repair')for(let n=0;n<repair.admitted;n++)expected.push([n,'enqueue']);
+    for(let n=0;n<repair.targets;n++){expected.push([n,'read_authoritative'],[n,'read_cache']);if(repair.schema_version===3)expected.push([n,'read_queue']);}
     assert.deepEqual(entries,expected.flatMap(([n,phase])=>[{n,phase,outcome:'started'},{n,phase,outcome:'completed'}]),'repair journal missing/unknown/reordered operation');
   }
   repair.observations.forEach((r,i)=>{assert.equal(r.n,i);assert(r.pending>=0);});

@@ -238,6 +238,17 @@ async fn fixed_rate_six_operations() {
     let tx_audit = tx_mode == "1";
     assert!(!tx_audit || sdk_audit);
     assert!(!stage_audit || stats_mode != "none");
+    let (repair_stop, repair_stop_rx) = tokio::sync::watch::channel(false);
+    let (repair_rows, repair_task, repair_start) = repair::prepare(
+        &url,
+        &env.cache[0],
+        &env.run_id,
+        warm + sample,
+        &dir,
+        &repair_mode,
+        repair_stop_rx,
+    )
+    .await;
     let mut server = if baseline == "B1" || stats_mode != "none" {
         let binary = std::env::var("DBPROXY_ACCEPTANCE_HOST_BINARY")
             .expect("B1 requires the explicitly built test host");
@@ -280,17 +291,7 @@ async fn fixed_rate_six_operations() {
             }
         );
     }
-    let (repair_stop, repair_stop_rx) = tokio::sync::watch::channel(false);
-    let (repair_rows, repair_task, repair_start) = repair::prepare(
-        &url,
-        &env.cache[0],
-        &env.run_id,
-        warm + sample,
-        &dir,
-        &repair_mode,
-        repair_stop_rx,
-    )
-    .await;
+    repair::verify_started(&url, &env.cache[0], &env.run_id, &dir, &repair_mode).await;
     let mut ledger = std::fs::File::create(dir.join("requests.jsonl")).unwrap();
     append(
         &mut ledger,
@@ -578,6 +579,11 @@ async fn fixed_rate_six_operations() {
         assert_eq!(repair_result["remaining"], 0);
         assert_eq!(repair_result["mismatches"], 0);
         assert_eq!(repair_result["untouched_mismatches"], 0);
+        assert_eq!(repair_result["queue_mismatches"], 0);
+        assert_eq!(
+            repair_result["final_queue"]["held"],
+            repair_result["not_injected"]
+        );
     }
 }
 

@@ -22,6 +22,7 @@ for(const [i,e] of entries.entries()){
   assert.deepEqual(m.mix,[40,20,20,10,5,5]);
   if(i)for(const key of ['warmup','sample','batch','payload_bytes','payload_rule','shards','read_connections','runtime_workers','repair_rows'])assert.equal(m[key],runs[0].analysis.manifest[key]);
   const repair=JSON.parse(fs.readFileSync(path.join(dir,'repair.json'),'utf8'));
+  if(i){assert.equal(repair.schema_version,runs[0].repair.schema_version);assert.equal(repair.baseline_scope,runs[0].repair.baseline_scope);}
   runs.push({...e,analysis:a,repair});
 }
 const median=x=>[...x].sort((a,b)=>a-b)[1];
