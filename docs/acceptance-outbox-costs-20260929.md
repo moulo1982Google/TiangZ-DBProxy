@@ -218,3 +218,5 @@ stgf六轮按r0 off/on、r1 off/on、r2 off/on，单事务与批量调用重叠�
 cb4049a接入现有ClientObserver::request_attempt_timed，不改生产SDK行为。MIX_SDK_AUDIT=1要求阶段采样同时开启；验收task-local保留最多两次回调，无锁/通道/文件IO或await，不以业务键作指标标签。每条response保存sdk_attempts，包含操作、endpoint、结果、queue_wait_us和exchange_us；种子写入在scope外不记录。严格分析要求每调用恰好一次成功回调、正确操作、endpoint0、非负整数、SDK总量不超过包围调用rpc_us；重试保留原始但不接受为普通无错误性能样本。六轮要求开关一致，历史未启用数据兼容。
 
 本地并发task-local隔离测试、Clippy、fmt、Node负例（缺回调、重复、错误操作、负耗时、超出调用、失败结果）、历史stgf兼容分析通过。确认220仅基础服务后上传三个文件并比对SHA256，新库sdks_0930a六轮2/5秒短测UTC09:27:22至09:28:55 exit0/OOMfalse，六次1 passed及结束标记；840请求、42真实消息核对零差异。全部原始已拉回，配对SMOKE_ONLY，六轮SDK_CALLBACKS_CHECKED及STAGE_INTERVALS_CHECKED。正式5秒样本的SDK queue最大18–52us仅是短测观测，不外推正式尾延迟。记录回调会增加少量开销，后续两组同开且与旧组分开报告。
+
+正式sdkf_0930a于UTC2026-09-30 09:29:47（北京时间17:29:47）启动，容器dbproxy-mixed-sdkf_0930a，预计UTC10:16附近结束。六轮新库120/300秒、20/s并发8四连接、off-on/on-off/off-on；两组SDK和服务阶段采样均启用。源码cb4049a，短测报告70ec7c9。环境文件sdkf_0930a.environment-before.txt；仅基础服务运行，资源限制不变。只读事件订阅已捕获本轮start，PID2357484，UTC10:34:47自动结束。运行中不改挂载源码或并行编译/负载；结束核对六轮完整业务/消息/SDK回调及阶段覆盖，再分析排队与exchange，不据启动或短测宣称性能通过。
