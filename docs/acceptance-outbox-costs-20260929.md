@@ -555,3 +555,15 @@ parallel_environment.mjs要求完整LF/五条记录/30秒内采集、真实资�
 事件订阅在启动前运行180秒，约20:33:56自然结束；当前回收仅自身start/die两条、stderr空，到期再拉完整窗口，不停止监听。结束后实际仍5基础服务，无编译/负载。工作区他人roadmap保留。
 
 此处首次验证真实PG阻塞触发原claim超时及双方unknown留档，范围严格为空outbox关系锁。不能据空表最终0推断有消息请求取消、已提交操作或ack未知，也不称全流程有界。正常性能入口的unknown拒绝不变，不重复该已过负例。下一步核对独立新库ack超时的证据设计：必须先获得真实租约，限定该库锁，保留超时后的PG最终状态与请求是否继续执行证据；不能把future取消当提交取消、不能重试未知ack。先本地严格正负例及释放边界验证再决定必要实测。正式九分布、P06高积压/P09容量及提交后未知继续保留，不升压。
+
+## P07 ack未知结果：核对契约与故障边界准备（仅本地）
+
+读取生产ack实现确认：ack执行单条UPDATE，只有event_id、owner、token匹配且lease_until仍有效才置published_at并清owner/until；claim仅增加lease_token，不增加attempt_count。因此新夹具显式预置attempt_count=0，领取后及最终仍要求0，不把它当领取次数。不能拿超时future被丢弃推断该UPDATE已取消。
+
+本阶段新增tools/ack_timeout_evidence.mjs与33严格负例，实际完成纯本地结果核对契约：独立p7at_库、两条不同partition记录、两个真实领取租约，要求事件/owner/publisher/key/token/PID唯一关联；原5秒两个ack均unknown；超时前与超时后释放前两次真实PG阻塞证明；超时后MVCC读仍完整保留原租约且未发布；确认rollback后两worker不再active，最终逐条published且owner/until清空、token和attempt_count不变。0重试、0额外claim、总行数恰好2。2秒阻塞证明、2秒释放及5秒释放后核对区间均验证。单合成正例和33错库/错token/超时不足/租约失效/提前发布/仍active/重复PID/释放失败等负例通过。没有Rust注入实现、没有上传或新库实测，不能报告真实ack覆盖。
+
+具体待实现协议采用本RunId库中两已领取行的SELECT ... FOR UPDATE行锁，避免ACCESS EXCLUSIVE关系锁连只读MVCC核对也阻塞。blocker设置lock_timeout2s、idle_in_transaction_session_timeout12s及Drop连接guard；租约用正常30秒，先独立领取再持锁。两ack复用原observed5秒并join，2秒内记录pg_stat_activity当前库/application/PID/Lock及pg_blocking_pids。双方unknown后、释放前再次核实仍被本blocker阻塞并SELECT读取未发布有效租约，随后无论核对成功与否先ROLLBACK释放，之后才断言。等待PG执行结束并核对最终发布；若驱动实际取消、租约失效或最终未发布，保留失败证据，不放宽为另一个通过结果。封存原始journal后重建上述契约，客户端outcome永远保留unknown。
+
+此方案验证“客户端超时后，已发送ack继续执行并最终发布”这一具体路径；即使通过，也不能称“PG提交完成后响应丢失”精确故障已覆盖。全流程连接/建库/文件IO仍没有统一硬期限。下一步实现独立ignored测试和封存账本适配、先Clippy/fmt及本地边界负例，再专用入口的新库实测；不改正常入口吞unknown、不重试未知ack、不升压。
+
+旧p7ct_0930a事件观察器已到期重拉，仅自身start/die两条、stderr空，无需再等待。实际docker ps仍5基础服务，无其他编译或验收进程；宿主非容器活动未排除。旧失败和正式九分布/P06高积压/P09容量缺口保持。
