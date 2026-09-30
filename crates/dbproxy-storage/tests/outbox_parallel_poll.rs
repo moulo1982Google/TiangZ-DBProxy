@@ -188,6 +188,7 @@ async fn two_workers_fixed_budget() {
     assert!(matches!(
         mode.as_str(),
         "ready"
+            | "spread-ready"
             | "none"
             | "all-blocked"
             | "leased"
@@ -228,7 +229,7 @@ async fn two_workers_fixed_budget() {
         };
         setup.register_route(&route).await.unwrap();
         // Two FIFO partitions per publisher; names deliberately shared across publishers.
-        sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms) SELECT $1::text||'-'||n,'parallel',$2,CASE WHEN $3 AND n<450 THEN 'blocked-key-' ELSE 'key-' END||(n%2),'',0 FROM generate_series(0,499) n ORDER BY n", &[&publisher, &route.key(), &mixed]).await.unwrap();
+        sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms) SELECT $1::text||'-'||n,'parallel',$2,CASE WHEN $3 AND n<450 THEN 'blocked-key-' ELSE 'key-' END||(CASE WHEN $4 THEN n ELSE n%2 END),'',0 FROM generate_series(0,499) n ORDER BY n", &[&publisher, &route.key(), &mixed, &(mode == "spread-ready")]).await.unwrap();
     }
     match mode.as_str() {
         "leased-heads" => {
@@ -259,7 +260,7 @@ async fn two_workers_fixed_budget() {
         }
         _ => {}
     }
-    journal.record(json!({"kind":"fixture","schema":if mixed {3} else {2},"mode":mode,"rows":1000,"claim_calls":28}));
+    journal.record(json!({"kind":"fixture","schema":if mode == "spread-ready" {4} else if mixed {3} else {2},"mode":mode,"rows":1000,"claim_calls":28}));
     distribution(&sql, &journal, &mode, "before").await;
     sql.batch_execute("ANALYZE dbproxy_outbox").await.unwrap();
     let first = PostgresSnapshotStore::connect_existing(&url)
@@ -336,10 +337,15 @@ async fn two_workers_fixed_budget() {
                 .unwrap()
                 .parse()
                 .unwrap();
-            assert!(key < 2);
-            let expected = &mut next[(wave % 2) as usize][key];
-            assert_eq!(lease.event.event_id, format!("{publisher}-{expected}"));
-            *expected += 2;
+            if mode == "spread-ready" {
+                assert!(key < 500);
+                assert_eq!(lease.event.event_id, format!("{publisher}-{key}"));
+            } else {
+                assert!(key < 2);
+                let expected = &mut next[(wave % 2) as usize][key];
+                assert_eq!(lease.event.event_id, format!("{publisher}-{expected}"));
+                *expected += 2;
+            }
             journal.record(json!({"kind":"lease","wave":wave,"worker":worker,"publisher":lease.publisher_id,"event":lease.event.event_id,"partition":lease.event.partition_key,"token":lease.lease_token,"destination":lease.destination}));
         }
         // No acknowledge starts until both claims returned. Next wave waits for both acknowledgements.
@@ -439,6 +445,19 @@ async fn distribution(sql: &tokio_postgres::Client, journal: &Journal, mode: &st
     );
     assert_eq!(counts[4], 0);
     journal.record(json!({"kind":"distribution","phase":phase,"total":counts[0],"future_leased":counts[1],"dead":counts[2],"future_available":counts[3],"owned":counts[4]}));
+    if mode == "spread-ready" {
+        for publisher in ["parallel-a", "parallel-b"] {
+            let row = sql.query_one("SELECT count(*),count(DISTINCT partition_key),count(*) FILTER(WHERE published_at IS NULL) FROM dbproxy_outbox WHERE event_id LIKE $1", &[&format!("{publisher}-%")]).await.unwrap();
+            let total: i64 = row.get(0);
+            let partitions: i64 = row.get(1);
+            let pending: i64 = row.get(2);
+            assert_eq!(
+                (total, partitions, pending),
+                (500, 500, if phase == "before" { 500 } else { 486 })
+            );
+            journal.record(json!({"kind":"spread","phase":phase,"publisher":publisher,"total":total,"partitions":partitions,"pending":pending}));
+        }
+    }
     if matches!(
         mode,
         "leased" | "backoff" | "leased-heads" | "backoff-heads" | "dead-heads"

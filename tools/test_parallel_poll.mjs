@@ -83,3 +83,28 @@ for(const mode of ['leased','backoff','leased-heads','backoff-heads','dead-heads
   ]) { const x=structuredClone(mixed);mutate(x);assert.throws(()=>analyze(encode(x))); }
 }
 console.log('mixed fixtures: five valid modes + 25 rejected mutations');
+const spreadBoundary=phase=>[
+  {kind:'distribution',phase,total:1000,future_leased:0,dead:0,future_available:0,owned:0},
+  ...['parallel-a','parallel-b'].map(publisher=>({kind:'spread',phase,publisher,total:500,partitions:500,pending:phase==='before'?500:486}))
+];
+const spread=[{kind:'fixture',schema:4,mode:'spread-ready',rows:1000,claim_calls:28},...spreadBoundary('before')];
+for(const r of structuredClone(rows)){
+  if(r.kind==='lease')r.partition='key-'+r.event.match(/\d+$/)[0];
+  if(r.kind==='result')spread.push(...spreadBoundary('after'));
+  spread.push(r);
+}
+assert.equal(analyze(encode(spread)).returned,28);
+const swapped=structuredClone(spread), leases=swapped.filter(v=>v.kind==='lease');
+for(let i=0;i<leases.length;i+=2){
+  [leases[i].event,leases[i+1].event]=[leases[i+1].event,leases[i].event];
+  [leases[i].partition,leases[i+1].partition]=[leases[i+1].partition,leases[i].partition];
+}
+assert.equal(analyze(encode(swapped)).returned,28);
+for(const mutate of [
+  x=>x.find(v=>v.kind==='spread').partitions=2,
+  x=>x.find(v=>v.kind==='spread'&&v.phase==='after').pending=0,
+  x=>x.find(v=>v.kind==='lease').partition='key-500',
+  x=>x.find(v=>v.kind==='lease').event='parallel-a-499',
+  x=>x.filter(v=>v.kind==='lease')[2].event='parallel-a-0',
+]){const x=structuredClone(spread);mutate(x);assert.throws(()=>analyze(encode(x)));}
+console.log('spread: two legal return orders + 5 rejected mutations');

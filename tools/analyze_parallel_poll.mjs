@@ -17,13 +17,14 @@ export function analyze(raw) {
   function distribution(phase) {
     assert.deepEqual(take('distribution'), {kind:'distribution',phase,total:1000,future_leased:mode==='none'?1000:mode==='leased'?900:mode==='leased-heads'?4:0,dead:['all-blocked','dead-heads'].includes(mode)?4:0,future_available:mode==='backoff'?900:mode==='backoff-heads'?4:0,owned:0});
     if(mixed) for(const publisher of ['parallel-a','parallel-b']) assert.deepEqual(take('reserve'),{kind:'reserve',phase,publisher,blocked:450,ready_pending:phase==='before'?50:36,blocked_published:0});
+    if(mode==='spread-ready') for(const publisher of ['parallel-a','parallel-b']) assert.deepEqual(take('spread'),{kind:'spread',phase,publisher,total:500,partitions:500,pending:phase==='before'?500:486});
   }
   if(versioned) {
     const f=take('fixture'); mode=f.mode;
-    assert(['ready','none','all-blocked','leased','backoff','leased-heads','backoff-heads','dead-heads'].includes(mode));
+    assert(['ready','spread-ready','none','all-blocked','leased','backoff','leased-heads','backoff-heads','dead-heads'].includes(mode));
     mixed=['leased','backoff','leased-heads','backoff-heads','dead-heads'].includes(mode);
     if(mixed) for(const n of next) {n[0]=450;n[1]=451;}
-    assert.equal(f.schema,mixed?3:2);assert.equal(f.rows,1000);assert.equal(f.claim_calls,28);
+    assert.equal(f.schema,mode==='spread-ready'?4:mixed?3:2);assert.equal(f.rows,1000);assert.equal(f.claim_calls,28);
     distribution('before');
   }
   for (let wave = 0; wave < 14; wave++) {
@@ -55,16 +56,23 @@ export function analyze(raw) {
     }
     const c = operations('claim');
     let a = c;
-    if(mode==='ready'||mixed) {
+    if(mode==='ready'||mode==='spread-ready'||mixed) {
     const keys = new Set();
     for (let worker = 0; worker < 2; worker++) {
       const l = take('lease'); assert.equal(l.wave, wave); assert.equal(l.worker, worker);
       assert.equal(l.publisher, publisher); assert.equal(l.destination, 'parallel-destination');
       uint(l.token); assert(l.token > 0);
-      assert(['key-0', 'key-1'].includes(l.partition)); assert(!keys.has(l.partition)); keys.add(l.partition);
+      assert(!keys.has(l.partition)); keys.add(l.partition);
+      if(mode==='spread-ready') {
+        assert(/^key-(0|[1-9][0-9]{0,2})$/.test(l.partition));
+        const key=Number(l.partition.slice(4));assert(key<500);
+        assert.equal(l.event,`${publisher}-${key}`);
+      } else {
+      assert(['key-0', 'key-1'].includes(l.partition));
       const key = Number(l.partition.slice(-1));
       assert.equal(l.event, `${publisher}-${next[wave % 2][key]}`);
       next[wave % 2][key] += 2;
+      }
       assert(!seen.has(l.event)); seen.add(l.event);
     }
     a = operations('ack', Math.max(...c.map(v => v.end_us)));
@@ -89,7 +97,7 @@ export function analyze(raw) {
   const result = take('result');
   assert.equal(result.status, 'SMOKE_ONLY'); assert.equal(result.waves,14);
   assert.equal(result.workers,2); assert.equal(result.publishers,2); assert.equal(result.rows,1000);
-  assert.equal(result.claims,mode==='ready'||mixed?28:0); assert.equal(result.stats,false);
+  assert.equal(result.claims,mode==='ready'||mode==='spread-ready'||mixed?28:0); assert.equal(result.stats,false);
   assert.equal(result.warmup_seconds,2); assert.equal(result.sample_seconds,5);
   assert(overlaps > 0); assert.equal(result.overlap_waves,overlaps); assert.equal(cursor,rows.length);
   return {status:'SMOKE_ONLY', validation:'PARALLEL_CLAIMS_CHECKED', mode, waves:14, claim_calls:28, returned:seen.size, formal_claim_calls:20, overlap_waves:overlaps, claims_timing:claims};
