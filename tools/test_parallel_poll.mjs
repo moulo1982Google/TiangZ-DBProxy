@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {analyze} from './analyze_parallel_poll.mjs';
+import {analyze,validateBudget} from './analyze_parallel_poll.mjs';
 import {createHash} from 'node:crypto';
 const versionedFixtures=[];
 const rows=[], seen=new Set(), next=[[0,1],[0,1]];
@@ -131,3 +131,54 @@ for(const fixture of versionedFixtures){
   }
 }
 console.log('schema5: nine distributions + 99 seal/configuration rejections');
+
+// Generate independent evidence fixtures with different row counts and durations.
+// This is offline analysis coverage, never a PostgreSQL performance result.
+function resized(source,total,warmup=2,sample=5) {
+  const mode=source[0].mode, mixed=['leased','backoff','leased-heads','backoff-heads','dead-heads'].includes(mode);
+  const waves=(warmup+sample)*2,calls=waves*2,per=total/2,blocked=mixed?total*9/20:0;
+  const empty=['none','all-blocked'].includes(mode), current=[], published=new Set();
+  current.push({...source[0],schema:6,rows:total,claim_calls:calls,warmup_seconds:warmup,sample_seconds:sample,workers:2,publishers:2,claims_per_second:4,stats:false,seal_required:true});
+  const boundary=phase=>source.filter(v=>['distribution','reserve','spread'].includes(v.kind)&&v.phase===phase).map(v=>{
+    const n={...v};
+    if(n.kind==='distribution') {n.total=total;if(n.future_leased>4)n.future_leased=mode==='none'?total:blocked*2;if(n.future_available>4)n.future_available=blocked*2;}
+    if(n.kind==='reserve'){n.blocked=blocked;n.ready_pending=per-blocked-(phase==='after'?calls/2:0);}
+    if(n.kind==='spread'){n.total=per;n.partitions=per;n.pending=per-(phase==='after'?calls/2:0);}
+    return n;
+  });
+  current.push(...boundary('before'));
+  for(let wave=0;wave<waves;wave++) {
+    const origin=wave%2,delta=(wave-origin)*500000;
+    for(const old of source.filter(v=>v.wave===origin)) {
+      const n={...old,wave};
+      for(const k of ['scheduled_us','dispatch_us','at_us','begin_us','end_us'])if(k in n)n[k]+=delta;
+      if(n.kind==='wave')n.sample=wave>=warmup*2;
+      if(n.kind==='lease'){
+        const index=blocked+Math.floor(wave/2)*2+n.worker;
+        n.event=`${n.publisher}-${index}`;published.add(n.event);
+        if(mode==='spread-ready')n.partition=`key-${index}`;
+      }
+      current.push(n);
+    }
+  }
+  for(const p of ['a','b'])for(let n=0;n<per;n++) {const event=`parallel-${p}-${n}`;current.push({kind:'final',event,published:published.has(event)});}
+  current.push(...boundary('after'),{...source.at(-1),status:sample===5?'SMOKE_ONLY':'BOUNDED_LEDGER_ONLY',rows:total,waves,claims:empty?0:calls,overlap_waves:waves,warmup_seconds:warmup,sample_seconds:sample});
+  return current;
+}
+for(const source of versionedFixtures) {
+  const current=resized(source,1040), raw=encode(current);
+  assert.equal(analyze(raw,sealOf(raw)).claim_calls,28);
+  for(const mutate of [
+    x=>x[0].rows=1000,
+    x=>x[0].rows=100000,
+    x=>x[0].warmup_seconds=120,
+    x=>x.find(v=>v.kind==='distribution').total=1000,
+    x=>x.find(v=>v.kind==='final').event='parallel-a-99999',
+    x=>x.splice(x.findIndex(v=>v.kind==='final'),1),
+  ]){const changed=structuredClone(current);mutate(changed);const bad=encode(changed);assert.throws(()=>analyze(bad,sealOf(bad)));}
+}
+const formal=resized(versionedFixtures.find(v=>v[0].mode==='leased-heads'),33600,120,300);
+const formalRaw=encode(formal), checked=analyze(formalRaw,sealOf(formalRaw));
+assert.equal(checked.status,'BOUNDED_LEDGER_ONLY');assert.equal(checked.claim_calls,1680);assert.equal(checked.formal_claim_calls,1200);
+console.log('schema6: nine resized distributions + 54 rejections; synthetic 33600-row/840-wave ledger checked (not database evidence)');
+for(const [w,s,n,m] of [[120,300,33560,true],[120,300,1000,false],[120,300,1000,true],[2,5,1001,false],[2,5,100000,true],[Number.MAX_SAFE_INTEGER,300,33600,true],[120,301,33600,true],[2,5,'1000',false]]) assert.throws(()=>validateBudget(w,s,n,m));

@@ -256,6 +256,18 @@ async fn two_workers_fixed_budget() {
             | "backoff-heads"
             | "dead-heads"
     ));
+    let budget = parallel_budget::validate(
+        warmup,
+        sample,
+        budget.rows,
+        matches!(
+            mode.as_str(),
+            "leased" | "backoff" | "leased-heads" | "backoff-heads" | "dead-heads"
+        ),
+    )
+    .unwrap();
+    let per_publisher = budget.rows / 2;
+    let blocked = per_publisher - budget.ready_per_publisher;
     let store = PostgresSnapshotStore::connect(&url).await.unwrap();
     let setup = store.outbox_queue();
     let (sql, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
@@ -288,7 +300,7 @@ async fn two_workers_fixed_budget() {
         };
         setup.register_route(&route).await.unwrap();
         // Two FIFO partitions per publisher; names deliberately shared across publishers.
-        sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms) SELECT $1::text||'-'||n,'parallel',$2,CASE WHEN $3 AND n<450 THEN 'blocked-key-' ELSE 'key-' END||(CASE WHEN $4 THEN n ELSE n%2 END),'',0 FROM generate_series(0,499) n ORDER BY n", &[&publisher, &route.key(), &mixed, &(mode == "spread-ready")]).await.unwrap();
+        sql.execute("INSERT INTO dbproxy_outbox(event_id,operation_id,topic,partition_key,payload,occurred_at_unix_ms) SELECT $1::text||'-'||n,'parallel',$2,CASE WHEN $3 AND n<$5 THEN 'blocked-key-' ELSE 'key-' END||(CASE WHEN $4 THEN n ELSE n%2 END),'',0 FROM generate_series(0,$6::bigint-1) n ORDER BY n", &[&publisher, &route.key(), &mixed, &(mode == "spread-ready"), &(blocked as i64), &(per_publisher as i64)]).await.unwrap();
     }
     match mode.as_str() {
         "leased-heads" => {
@@ -319,8 +331,8 @@ async fn two_workers_fixed_budget() {
         }
         _ => {}
     }
-    journal.record(json!({"kind":"fixture","schema":5,"mode":mode,"rows":budget.rows,"claim_calls":budget.calls,"warmup_seconds":warmup,"sample_seconds":sample,"workers":2,"publishers":2,"claims_per_second":4,"stats":false,"seal_required":true}));
-    distribution(&sql, &journal, &mode, "before").await;
+    journal.record(json!({"kind":"fixture","schema":6,"mode":mode,"rows":budget.rows,"claim_calls":budget.calls,"warmup_seconds":warmup,"sample_seconds":sample,"workers":2,"publishers":2,"claims_per_second":4,"stats":false,"seal_required":true}));
+    distribution(&sql, &journal, &mode, "before", &budget).await;
     sql.batch_execute("ANALYZE dbproxy_outbox").await.unwrap();
     let first = PostgresSnapshotStore::connect_existing(&url)
         .await
@@ -333,7 +345,7 @@ async fn two_workers_fixed_budget() {
     let start = Instant::now();
     let mut seen = HashSet::new();
     let mut next = if mixed {
-        [[450_u64, 451_u64]; 2]
+        [[blocked, blocked + 1]; 2]
     } else {
         [[0_u64, 1_u64]; 2]
     };
@@ -397,7 +409,7 @@ async fn two_workers_fixed_budget() {
                 .parse()
                 .unwrap();
             if mode == "spread-ready" {
-                assert!(key < 500);
+                assert!((key as u64) < per_publisher);
                 assert_eq!(lease.event.event_id, format!("{publisher}-{key}"));
             } else {
                 assert!(key < 2);
@@ -437,14 +449,14 @@ async fn two_workers_fixed_budget() {
         )
         .await
         .unwrap();
-    assert_eq!(rows.len(), 1000);
+    assert_eq!(rows.len() as u64, budget.rows);
     for row in rows {
         let event: String = row.get(0);
         let published: bool = row.get(1);
         assert_eq!(published, seen.contains(&event));
         journal.record(json!({"kind":"final","event":event,"published":published}));
     }
-    distribution(&sql, &journal, &mode, "after").await;
+    distribution(&sql, &journal, &mode, "after", &budget).await;
     // Actual overlap is checked using operation boundaries, not join!/barrier presence.
     let raw = std::fs::read_to_string(output.join("journal.jsonl")).unwrap();
     let values: Vec<Value> = raw
@@ -469,20 +481,35 @@ async fn two_workers_fixed_budget() {
         }
     }
     assert!(overlaps > 0, "no observed concurrent claim intervals");
-    journal.record(json!({"kind":"result","status":"SMOKE_ONLY","workers":2,"publishers":2,"rows":1000,"waves":waves,"claims":seen.len(),"overlap_waves":overlaps,"warmup_seconds":warmup,"sample_seconds":sample,"stats":false}));
+    journal.record(json!({"kind":"result","status":"SMOKE_ONLY","workers":2,"publishers":2,"rows":budget.rows,"waves":waves,"claims":seen.len(),"overlap_waves":overlaps,"warmup_seconds":warmup,"sample_seconds":sample,"stats":false}));
     journal.seal(&output);
     connection.abort();
 }
 
-async fn distribution(sql: &tokio_postgres::Client, journal: &Journal, mode: &str, phase: &str) {
+async fn distribution(
+    sql: &tokio_postgres::Client,
+    journal: &Journal,
+    mode: &str,
+    phase: &str,
+    budget: &parallel_budget::Budget,
+) {
     let row = sql.query_one("SELECT count(*), count(*) FILTER(WHERE lease_until>statement_timestamp()), count(*) FILTER(WHERE dead_lettered_at IS NOT NULL), count(*) FILTER(WHERE available_at>statement_timestamp()), count(*) FILTER(WHERE lease_owner IS NOT NULL) FROM dbproxy_outbox", &[]).await.unwrap();
     let counts: Vec<i64> = (0..5).map(|i| row.get(i)).collect();
-    assert_eq!(counts[0], 1000);
+    let total = budget.rows as i64;
+    let per_publisher = total / 2;
+    let ready = budget.ready_per_publisher as i64;
+    let blocked = per_publisher - ready;
+    let consumed = if phase == "before" {
+        0
+    } else {
+        budget.calls as i64 / 2
+    };
+    assert_eq!(counts[0], total);
     assert_eq!(
         counts[1],
         match mode {
-            "none" => 1000,
-            "leased" => 900,
+            "none" => total,
+            "leased" => blocked * 2,
             "leased-heads" => 4,
             _ => 0,
         }
@@ -498,7 +525,7 @@ async fn distribution(sql: &tokio_postgres::Client, journal: &Journal, mode: &st
     assert_eq!(
         counts[3],
         match mode {
-            "backoff" => 900,
+            "backoff" => blocked * 2,
             "backoff-heads" => 4,
             _ => 0,
         }
@@ -513,7 +540,7 @@ async fn distribution(sql: &tokio_postgres::Client, journal: &Journal, mode: &st
             let pending: i64 = row.get(2);
             assert_eq!(
                 (total, partitions, pending),
-                (500, 500, if phase == "before" { 500 } else { 486 })
+                (per_publisher, per_publisher, per_publisher - consumed)
             );
             journal.record(json!({"kind":"spread","phase":phase,"publisher":publisher,"total":total,"partitions":partitions,"pending":pending}));
         }
@@ -527,8 +554,8 @@ async fn distribution(sql: &tokio_postgres::Client, journal: &Journal, mode: &st
             let blocked: i64 = row.get(0);
             let ready_pending: i64 = row.get(1);
             let blocked_published: i64 = row.get(2);
-            assert_eq!(blocked, 450);
-            assert_eq!(ready_pending, if phase == "before" { 50 } else { 36 });
+            assert_eq!(blocked, per_publisher - ready);
+            assert_eq!(ready_pending, ready - consumed);
             assert_eq!(blocked_published, 0);
             journal.record(json!({"kind":"reserve","phase":phase,"publisher":publisher,"blocked":blocked,"ready_pending":ready_pending,"blocked_published":blocked_published}));
         }
