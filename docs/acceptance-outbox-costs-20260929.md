@@ -388,3 +388,13 @@ rhdf_0930a事件观察器到期后已重拉完整文件：仍仅该工作台star
 在990530d基础上把100ms调度判定提取为WaveGuard，保持阈值；一旦拒绝即保持停止，后续即使时隙恢复也不会重新领取。新增三个异步本地测试：100ms精确边界接受/150ms实际等待后拒绝/后续不恢复；claim与ack各模拟两个永久pending，实际走原5秒期限并保存双方started与unknown；一worker立即错误时，另一worker延迟完成仍保存completed，证明join不会因首个错误取消同波另一项。共3 passed，真实数据库短测仍ignored，没有启动或重复远端负载。这是future模拟，不代表真实PG已提交后断连或超时故障已覆盖；文件同步IO和预置也未取得硬期限，不称全流程有界。
 
 严格分析器补充ack的started不得早于双方claim结束。Node正夹具与18个负例通过，新增guard记录、ack unknown、缺另一worker完成、过早ack started、错误时间类型、零实际重叠、缺结果等。原p7ps_0930a原始账本用新分析器复查通过；原始未改。目标Clippy -D warnings、fmt通过。此次仅本地工具验证，未上传新源码，不据此声称九分布/正式性能或真实超时完成；下一步实际扩展小数据分布夹具与空领取账本，优先leased/backoff及none/all-blocked，再覆盖头阻塞，保持两worker总4次/s、各场景新库、不升压。
+
+## P07 空领取两分布短测（工具eab6aea）
+
+新增schema2 fixture及before/after分布计数，显式区分claim_calls与返回事件数；空结果单独记录empty且禁止生成ack，仍严格检查双方实际调用区间、publisher、14波时序及1000行最终PG。none将1000行lease_until置一天后；all-blocked只将两publisher各两分区的头（共4行）置死信，996后继保持非死信。没有删数据或停worker，不改生产SQL。分布起止严格要求租约/死信/未来available/owner计数符合夹具；这只是边界快照，不冒充全窗口连续分布采样。目标Clippy/fmt通过，原18负例加两种空场景正例及12负例通过。两上传文件SHA256一致。
+
+p7none_0930a新库UTC17:12:58.752至17:13:14.357，p7block_0930a新库UTC17:13:35.997至17:13:51.791，均exit0/OOMfalse、1 passed/P07_PARALLEL_SMOKE_COMPLETED。每个1000行、2/5秒、两worker共4调用/s，无stats；每场景14波均实际重叠、28调用全部空（短采样20调用）、0ack、0published，最终1000行一致。none起止1000future_leased；all-blocked起止4dead；其他未来available/owner均0。严格PARALLEL_CLAIMS_CHECKED/SMOKE_ONLY，原始目录及容器/镜像/源码/日志/资源均已回收至target/server_20260929。
+
+实际启动前、两场景之间、结束后只有5基础服务；启动前进程检索无其他编译/验收。两场景各2条资源样本、单观察区间，PG max/oom/oom_kill及scan/steal增量0，不能排除未采样峰值、不解除既有回收导致的不升压边界。连续只读Docker事件订阅在第一场景前启动，timeout180秒自然结束（约UTC17:15:58）；截至收集只含本次两个容器start/die共4条、stderr空。到期后补拉完整文件，不停止观察器，非容器活动未排除。
+
+不重复这两个正常短测。下一步实现leased/backoff的多数受阻行加独立可领取FIFO分区（防耗尽、起止分布计数），随后补头租约/退避/死信混合和dense-ready；仍新库、小数据、总4调用/s，先严格本地正负例再短测。当前九分布及多worker正式性能尚未完成，真实超时故障仍未覆盖，原失败和P06/P09缺口保留。
