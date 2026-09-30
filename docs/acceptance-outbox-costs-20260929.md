@@ -398,3 +398,13 @@ p7none_0930a新库UTC17:12:58.752至17:13:14.357，p7block_0930a新库UTC17:13:3
 实际启动前、两场景之间、结束后只有5基础服务；启动前进程检索无其他编译/验收。两场景各2条资源样本、单观察区间，PG max/oom/oom_kill及scan/steal增量0，不能排除未采样峰值、不解除既有回收导致的不升压边界。连续只读Docker事件订阅在第一场景前启动，timeout180秒自然结束（约UTC17:15:58）；截至收集只含本次两个容器start/die共4条、stderr空。到期后补拉完整文件，不停止观察器，非容器活动未排除。
 
 不重复这两个正常短测。下一步实现leased/backoff的多数受阻行加独立可领取FIFO分区（防耗尽、起止分布计数），随后补头租约/退避/死信混合和dense-ready；仍新库、小数据、总4调用/s，先严格本地正负例再短测。当前九分布及多worker正式性能尚未完成，真实超时故障仍未覆盖，原失败和P06/P09缺口保留。
+
+## P07 leased/backoff 混合分布短测及预置失败
+
+工具68860a4先实现900受阻行、100独立可领取行（每publisher450/50），schema3增加每publisher起止reserve，完整FIFO与最终PG核对。首轮p7lease_0930a UTC17:27:34.270至17:27:42.669，exit101/OOMfalse：预置UPDATE partition_key触发生产dbproxy_reject_outbox_content_mutation拒绝，尚未发负载。失败新库、原始日志完整保留；只有1条资源样本，资源分析器拒绝need at least two samples，不给该轮区间压力结论。
+
+b89072c将分区直接确定在INSERT，保留生产不可变触发器，未绕过或修改生产约束；仅之后设置可变lease_until/available_at。源码上传SHA256 b17338c126427578a9e3f36f2d2f360ec2c88e17db0c60855d0b0122a1695a87远端一致。目标Clippy/fmt、旧18+空12+混合10分析负例及各正例通过。修正后新库p7lease_0930b UTC17:28:25.752至17:28:41.716，p7back_0930a UTC17:29:00.094至17:29:16.052，均exit0/OOMfalse、1 passed/结束标记。各1000行、2/5秒、两worker总4调用/s，无stats；14波全部实际区间重叠、28次唯一领取及确认（短采样20），最终1000PG行一致。
+
+leased起止900future_leased，backoff起止900future_available；受阻发布0，owner0，各publisher独立可领取余量50→36。防耗尽与publisher/FIFO/最终28published严格通过，PARALLEL_CLAIMS_CHECKED/SMOKE_ONLY；边界快照不代表连续分布采样，不是九分布正式性能。全部三轮原始已回收target/server_20260929。成功两轮各2资源样本、单区间PG max/oom0，scan/steal分别7843和14262，有回收不升压，不排除未采样峰值。
+
+前中后实际均仅5基础服务；连续事件p7mixed_0930a.events在首失败轮前启动、timeout180秒约17:30:34自然退出，收集时保留本组容器事件，需到期后补拉，不停止。上一p7empty事件窗口到期后已重拉仍4条自身start/die，stderr空。非容器活动不排除。下一步补小数据leased-heads/backoff-heads/dead-heads及明确dense-ready与分散ready差别，继续新库/有界预算/严格账本，不重复这两正常短测。保留首轮失败，真实数据库超时、多worker正式性能、P06高积压/P09容量仍缺。
