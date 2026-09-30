@@ -113,3 +113,15 @@ rpairf_0930c 于 UTC2026-09-30 02:22:12 exit=0/OOM=false，六次1 passed及结�
 结论限定为20业务请求/秒、2修复目标/秒、实验30分钟TTL：正确性与完整计时对照通过，扩展复核未观察到稳定超过20%参考线的性能退化；原单对波动保留，不能承诺每轮变化均小于20%。不再无止境重复此低速矩阵，继续P07应用影响，P06高积压/容量范围仍未覆盖。合并数值保存于target/server_20260929/repair_pairs_bc_combined.json。
 
 追加270份资源记录中，主机可用内存最低35.29GiB，PG峰7.995GiB。相邻同cgroup的max事件增量1316、oom增量0，pgscan/pgsteal增量269440/268201，内存full PSI区间峰0.12743%。这些是区间实测增量，表明确有触限回收；不能把时序不同的回收直接归因于某类请求。保持不升压、不增加限额，不声称已找到容量上限。
+
+## P06注入停止前置与rgs_0930a短测
+
+工具d34ca03仅修改验收驱动。业务guard触发即发送watch停止信号；修复生成器等待下一500ms时隙时可被唤醒，停止后不再领取新项。已经通过领取检查的单项允许完成，不在enqueue中途取消，避免把可能提交的注入当未发送。停止后保持30秒队列排空窗口，pending查询各5秒超时；超时令工具失败、保留不完整证据，不算排空成功。enqueue本身及最终逐项核对尚未加统一总期限，不能据此声称所有故障下全流程有界。
+
+repair.json schema2记录admitted、not_injected、stopped、untouched_mismatches。顺序observations对应已领取前缀；未注入后缀必须仍等于注入前缓存快照，已领取项必须匹配PG权威快照（control组本来已同步）。targets仍是全部预置记录数，保留PG行数核对。guard发生而修复任务已完成时允许stopped=false且全项完成；观察到停止必须有业务guard。业务guard原本导致拒绝负载的断言没有放宽。
+
+本地异步测试覆盖首项正常领取、停止后拒绝继续、等待远期时隙被停止立即唤醒；Clippy -D warnings和fmt通过。历史schema兼容通过，schema2复制夹具正例及计数/停止标记/未注入项差异负例通过。两上传源码SHA256核对一致。
+
+rgs_0930a新库六轮2/5秒（control/repair、repair/control、control/repair）UTC2026-09-30 13:58:44至14:00:26，exit0/OOMfalse，六次1 passed与REPAIR_PAIRS_COMPLETED，原始六目录及rgs_0930a.*已拉回。840业务请求零错误/未发送/核对差异，每轮14个领取项、not_injected=0、remaining=0、mismatches=0、untouched_mismatches=0，三修复组共42条真实修复注入；六轮SMOKE_ONLY。无guard触发，此实测只验证schema2正常路径，不验证真实停止路径、不作性能结论。
+
+下一步补新库低速、确定性触发业务guard的独立负例，核对停止后的已领取前缀/未注入后缀、保留预期REJECTED_LOAD并验证部分修复完成；先完善已开始注入及核对超时的未知结果留档，避免取消后误判未注入。不能直接开展高积压故障、重复正式低速矩阵或解除升压边界。当前只有5基础服务，无验收负载；生产源码未改，旧性能/证据失败仍保留。
