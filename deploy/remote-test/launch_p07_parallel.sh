@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P07 two-worker smoke; formal timing/stats remain disabled pending evidence tooling.
+# P07 two-worker smoke; formal timing remains disabled pending resource evidence.
 set -euo pipefail
 source "$(dirname "$0")/p07_parallel_preflight.sh"
 RUN_ID=${1:?new run id required}
@@ -33,6 +33,12 @@ docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cp
 docker exec "$WB" sha256sum /src/crates/dbproxy-storage/tests/outbox_parallel_poll.rs \
     /src/crates/dbproxy-storage/tests/parallel_budget/mod.rs \
     /src/deploy/remote-test/p07_parallel_preflight.sh \
+    /src/deploy/remote-test/run_p07_parallel.sh \
+    /src/deploy/remote-test/launch_p07_parallel.sh \
+    /src/deploy/remote-test/common.sh \
+    /src/deploy/remote-test/sample_containers.sh \
+    /src/crates/dbproxy-storage/src/outbox.rs \
+    /src/crates/dbproxy-storage/src/outbox_stats.sql \
     /src/crates/dbproxy-storage/src/outbox_claim.sql >"$DATA/evidence/$RUN_ID.sources.sha256"
 docker image inspect "$IMAGE" >"$DATA/evidence/$RUN_ID.image.json"
 bash "$DATA/src/deploy/remote-test/sample_containers.sh" "$DATA/evidence/$RUN_ID.containers.jsonl" "$WB" 10 >/dev/null 2>&1 &

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {analyze,validateBudget} from './analyze_parallel_poll.mjs';
 import {createHash} from 'node:crypto';
 const versionedFixtures=[];
+export const phaseFixtures=[];
 const rows=[], seen=new Set(), next=[[0,1],[0,1]];
 for(let wave=0;wave<14;wave++) {
   const t=wave*500000, publisher=`parallel-${wave%2?'b':'a'}`;
@@ -205,6 +206,7 @@ for(const source of versionedFixtures)for(const enabled of [false,true]){
       }
     }
     const newRaw=encode(newer);assert.equal(analyze(newRaw,sealOf(newRaw)).stats_phase,phase);
+    phaseFixtures.push(newer);
     for(const mutate of [x=>x[0].stats_phase=2,x=>x[0].stats_phase=1-phase,x=>x.find(v=>v.kind==='stats_slot').scheduled_us+=500000]){const bad=structuredClone(newer);mutate(bad);const text=encode(bad);assert.throws(()=>analyze(text,sealOf(text)));}
   }
   for(const mutate of [
