@@ -59,3 +59,5 @@ RunId `p06_0929a`，三项测试各用新库 `_distribution/_order/_half`，全�
 run_repair_pairs.sh 固定正式 B2、20 业务请求/秒、并发8、四SDK连接，以 control→repair、repair→control、control→repair 组织六个新库；任一失败即停。MIX_SUITE=repair 由现有受限工作台启动，默认120秒预热300秒采样。analyze_repair_pairs.mjs 逐轮调用完整账本分析器，核对模式、轮次和相同配置，输出六类三轮P99、绝对变化和20%参考线、修复队列峰值与最终核对。完整矩阵标记不等于性能回归通过，2条修复/秒不等于积压处理容量。
 
 首个组织短测 rpairs_0930a 在真正测试前因子RunId后缀过长被拒绝，exit=2，原始容器和顺序记录保留并拉回；没有修改标识符校验。后缀改为c/r，前缀长度同步限制，新编号 rpairs_0930b 六轮短测通过：各140业务请求、14夹具记录，实际六次1 passed，exit=0/OOM=false，业务与缓存核对均零差异，原始已拉回，汇总SMOKE_ONLY。分析器对首轮不完整的一条顺序记录正确拒绝。
+
+正式 rpairf_0930a 于 UTC2026-09-30 00:23:02 启动，容器 dbproxy-mixed-rpairf_0930a，固定20业务请求/秒、2修复目标/秒、并发8，control/repair三对交替，各120秒预热300秒采样。每轮正常8400业务请求、840夹具记录，六轮预计约45分钟含准备/核对。证据 repair_pairs_rpairf_0930a/order.jsonl、fault_process_rpairf_0930a_r{0,1,2}_{c,r}/mixed-paced 与同级 rpairf_0930a.*。运行中只读，不改挂载源码或并行其他服务器验收。短测8份连续采样中的PG max/oom事件增量与内存full PSI增量均零；仅作允许维持低速的短区间依据，不用于支持升压。
