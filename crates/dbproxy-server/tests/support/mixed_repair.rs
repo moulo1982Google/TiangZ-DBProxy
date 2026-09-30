@@ -56,9 +56,40 @@ pub(super) async fn prepare(
                 .await
                 .unwrap();
         }
-        initial_cache.push(cache.get(&w.record).await.unwrap());
+
         records.push(w.record);
     }
+    // Automatic repair created by save must finish before explicit re-enqueue tests.
+    // This fixture has CURRENT caches; it does not measure stale-cache recovery.
+    let pg = sql(url).await;
+    let baseline_path = evidence.join("repair-baseline.jsonl");
+    let mut baseline = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(baseline_path)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let pending: i64 = pg.query_one("SELECT count(*) FROM dbproxy_cache_repairs WHERE namespace=$1", &[&namespace]).await.unwrap().get(0);
+            append(&mut baseline, &json!({"kind":"preparation_queue","pending":pending}));
+            baseline.sync_data().unwrap();
+            if pending == 0 { break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for (n, record) in records.iter().enumerate() {
+            let authoritative = store.load(record).await.unwrap().unwrap();
+            let actual = cache.get(record).await.unwrap();
+            let matches = actual.as_ref() == Some(&authoritative);
+            append(&mut baseline, &json!({"kind":"cache_baseline","n":n,"revision":authoritative.revision.0,"matches":matches}));
+            baseline.sync_data().unwrap();
+            assert!(matches, "automatic repair did not establish current cache");
+            initial_cache.push(actual);
+        }
+        let pending: i64 = pg.query_one("SELECT count(*) FROM dbproxy_cache_repairs WHERE namespace=$1", &[&namespace]).await.unwrap().get(0);
+        append(&mut baseline, &json!({"kind":"baseline_ready","pending":pending,"targets":count,"scope":"current_cache_reenqueue"}));
+        baseline.sync_data().unwrap();
+        assert_eq!(pending,0);
+    }).await.expect("repair baseline preparation timed out; retain evidence");
     let journal_path = evidence.join("repair-operations.jsonl");
     let mut journal = std::fs::OpenOptions::new()
         .write(true)
@@ -66,7 +97,6 @@ pub(super) async fn prepare(
         .open(journal_path)
         .unwrap();
     let mode = mode.to_string();
-    let pg = sql(url).await;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         rx.await.unwrap();
@@ -149,7 +179,7 @@ pub(super) async fn prepare(
                 untouched_mismatches += u64::from(actual != initial_cache[n]);
             }
         }
-        json!({"schema_version":2,"admitted":admitted,"not_injected":count-admitted as u64,"stopped":stopped,"untouched_mismatches":untouched_mismatches,"mode":mode,"targets":count,"remaining":remaining,"mismatches":mismatches,"seconds":started.elapsed().as_secs_f64(),"observations":observations})
+        json!({"baseline_scope":"current_cache_reenqueue","schema_version":2,"admitted":admitted,"not_injected":count-admitted as u64,"stopped":stopped,"untouched_mismatches":untouched_mismatches,"mode":mode,"targets":count,"remaining":remaining,"mismatches":mismatches,"seconds":started.elapsed().as_secs_f64(),"observations":observations})
     });
     (count, Some(task), Some(tx))
 }

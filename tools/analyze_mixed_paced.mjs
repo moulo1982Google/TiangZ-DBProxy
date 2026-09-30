@@ -37,6 +37,14 @@ if(m.repair_mode && m.repair_mode!=='none') {
     assert.equal(repair.untouched_mismatches,0);
     if(!repair.stopped)assert.equal(repair.admitted,repair.targets);
   }else assert.equal(repair.observations.length,repair.targets);
+  if(repair.baseline_scope){
+    assert.equal(repair.baseline_scope,'current_cache_reenqueue');
+    const baseline=read('repair-baseline.jsonl').trim().split(/\r?\n/).map(JSON.parse);
+    const caches=baseline.filter(x=>x.kind==='cache_baseline');assert.equal(caches.length,repair.targets);
+    caches.forEach((x,n)=>{assert.equal(x.n,n);assert.equal(x.revision,2);assert.equal(x.matches,true);});
+    assert.deepEqual(baseline.at(-1),{kind:'baseline_ready',pending:0,targets:repair.targets,scope:'current_cache_reenqueue'});
+    const queue=baseline.filter(x=>x.kind==='preparation_queue');assert(queue.length);assert.equal(queue.at(-1).pending,0);
+  }
   if(m.repair_journal){
     const journal=read('repair-operations.jsonl');assert(journal.endsWith('\n'));
     const entries=journal.trim().split(/\r?\n/).map(JSON.parse);
