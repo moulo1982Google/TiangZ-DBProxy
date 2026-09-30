@@ -259,3 +259,7 @@ bd4e016新增显式acceptance-trace Cargo特性，默认构建不含此代码。
 analyze_mixed_transaction.mjs严格核对一调用一日志、摘要唯一匹配、schema、合法时间边界、trace总量不超过对应rpc_us，PG连接等待/PG处理/PG写入/commit/提交后cache同步均恰好一次。保存每请求SDK、RPC和存储阶段于transaction-analysis.json，只汇总正式样本。嵌套阶段不相加，PG处理仍含ensure_connected和SQL，commit单独记录；不假称已测SQL内部锁等待。缺失/重复/错摘要/越界/缺阶段负例、本地阶段测试、默认及特性Clippy、fmt、shell/Node语法、sdkf历史兼容通过。
 
 上传storage源码目录、两个Cargo清单及相关server/driver/scripts，以29文件SHA256逐一校验一致（校验清单最初因Windows CRLF路径尾部被拒绝，移除清单行尾CR后全通过，源码未修改）。新库txs_0930a六轮2/5秒UTC10:45:02至10:47:14 exit0/OOMfalse、六次1 passed和结束标记，840请求42真实同键消息零差异。原始全部拉回，SMOKE_ONLY、六轮TRANSACTION_TRACES_CHECKED/SDK_CALLBACKS_CHECKED/STAGE_INTERVALS_CHECKED，每轮7条单事务trace含5条正式样本，合计42条完整关联。该短测用于确认工具，不作为性能结论。
+
+正式txf_0930a于UTC2026-09-30 10:48:48启动，容器dbproxy-mixed-txf_0930a，预计UTC11:35附近（北京时间19:35）结束，以实际状态为准。六轮新库120/300秒，20业务/s、并发8、四连接，off/on、on/off、off/on；双方同时启用MIX_TX_AUDIT、MIX_SDK_AUDIT、MIX_STAGE_AUDIT。代码bd4e016、短测报告a46d10b；每轮预期8400请求6000正式样本420真实消息，420条单事务trace含300正式样本。保持原资源限制，运行中不改挂载源码或并行编译/负载。
+
+启动前仅基础服务，环境证据txf_0930a.environment-before.txt已保存。连续只读Docker事件订阅PID2541266覆盖UTC10:48:48至11:53:48，已捕获本轮start；结束须核对start/die、stderr及窗口内其他容器活动，不排除宿主非容器负载。原始目录outbox_pairs_txf_0930a、fault_process_txf_0930a_r{0,1,2}_{off,on}及txf_0930a.*。结束拉回后要求配对、SDK、阶段和逐事务关联全部核验，再报告同一慢调用的PG等待/处理/commit/缓存阶段；嵌套计时不相加，原性能失败保留，本轮尚无性能结论。
