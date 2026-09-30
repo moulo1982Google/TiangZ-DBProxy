@@ -13,6 +13,24 @@ impl Journal {
     }
 }
 
+#[derive(Default)]
+struct WaveGuard {
+    stopped: bool,
+}
+impl WaveGuard {
+    fn admit(&mut self, journal: &Journal, wave: u64, scheduled: u64, dispatch: u64) -> bool {
+        if self.stopped {
+            return false;
+        }
+        if dispatch.saturating_sub(scheduled) > 100_000 {
+            self.stopped = true;
+            journal.record(json!({"kind":"guard","wave":wave,"reason":"dispatch_lag"}));
+            return false;
+        }
+        true
+    }
+}
+
 // A timeout can follow a committed database operation. Preserve unknown, fail,
 // and never retry it or silently turn it into an empty claim.
 async fn observed<T, E: std::fmt::Debug>(
@@ -36,6 +54,117 @@ async fn observed<T, E: std::fmt::Debug>(
     result
         .map_err(|_| "unknown operation timeout; journal retained")?
         .map_err(|_| "unknown operation error; journal retained")
+}
+
+fn local_journal(name: &str) -> (Journal, std::path::PathBuf) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/parallel-local-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}-{}-{nonce}.jsonl", std::process::id()));
+    let file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    (Journal(Mutex::new(file)), path)
+}
+
+fn journal_rows(path: &std::path::Path) -> Vec<Value> {
+    let raw = std::fs::read_to_string(path).unwrap();
+    assert!(raw.ends_with('\n'));
+    raw.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn guard_rejects_late_wave_and_remains_stopped() {
+    let (journal, path) = local_journal("guard");
+    let mut guard = WaveGuard::default();
+    assert!(guard.admit(&journal, 0, 0, 100_000)); // Exact original boundary.
+    let start = Instant::now();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!guard.admit(&journal, 1, 0, start.elapsed().as_micros() as u64));
+    assert!(!guard.admit(&journal, 2, 500_000, 500_000)); // No recovery/retry.
+    let rows = journal_rows(&path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["kind"], "guard");
+    assert_eq!(rows[0]["wave"], 1);
+}
+
+#[tokio::test]
+async fn both_unknown_timeouts_are_retained_before_rejection() {
+    for operation in ["claim", "ack"] {
+        let (journal, path) = local_journal(operation);
+        let start = Instant::now();
+        let (first, second) = tokio::join!(
+            observed(
+                &journal,
+                start,
+                0,
+                0,
+                operation,
+                std::future::pending::<Result<(), ()>>()
+            ),
+            observed(
+                &journal,
+                start,
+                0,
+                1,
+                operation,
+                std::future::pending::<Result<(), ()>>()
+            )
+        );
+        assert!(first.is_err() && second.is_err());
+        assert!(start.elapsed() >= Duration::from_secs(5));
+        let rows = journal_rows(&path);
+        assert_eq!(rows.len(), 4);
+        for worker in [0, 1] {
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r["worker"] == worker && r["kind"] == "started")
+                    .count(),
+                1
+            );
+            let result = rows
+                .iter()
+                .find(|r| r["worker"] == worker && r["kind"] == "operation")
+                .unwrap();
+            assert_eq!(result["outcome"], "unknown");
+            assert_eq!(result["operation"], operation);
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_worker_does_not_cancel_delayed_peer() {
+    let (journal, path) = local_journal("peer");
+    let start = Instant::now();
+    let (first, second) = tokio::join!(
+        observed(&journal, start, 0, 0, "claim", async {
+            Err::<(), _>("simulated error")
+        }),
+        observed(&journal, start, 0, 1, "claim", async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<_, ()>(42)
+        })
+    );
+    assert!(first.is_err());
+    assert_eq!(second.unwrap(), 42);
+    let rows = journal_rows(&path);
+    assert_eq!(rows.len(), 4);
+    assert!(
+        rows.iter()
+            .any(|v| v["worker"] == 0 && v["outcome"] == "unknown")
+    );
+    assert!(
+        rows.iter()
+            .any(|v| v["worker"] == 1 && v["outcome"] == "completed")
+    );
 }
 
 #[tokio::test]
@@ -98,13 +227,13 @@ async fn two_workers_fixed_budget() {
     let mut seen = HashSet::new();
     let mut next = [[0_u64, 1_u64]; 2];
     let mut overlaps = 0;
+    let mut guard = WaveGuard::default();
     for wave in 0..waves {
         let scheduled = wave * 500_000;
         sleep_until(start + Duration::from_micros(scheduled)).await;
         let dispatch = start.elapsed().as_micros() as u64;
         journal.record(json!({"kind":"wave","wave":wave,"scheduled_us":scheduled,"dispatch_us":dispatch,"publisher":publishers[(wave%2) as usize],"sample":wave>=warmup*2}));
-        if dispatch.saturating_sub(scheduled) > 100_000 {
-            journal.record(json!({"kind":"guard","wave":wave,"reason":"dispatch_lag"}));
+        if !guard.admit(&journal, wave, scheduled, dispatch) {
             panic!("guard stopped new wave; evidence retained");
         }
         let publisher = publishers[(wave % 2) as usize];

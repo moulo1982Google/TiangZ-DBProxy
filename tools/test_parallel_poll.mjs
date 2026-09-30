@@ -29,7 +29,14 @@ const mutations=[
   x=>x.find(v=>v.kind==='operation'&&v.operation==='ack').begin_us=1,
   x=>x.find(v=>v.kind==='wave').dispatch_us=100001,
   x=>x.at(-1).overlap_waves=0,
+  x=>x.splice(1,0,{kind:'guard',wave:0,reason:'dispatch_lag'}),
+  x=>x.find(v=>v.kind==='operation'&&v.operation==='ack').outcome='unknown',
+  x=>x.splice(x.findIndex(v=>v.kind==='operation'&&v.operation==='ack'&&v.worker===1),1),
+  x=>x.find(v=>v.kind==='started'&&v.operation==='ack').at_us=1,
+  x=>x.find(v=>v.kind==='operation').end_us='100',
+  x=>{for(const v of x) if(v.kind==='operation'&&v.operation==='claim'&&v.worker===1) v.begin_us=v.end_us; x.at(-1).overlap_waves=0;},
+  x=>x.pop(),
 ];
 for(const mutate of mutations){const x=structuredClone(rows);mutate(x);assert.throws(()=>analyze(encode(x)));}
 assert.throws(()=>analyze(encode(rows).trimEnd()));
-console.log('parallel ledger: valid fixture + 11 rejected mutations');
+console.log(`parallel ledger: valid fixture + ${mutations.length+1} rejected mutations`);

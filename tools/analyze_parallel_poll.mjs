@@ -18,7 +18,7 @@ export function analyze(raw) {
     uint(w.dispatch_us);
     assert(w.dispatch_us >= Math.max(w.scheduled_us, previousEnd));
     assert(w.dispatch_us - w.scheduled_us <= 100000, 'load guard');
-    function operations(operation) {
+    function operations(operation, earliest = w.dispatch_us) {
       const started = new Map(), completed = new Map();
       for (let i = 0; i < 4; i++) {
         const v = rows[cursor++];
@@ -26,7 +26,7 @@ export function analyze(raw) {
         assert([0, 1].includes(v.worker));
         if (v.kind === 'started') {
           assert(!started.has(v.worker)); uint(v.at_us);
-          assert(v.at_us >= w.dispatch_us); started.set(v.worker, v);
+          assert(v.at_us >= earliest); started.set(v.worker, v);
         } else {
           assert.equal(v.kind, 'operation'); assert(started.has(v.worker));
           assert(!completed.has(v.worker)); assert.equal(v.outcome, 'completed');
@@ -50,7 +50,7 @@ export function analyze(raw) {
       next[wave % 2][key] += 2;
       assert(!seen.has(l.event)); seen.add(l.event);
     }
-    const a = operations('ack');
+    const a = operations('ack', Math.max(...c.map(v => v.end_us)));
     for (const ack of a) assert(ack.begin_us >= Math.max(...c.map(v => v.end_us)));
     const end = take('wave_completed'); assert.equal(end.wave, wave);
     uint(end.begin_us); uint(end.end_us);
