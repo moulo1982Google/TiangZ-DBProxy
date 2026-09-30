@@ -251,3 +251,11 @@ UTC2026-09-30 09:29:47至10:14:52，容器exit0/OOMfalse，六次1 passed及OUTB
 连续事件文件包含本容器start/die且stderr为空，截至UTC10:25仅这两个事件；起止检查仅基础服务，不排除非容器宿主活动。263条资源PG峰3.771GiB、主机可用最低38.81GiB，max/oom增量0，pgscan/pgsteal各85241，full内存PSI区间峰0.010523%。不称零压力、不解除历史升压边界。
 
 下一步停止重复相同低速矩阵，针对单事务PG执行/commit与提交后缓存同步作分解，优先补能够对应同一请求的观测；同时保留服务响应发送未包含于handler的边界。不凭当前数据直接改SQL或锁策略。SDK排队诊断范围已完成，P07尾延迟根因及性能修复、多publisher/并发worker和其他容量范围仍未完成。
+
+## 同事务存储分解短测
+
+bd4e016新增显式acceptance-trace Cargo特性，默认构建不含此代码。只有验收例子在MIX_TX_AUDIT=1时启用；正式入口不启用，不增加生产关闭开关。单事务StorageBackend调用以task-local收集既有存储计时器的相对起止时间，另记录single_transaction_commit；每请求最多64阶段，仅输出operation_id的SHA256及微秒计时，不输出payload/明文业务键。验收日志ACCEPTANCE_TX_TRACE可与账本run-n-0摘要逐条关联；handler不包含响应发送，日志写入也有成本，两组同开并与旧组区分。
+
+analyze_mixed_transaction.mjs严格核对一调用一日志、摘要唯一匹配、schema、合法时间边界、trace总量不超过对应rpc_us，PG连接等待/PG处理/PG写入/commit/提交后cache同步均恰好一次。保存每请求SDK、RPC和存储阶段于transaction-analysis.json，只汇总正式样本。嵌套阶段不相加，PG处理仍含ensure_connected和SQL，commit单独记录；不假称已测SQL内部锁等待。缺失/重复/错摘要/越界/缺阶段负例、本地阶段测试、默认及特性Clippy、fmt、shell/Node语法、sdkf历史兼容通过。
+
+上传storage源码目录、两个Cargo清单及相关server/driver/scripts，以29文件SHA256逐一校验一致（校验清单最初因Windows CRLF路径尾部被拒绝，移除清单行尾CR后全通过，源码未修改）。新库txs_0930a六轮2/5秒UTC10:45:02至10:47:14 exit0/OOMfalse、六次1 passed和结束标记，840请求42真实同键消息零差异。原始全部拉回，SMOKE_ONLY、六轮TRANSACTION_TRACES_CHECKED/SDK_CALLBACKS_CHECKED/STAGE_INTERVALS_CHECKED，每轮7条单事务trace含5条正式样本，合计42条完整关联。该短测用于确认工具，不作为性能结论。
