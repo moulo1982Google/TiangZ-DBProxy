@@ -71,3 +71,5 @@ rpairf_0930a 于 UTC00:31:06 exit=1/OOM=false，在首个control轮次结束后�
 修正仅影响MIX_REPAIR实验：正式服务测试配置与夹具连接同时显式设cacheTtlMs=1800000、jitter=0，两组完全相同，manifest记录repair_cache_ttl_ms，配对分析器要求该值。生产默认配置不变，不接受缺失缓存作为成功、不放宽零差异断言；对照结论需注明30分钟实验TTL，不再直接与默认TTL历史轮次合并。新编号rpairs_0930c先验证六轮短测，再使用全新RunId重跑完整计时，原失败保留。
 
 修正后rpairs_0930c六轮短测实际通过，exit=0/OOM=false，原始已拉回，配对分析SMOKE_ONLY，业务/缓存核对均零差异。Windows指定测试Clippy、格式/差异检查与Linux重编译短测通过；短测仅验证配置接入，缓存跨7分钟的检查仍需正式重跑。
+
+正式重跑 rpairf_0930b 于 UTC00:37:45 启动，容器 dbproxy-mixed-rpairf_0930b，实验TTL30分钟，两组相同；其余20业务请求/秒、2修复目标/秒、并发8和六轮120/300秒不变。预期UTC01:23左右结束。证据按rpairf_0930b新前缀保存，禁止覆盖rpairf_0930a失败。
