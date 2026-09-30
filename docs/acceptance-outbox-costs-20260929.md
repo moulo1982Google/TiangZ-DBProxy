@@ -310,3 +310,5 @@ capture的total_us在tracing::info输出之前读取，摘要及部分调用边�
 验收feature内trace schema升级为2：先保存原storage总时长，再测量首条trace的JSON构建、格式化和tracing::info调用耗时，以同SHA256的ACCEPTANCE_TX_OUTPUT第二条记录保存output_us。第二条记录自身的序列化/输出仍未计入，不能把剩余时间解释为网络；异步日志sink下该计时也不代表落盘耗时。默认生产构建不包含此观测。
 
 分析器兼容旧schema1（trace_output_us为null），schema2严格要求唯一、完整、同摘要输出记录及非负整数，storage total+output不得超过同请求RPC；禁止同轮混合版本。缺失/重复/错摘要/负值/类型/越界负例通过，feature与默认storage Clippy通过，fmt及历史txf六轮兼容通过。尚未上传、未运行真实新库短测，不称实测通过。响应队列/写出关联仍待补齐；先用新RunId短测校验新记录完整性，不能直接开展正式对照。
+
+aeba55f计时文件单独上传并核对SHA256 f9b263b86d87e5c5be98c37dac46f64ca2dc0bf15fd0d15f3dba36f4bba92073一致。outs_0930a新库六轮2/5秒于UTC12:12:39至12:14:49 exit0/OOMfalse、六次1 passed及结束标记，840请求42消息零错误/漏发/核对差异。原始全部拉回，SMOKE_ONLY，42条schema2 trace及42条同摘要output日志完整对应，六轮TRANSACTION_TRACES_CHECKED；SDK及阶段检查也通过。每轮7条输出调用耗时峰501/98/114/655/88/104us（含预热），仅为工具短测，不解释此前15ms异常，不代表落盘完成。尚未启动新正式矩阵；下一步补齐响应队列/写出边界再决定是否需要完整对照，避免每加一个计时点就重复约45分钟负载。
