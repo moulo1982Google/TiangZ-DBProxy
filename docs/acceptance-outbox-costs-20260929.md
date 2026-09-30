@@ -486,3 +486,17 @@ Rust补相位解析及短/长预算固定频率验证，三个预算/配置测�
 前中后实际5基础服务、启动前无其他编译/验收，各2资源样本单区间PGmax/oom/reclaim0，不排除未采样峰值、不解除边界。p7stats上轮事件到期已补拉，只有自身四条start/die、stderr空。新p7phase_0930a.events首轮前180秒约19:16:20自然结束，当前已回收，需到期补拉，不停止；宿主非容器活动未排除。
 
 下一步实现严格配对汇总入口，要求同版本/同预算/同分布且每相位off/on齐全，区分各worker/publisher以及预热/采样统计，保留每对变化而非中位抵消；先使用合成正负例验证完整性和相位缺失拒绝。之后评估正式夹具规模和资源前置，原1000行入口仍只短测，不直接33600行120/300，不升压。正式多worker九分布性能、真实DB超时、P06高积压/P09容量仍缺。
+
+## P07 互补相位严格配对汇总入口（9456e82，本地证据工具）
+
+新增 tools/analyze_parallel_pairs.mjs。输入manifest schema1指定modes、rounds（1或3）及runs；每个run提供run_id、round（0起）、phase（0/1）、stats布尔、directory（含journal及seal）与evidence_prefix（对应sources.sha256/image.json/container.json的前缀），路径相对manifest目录。命令 node tools/analyze_parallel_pairs.mjs <manifest.json>；仅全部验证通过才生成 <manifest.json>.analysis.json。直接重读并严格验证原journal与封存，不信任已有analysis.json。要求schema8、每模式每轮phase0/1各off/on齐全、不同RunId/证据目录/前缀、同模式预算完全一致、全部记录源hash相同、固定镜像、容器参数与fixture匹配、工作台原限额、exit0/OOMfalse以及各容器运行窗口不重叠。缺相位、混schema、未知结果、错封存、错版本/配置均拒绝。
+
+按预热/采样、publisher、worker分别输出claim/ack时长的count、最近秩P50/P95/P99/max；wave协调时长和实际stats调用单独输出，不与嵌套claim/ack相加。每相位每对保留P99 off/on、绝对变化、百分比与超过20%标志，未用跨相位/多轮中位数抵消越线；off为0时百分比null，绝对差及越线标志仍保留。on独有stats时长不与off跳过槽假造配对。输出只可SMOKE_PAIRED_LEDGER_ONLY或BOUNDED_PAIRED_LEDGER_ONLY，formal_performance_complete始终false；不表示正式九分布性能验收完成，也不是生产stats SQL净成本。
+
+补全未来launcher源码指纹，从原4文件扩为10文件，包括run/launch/common/sample_containers脚本、outbox.rs与outbox_stats.sql；配对入口严格要求这些文件，旧4文件证据不回填、不冒充完整同版本配对。镜像和工作台限额一致仍不能证明基础服务限额、外部活动或分布稳定；这些资源/环境前置继续独立保留。执行入口仍仅1000行2/5秒、两worker总4claim/s、stats单相位1Hz；未启用正式执行，也未上传本阶段launcher。
+
+本地合成九模式、各两相位off/on共36单轮与108三轮记录通过；反向manifest顺序仍按键配对，单worker/单相位人为尾延迟越线在其余对不变时保留。32个缺项/重复/错相位/配置/源码/封存/退出/资源/重叠窗口/unknown负例严格拒绝；同时运行既有单轮全部正负例和真实Bash135参数拒绝检查通过。此阶段只改JS及证据采集清单，未改Rust/生产策略、未编译或启动远端负载，合成数据不作数据库性能证据。
+
+p7phase观察器到期已重新拉回：仅p7p1off/p7p1on自身四条start/die，stderr零字节；实际docker ps仍5基础服务且无cargo/rustc/outbox_parallel_poll/fault_process进程。不能排除宿主非容器活动。原phase1短测和历史失败保持，不重复。
+
+下一步补配对所需的基础服务资源/挂载与实际源码证据一致性前置，先本地严格校验及只读资源规模评估，再决定必要同版本小数据证据采集。33600只是最低50%余量数学候选，混合分布仍会消耗一半可领储备，不能称稳定分布或资源许可；不直接启动33600行120/300。旧九分布短测不合成正式矩阵，不升压；真实DB超时、P06高积压、P09容量缺口不变。
