@@ -543,3 +543,15 @@ parallel_environment.mjs要求完整LF/五条记录/30秒内采集、真实资�
 本阶段未上传源码、未建库、未执行真实PG故障；不能报告真实timeout覆盖。p7pair事件到期补拉仍8条自身start/die，stderr空；实际5基础服务无编译/验收负载，工作区其他人的roadmap保留。
 
 下一步实际添加专用runner/launcher（严格exact parallel_claim_timeout::real_claim_timeout，独立RunId前缀，原工作台资源、环境/源码/事件/资源证据），先本地入口拒绝检查再一个新空库执行；不得通过改正常入口或放宽正常未知拒绝来跑。失败保留，先核实双方真实阻塞/5秒unknown/有界释放及最终核对，再决定后续范围。不重复已完成的配对短测，不升压；正式九分布、提交后未知、P06高积压/P09容量仍缺。
+
+## P07 独立真实领取超时已验证（入口c520b3b，p7ct_0930a）
+
+专用runner/launcher固定exact parallel_claim_timeout::real_claim_timeout，p7ct_前缀、单参数及所有P07_*覆盖拒绝在外部动作之前执行。本地真实Bash正例与36入口负例、脚本语法通过。工具e60a5c8与入口共5文件上传SHA256逐项一致，运行前实际仅5基础服务、无其他编译/验收。
+
+新空库p7ct_0930a于UTC2026-09-30 20:30:56.996→20:31:11.196串行执行，容器exit0/OOMfalse，1 passed/P07_CLAIM_TIMEOUT_PROBE_COMPLETED。专属库blocker PID422436；两个独立worker PID422433/422435在8.851ms被实际监测为Lock等待且阻塞者包含该blocker。两claim分别耗时5001096/5001749us，原5秒阈值触发unknown，双方均完整留档；5.005050秒确认ROLLBACK，5.112499秒完成两PG请求不再active和空表0核对。0重试、0ack、没有后续波。
+
+全部原始、9条journal及封存、12文件指纹、镜像/容器、前后环境和资源已拉回target/server_20260929/claim_timeout_p7ct_0930a与p7ct_0930a.*。严格analyze_claim_timeout生成EXPECTED_CLAIM_TIMEOUT_ONLY / BLOCKED_CLAIM_UNKNOWN_JOURNAL_CHECKED；环境时间包围、基础服务ID/启动/限额/挂载、工作台资源及12文件本地hash与实际容器hash一致，review.json保留核验结果。两种合成合法顺序/19负例再通过。两个资源样本单区间PG max/oom/reclaim增量0，不排除未采样峰值、不解除升压边界。
+
+事件订阅在启动前运行180秒，约20:33:56自然结束；当前回收仅自身start/die两条、stderr空，到期再拉完整窗口，不停止监听。结束后实际仍5基础服务，无编译/负载。工作区他人roadmap保留。
+
+此处首次验证真实PG阻塞触发原claim超时及双方unknown留档，范围严格为空outbox关系锁。不能据空表最终0推断有消息请求取消、已提交操作或ack未知，也不称全流程有界。正常性能入口的unknown拒绝不变，不重复该已过负例。下一步核对独立新库ack超时的证据设计：必须先获得真实租约，限定该库锁，保留超时后的PG最终状态与请求是否继续执行证据；不能把future取消当提交取消、不能重试未知ack。先本地严格正负例及释放边界验证再决定必要实测。正式九分布、P06高积压/P09容量及提交后未知继续保留，不升压。
