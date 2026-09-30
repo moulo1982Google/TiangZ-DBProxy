@@ -270,12 +270,14 @@ async fn fixed_rate_six_operations() {
             }
         );
     }
+    let (repair_stop, repair_stop_rx) = tokio::sync::watch::channel(false);
     let (repair_rows, repair_task, repair_start) = repair::prepare(
         &url,
         &env.cache[0],
         &env.run_id,
         warm + sample,
         &repair_mode,
+        repair_stop_rx,
     )
     .await;
     let mut ledger = std::fs::File::create(dir.join("requests.jsonl")).unwrap();
@@ -325,6 +327,7 @@ async fn fixed_rate_six_operations() {
             let event = json!({"kind":"guard_stop","n":n,"reason":reason,"in_flight":tasks.len(),"dispatch_us":scheduled.elapsed().as_micros(),"oldest_us":oldest_us,"elapsed_us":start.elapsed().as_micros()});
             append(&mut ledger, &event);
             stopped = Some(event);
+            repair_stop.send_replace(true);
             for skipped in n..total {
                 append(
                     &mut ledger,
@@ -560,6 +563,7 @@ async fn fixed_rate_six_operations() {
     if repair_mode != "none" {
         assert_eq!(repair_result["remaining"], 0);
         assert_eq!(repair_result["mismatches"], 0);
+        assert_eq!(repair_result["untouched_mismatches"], 0);
     }
 }
 

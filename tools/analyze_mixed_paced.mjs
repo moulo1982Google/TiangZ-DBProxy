@@ -28,7 +28,15 @@ if(m.repair_mode && m.repair_mode!=='none') {
   assert.equal(repair.mode,m.repair_mode);
   assert.equal(repair.targets,(m.warmup+m.sample)*2);
   assert.equal(m.repair_rows,repair.targets);
-  assert.equal(repair.observations.length,repair.targets);
+  if(repair.schema_version===2){
+    assert(Number.isSafeInteger(repair.admitted)&&repair.admitted>=0&&repair.admitted<=repair.targets);
+    assert.equal(repair.observations.length,repair.admitted);
+    assert.equal(repair.not_injected,repair.targets-repair.admitted);
+    assert.equal(typeof repair.stopped,'boolean');
+    if(repair.stopped)assert(result.guard_stop,'repair stopped without business guard');
+    assert.equal(repair.untouched_mismatches,0);
+    if(!repair.stopped)assert.equal(repair.admitted,repair.targets);
+  }else assert.equal(repair.observations.length,repair.targets);
   repair.observations.forEach((r,i)=>{assert.equal(r.n,i);assert(r.pending>=0);});
 }
 assert.equal(m.cleanup,baseline==='B1'?'test-host-disabled':'production-enabled');
