@@ -3,10 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {analyze} from './analyze_parallel_poll.mjs';
+import {validateEnvironment} from './parallel_environment.mjs';
 
 const modes=['ready','spread-ready','none','all-blocked','leased','backoff','leased-heads','backoff-heads','dead-heads'];
 export const requiredSources=['crates/dbproxy-storage/tests/outbox_parallel_poll.rs','crates/dbproxy-storage/tests/parallel_budget/mod.rs','deploy/remote-test/p07_parallel_preflight.sh','deploy/remote-test/run_p07_parallel.sh','deploy/remote-test/launch_p07_parallel.sh','deploy/remote-test/common.sh','deploy/remote-test/sample_containers.sh','crates/dbproxy-storage/src/outbox.rs','crates/dbproxy-storage/src/outbox_stats.sql','crates/dbproxy-storage/src/outbox_claim.sql'];
 const image='sha256:ae3b3d8e17608b277067e3a44ee3e45056a987655b023aad4b025dc0f6811470';
+requiredSources.push('deploy/remote-test/capture_p07_environment.sh');
 function sources(raw) {
   assert(raw.endsWith('\n'));
   const found=new Map();
@@ -43,7 +45,7 @@ export function analyzePairs(manifest,load) {
   for(const mode of manifest.modes)assert(modes.includes(mode));
   assert.equal(manifest.runs.length,manifest.modes.length*manifest.rounds*4,'missing phase/arm/round');
   const ids=new Set(),directories=new Set(),prefixes=new Set(),slots=new Map(),intervals=[];
-  let commonSources,commonImage;
+  let commonSources,commonImage,commonServices;
   const configurations=new Map(),runs=[];
   for(const input of manifest.runs) {
     assert(/^[a-z][a-z0-9_]{0,18}$/.test(input.run_id));
@@ -64,6 +66,8 @@ export function analyzePairs(manifest,load) {
     assert.equal(c.Image,im.Id);assert.equal(c.Name,`/dbproxy-parallel-${input.run_id}`);
     assert.deepEqual(c.Args,['/src/deploy/remote-test/run_p07_parallel.sh',input.run_id]);
     assert.equal(c.State.Status,'exited');assert.equal(c.State.Running,false);assert.equal(c.State.OOMKilled,false);assert.equal(c.State.ExitCode,0);
+    const services=validateEnvironment(evidence.before,evidence.after,c);
+    if(commonServices)assert.deepEqual(services,commonServices,'base services differ across paired runs');else commonServices=services;
     for(const [key,value] of Object.entries({CpusetCpus:'20-27,48-55',NanoCpus:4000000000,Memory:17179869184,MemorySwap:17179869184,NetworkMode:'dbproxy-test'}))assert.equal(c.HostConfig[key],value,'workbench resource mismatch');
     const env=new Map();for(const entry of c.Config.Env){const i=entry.indexOf('=');const key=entry.slice(0,i);assert(!env.has(key));env.set(key,entry.slice(i+1));}
     const expected={CARGO_BUILD_JOBS:4,P07_PARALLEL_MODE:f.mode,P07_ROWS:f.rows,P07_WARMUP_SECONDS:f.warmup_seconds,P07_SAMPLE_SECONDS:f.sample_seconds,P07_WORKERS:2,P07_PUBLISHERS:2,P07_CLAIMS_PER_SECOND:4,P07_ROUNDS:1,P07_STATS:Number(f.stats),P07_STATS_PHASE:f.stats_phase};
@@ -88,7 +92,7 @@ export function analyzePairs(manifest,load) {
     assert.deepEqual(Object.keys(on.groups).filter(k=>!k.endsWith('/stats')),Object.keys(off.groups));
     pairs.push({mode,round,phase,off:off.run_id,on:on.run_id,changes});
   }
-  return {status:runs.every(v=>v.status==='SMOKE_ONLY')?'SMOKE_PAIRED_LEDGER_ONLY':'BOUNDED_PAIRED_LEDGER_ONLY',validation:'COMPLEMENTARY_PHASE_PAIRS_CHECKED',formal_performance_complete:false,rounds:manifest.rounds,modes:manifest.modes,sources:commonSources,image:commonImage,runs,pairs,scope:'Claim/ack/wave wall time includes shared-connection stats coordination and synchronous journal costs; not production SQL net cost. Recorded source hashes and workbench limits do not establish base-service limits, distribution stability or absence of external activity.'};
+  return {status:runs.every(v=>v.status==='SMOKE_ONLY')?'SMOKE_PAIRED_LEDGER_ONLY':'BOUNDED_PAIRED_LEDGER_ONLY',validation:'COMPLEMENTARY_PHASE_PAIRS_CHECKED',formal_performance_complete:false,rounds:manifest.rounds,modes:manifest.modes,sources:commonSources,image:commonImage,base_services:commonServices,runs,pairs,scope:'Claim/ack/wave wall time includes shared-connection stats coordination and synchronous journal costs; not production SQL net cost. Boundary snapshots verify recorded base-service limits and mounts; they do not establish unchanged limits between snapshots, distribution stability or absence of external activity.'};
 }
 
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
@@ -96,7 +100,7 @@ if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.ur
   const json=p=>JSON.parse(fs.readFileSync(p,'utf8'));
   const result=analyzePairs(manifest,input=>{
     const dir=path.resolve(base,input.directory),prefix=path.resolve(base,input.evidence_prefix);
-    return {raw:fs.readFileSync(path.join(dir,'journal.jsonl'),'utf8'),seal:json(path.join(dir,'journal-sealed.json')),sources:fs.readFileSync(prefix+'.sources.sha256','utf8'),images:json(prefix+'.image.json'),containers:json(prefix+'.container.json')};
+    return {before:fs.readFileSync(prefix+'.environment-before.jsonl','utf8'),after:fs.readFileSync(prefix+'.environment-after.jsonl','utf8'),raw:fs.readFileSync(path.join(dir,'journal.jsonl'),'utf8'),seal:json(path.join(dir,'journal-sealed.json')),sources:fs.readFileSync(prefix+'.sources.sha256','utf8'),images:json(prefix+'.image.json'),containers:json(prefix+'.container.json')};
   });
   const output=filename+'.analysis.json';fs.writeFileSync(output,JSON.stringify(result,null,2)+'\n');console.log(JSON.stringify({status:result.status,validation:result.validation,pairs:result.pairs.length,output}));
 }

@@ -20,6 +20,7 @@ finish() {
     docker stop -t 10 "$WB" >/dev/null 2>&1 || true
 }
 trap finish EXIT
+bash "$DATA/src/deploy/remote-test/capture_p07_environment.sh" "$DATA/evidence/$RUN_ID.environment-before.jsonl"
 docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cpus 4 \
     --memory 16g --memory-swap 16g -e CARGO_BUILD_JOBS=4 \
     -e P07_PARALLEL_MODE="${P07_PARALLEL_MODE:-ready}" \
@@ -37,6 +38,7 @@ docker exec "$WB" sha256sum /src/crates/dbproxy-storage/tests/outbox_parallel_po
     /src/deploy/remote-test/launch_p07_parallel.sh \
     /src/deploy/remote-test/common.sh \
     /src/deploy/remote-test/sample_containers.sh \
+    /src/deploy/remote-test/capture_p07_environment.sh \
     /src/crates/dbproxy-storage/src/outbox.rs \
     /src/crates/dbproxy-storage/src/outbox_stats.sql \
     /src/crates/dbproxy-storage/src/outbox_claim.sql >"$DATA/evidence/$RUN_ID.sources.sha256"
@@ -51,6 +53,7 @@ while [[ $(docker inspect -f '{{.State.Running}}' "$WB") == true ]]; do
     sleep 10
 done
 status=$(docker inspect -f '{{.State.ExitCode}}' "$WB")
+bash "$DATA/src/deploy/remote-test/capture_p07_environment.sh" "$DATA/evidence/$RUN_ID.environment-after.jsonl"
 docker logs "$WB"
 echo "P07_PARALLEL_SMOKE run=$RUN_ID status=$status"
 exit "$status"

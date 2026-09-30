@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {phaseFixtures} from './test_parallel_poll.mjs';
 import {analyzePairs,requiredSources} from './analyze_parallel_pairs.mjs';
+import {environmentFixture} from './parallel_environment_fixture.mjs';
 
 const image='sha256:ae3b3d8e17608b277067e3a44ee3e45056a987655b023aad4b025dc0f6811470';
 const sourceNames=requiredSources;
@@ -14,6 +15,8 @@ function fixture(rounds=1) {
     const env={CARGO_BUILD_JOBS:4,P07_PARALLEL_MODE:f.mode,P07_ROWS:1000,P07_WARMUP_SECONDS:2,P07_SAMPLE_SECONDS:5,P07_WORKERS:2,P07_PUBLISHERS:2,P07_CLAIMS_PER_SECOND:4,P07_ROUNDS:1,P07_STATS:Number(f.stats),P07_STATS_PHASE:f.stats_phase};
     const c={Name:`/dbproxy-parallel-${id}`,Image:image,Args:['/src/deploy/remote-test/run_p07_parallel.sh',id],State:{Status:'exited',Running:false,OOMKilled:false,ExitCode:0,StartedAt:new Date(index*20000).toISOString(),FinishedAt:new Date(index*20000+10000).toISOString()},HostConfig:{CpusetCpus:'20-27,48-55',NanoCpus:4000000000,Memory:17179869184,MemorySwap:17179869184,NetworkMode:'dbproxy-test'},Config:{Env:Object.entries(env).map(([k,v])=>`${k}=${v}`)}};
     const e={raw:rows.map(v=>JSON.stringify(v)).join('\n')+'\n',sources:sourceNames.map(v=>'a'.repeat(64)+'  /src/'+v).join('\n')+'\n',images:[{Id:image}],containers:[c]};seal(e);
+    const environment=environmentFixture(index*20000,index*20000+10000);
+    c.Mounts=environment.Mounts;e.before=environment.before;e.after=environment.after;
     manifest.runs.push(input);evidence[id]=e;index++;
   }
   return {manifest,evidence};
