@@ -21,6 +21,7 @@ const runs=entries.map((entry,i)=>{
   assert.equal(a.manifest.baseline,entry.baseline);assert.equal(a.manifest.rate,entry.rate);
   assert.equal(entry.rate,entries[Math.floor(i/6)*6].rate);
   assert.deepEqual(a.manifest.mix,[40,20,20,10,5,5]);
+  assert.equal(a.manifest.repair_mode??'none','none','repair experiments require their own controlled comparison');
   for(const field of ['warmup','sample','concurrency','connections','batch','payload_bytes','payload_rule','shards','read_connections','runtime_workers']){
     if(i)assert.equal(a.manifest[field],JSON.parse(fs.readFileSync(path.join(root,'..',`fault_process_${entries[0].run}`,'mixed-paced','analysis.json'),'utf8')).manifest[field]);
   }

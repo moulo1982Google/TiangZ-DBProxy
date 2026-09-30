@@ -9,6 +9,16 @@ const result=JSON.parse(read('result.json'));
 const manifest=rows.filter(r=>r.kind==='manifest');assert.equal(manifest.length,1);const m=manifest[0];
 // Historical B2 runs predate the explicit baseline field.
 const baseline=m.baseline??'B2';assert(['B1','B2'].includes(baseline));
+let repair=null;
+if(m.repair_mode && m.repair_mode!=='none') {
+  assert(['control','repair'].includes(m.repair_mode));
+  repair=JSON.parse(read('repair.json'));
+  assert.equal(repair.mode,m.repair_mode);
+  assert.equal(repair.targets,(m.warmup+m.sample)*2);
+  assert.equal(m.repair_rows,repair.targets);
+  assert.equal(repair.observations.length,repair.targets);
+  repair.observations.forEach((r,i)=>{assert.equal(r.n,i);assert(r.pending>=0);});
+}
 assert.equal(m.cleanup,baseline==='B1'?'test-host-disabled':'production-enabled');
 if(m.baseline){assert.equal(m.shards,2);assert.equal(m.read_connections,2);assert.equal(m.runtime_workers,4);}
 const total=(m.warmup+m.sample)*m.rate;assert.equal(total,result.scheduled);
@@ -48,7 +58,7 @@ assert.equal(checks.length,sentWrites.length);assert.deepEqual([...new Set(check
 assert(checks.filter(r=>!r.valid).length<=result.reconciliation_mismatches);
 const p=v=>{if(!v.length)return null;assert(v.every(x=>Number.isFinite(x)&&x>=0));v.sort((a,b)=>a-b);return {count:v.length,p50:v[Math.ceil(v.length*.5)-1],p99:v[Math.ceil(v.length*.99)-1],max:v.at(-1)};};
 const perOperation=kinds.map(op=>{const all=[...responses.values()].filter(r=>r.op===op&&r.sample);return {op,end_to_end_us:p(all.map(r=>r.end_to_end_us)),dispatch_us:p(all.map(r=>r.dispatch_us)),rpc_us:p(all.map(r=>r.rpc_us)),errors:all.filter(r=>r.outcome.status!=='success').length,not_sent:[...dropped.values()].filter(r=>r.op===op&&r.sample).length};});
-const accepted=result.errors===0&&result.not_sent===0&&result.reconciliation_mismatches===0;
+const accepted=result.errors===0&&result.not_sent===0&&result.reconciliation_mismatches===0&&(!repair||(repair.remaining===0&&repair.mismatches===0));
 const analysis={status:accepted?(result.full_timing?'COMPLETE_SINGLE_TIMED_ROUND':'SMOKE_ONLY'):'REJECTED_LOAD',manifest:m,result,perOperation,capacity_proven:false};
 fs.writeFileSync(path.join(root,'analysis.json'),JSON.stringify(analysis,null,2));console.log(JSON.stringify(analysis,null,2));
 if(!accepted)process.exitCode=1;

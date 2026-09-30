@@ -43,3 +43,13 @@ RunId `p06_0929a`，三项测试各用新库 `_distribution/_order/_half`，全�
 复测：工作台 `bash deploy/remote-test/run_repair_matrix.sh <新RunId>`，旧镜像挂载 `repair_claim_plans.rs` 与脚本目录；每项新库、300 秒上限、检查一项实际执行。220 工作台 4 CPU/16 GiB、固定 cpuset。
 
 证据：服务器 `/data/dbproxy-test/evidence/repair_p06_0929a/`，本地 `target/server_20260929/repair_p06_0929a/`。分布日志含所有完整 JSON 执行计划、写入页数/WAL，half 日志含新增计划与 P06_HALF_HOT_RESULT。Windows 定向 Clippy、格式/差异检查、bash 语法及 Linux 实测通过，生产 SQL 和代码未改。
+
+## 整体应用对照工具（2026-09-30）
+
+六类固定速率驱动新增 MIX_REPAIR=control/repair，默认 none 保留原行为。两组均连接相同正式服务，在独立命名空间预置相同 revision=2、1KiB 的 PG 记录；修复组 Redis 保留 revision=1，对照组预先回填 revision=2。业务读取仍访问原有种子，不通过业务读取抢先修复夹具。
+
+从业务计时开始每 500ms 放入一个独立修复目标，正式 420 秒最多 840 条，使用生产队列 API、生产修复后台和真实 Redis；对照组同频查询队列但不入队。两组持有相同观测连接。保存各次入队及队列查询耗时、待处理条数，末尾最多等 30 秒排空，再逐条比较 Redis/PG 完整快照。业务账本仍逐条核对，夹具快照单独计数。repair.json 保存全部观测，分析器要求目标数、顺序、队列归零和内容一致。入队加查询耗时不等于单条修复完成延迟，末尾总耗时含核对；不混称两者。
+
+修复短测 repairs_0930a 已完成三轮，各 2 秒预热、5 秒采样、20 业务请求/秒、并发上限 8。容器 UTC00:07:35 退出0/OOMfalse，三次1 passed；每轮140业务请求、499业务快照、14效果及14独立修复目标，零业务错误/未发送/差异，修复队列归零、缓存零差异。观测待处理峰值1，各轮分析SMOKE_ONLY。原始证据已拉回 target/server_20260929/fault_process_repairs_0930a_r{0,1,2} 与同级资源记录。对照短测 repairc_0930a 同样三轮通过，exit=0/OOM=false，各140业务请求和14条夹具记录，队列和缓存核对零差异，原始已拉回且均SMOKE_ONLY。另对复制的证据人为加入一个缓存差异，分析器正确拒绝REJECTED_LOAD；正式原件未改。历史B1/B2配对分析回归通过。
+
+范围：这是低速持续修复与业务同时运行的工具验证，未覆盖大量积压/锁争用，尚未完成120/300秒交替三轮性能对照。当前每秒2条的修复输入有固定总量上限；业务保护触发后会停止业务发送并收齐账本，修复输入仍按预定有界时长结束，因此不得将此工具直接用于更高速故障升压。Windows定向cargo check/Clippy、格式、Node/Bash语法及差异检查通过；Linux实际重编译并运行短测。

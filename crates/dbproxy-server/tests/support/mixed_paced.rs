@@ -3,6 +3,8 @@ use super::*;
 use serde_json::{Value, json};
 use tiangz_dbproxy_client::ClientError;
 use tiangz_dbproxy_protocol::wire::ErrorCode;
+#[path = "mixed_repair.rs"]
+mod repair;
 
 fn failure(error: ClientError) -> Value {
     let definite = matches!(&error, ClientError::Remote(e) if matches!(e.code,
@@ -237,12 +239,24 @@ async fn fixed_rate_six_operations() {
             }
         );
     }
+    let repair_mode = std::env::var("MIX_REPAIR").unwrap_or_else(|_| "none".into());
+    let (repair_rows, repair_task, repair_start) = repair::prepare(
+        &url,
+        &env.cache[0],
+        &env.run_id,
+        warm + sample,
+        &repair_mode,
+    )
+    .await;
     let mut ledger = std::fs::File::create(dir.join("requests.jsonl")).unwrap();
     append(
         &mut ledger,
-        &json!({"kind":"manifest","run":env.run_id,"baseline":baseline,"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
+        &json!({"kind":"manifest","run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
     );
     let start = tokio::time::Instant::now();
+    if let Some(trigger) = repair_start {
+        trigger.send(()).unwrap();
+    }
     let mut tasks = tokio::task::JoinSet::<Value>::new();
     let mut completed = Vec::new();
     let mut not_sent = 0_u64;
@@ -311,6 +325,18 @@ async fn fixed_rate_six_operations() {
         tokio::time::sleep_until(start + Duration::from_secs(warm + sample)).await;
     }
     ledger.sync_all().unwrap();
+    let repair_result = match repair_task {
+        Some(task) => match task.await {
+            Ok(value) => value,
+            Err(error) => json!({"error":error.to_string()}),
+        },
+        None => Value::Null,
+    };
+    std::fs::write(
+        dir.join("repair.json"),
+        serde_json::to_vec_pretty(&repair_result).unwrap(),
+    )
+    .unwrap();
     // All sent writes are checked, including failed/partial/unknown responses. Never resend here.
     let pg = sql(&url).await;
     pg.batch_execute("SET statement_timeout='5s'")
@@ -404,7 +430,8 @@ async fn fixed_rate_six_operations() {
         mismatches += u64::from(r.get::<_, Vec<u8>>(0) != seed.payload || r.get::<_, i64>(1) != 1);
     }
     mismatches += u64::from(
-        count(&pg, "SELECT count(*) FROM dbproxy_snapshots").await != present as i64 + BATCH as i64,
+        count(&pg, "SELECT count(*) FROM dbproxy_snapshots").await
+            != present as i64 + BATCH as i64 + repair_rows as i64,
     );
     mismatches += u64::from(
         count(&pg, "SELECT count(*) FROM dbproxy_append_records").await
@@ -427,4 +454,8 @@ async fn fixed_rate_six_operations() {
     assert_eq!(mismatches, 0);
     assert_eq!(errors, 0);
     assert_eq!(not_sent, 0);
+    if repair_mode != "none" {
+        assert_eq!(repair_result["remaining"], 0);
+        assert_eq!(repair_result["mismatches"], 0);
+    }
 }
