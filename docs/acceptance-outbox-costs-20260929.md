@@ -312,3 +312,13 @@ capture的total_us在tracing::info输出之前读取，摘要及部分调用边�
 分析器兼容旧schema1（trace_output_us为null），schema2严格要求唯一、完整、同摘要输出记录及非负整数，storage total+output不得超过同请求RPC；禁止同轮混合版本。缺失/重复/错摘要/负值/类型/越界负例通过，feature与默认storage Clippy通过，fmt及历史txf六轮兼容通过。尚未上传、未运行真实新库短测，不称实测通过。响应队列/写出关联仍待补齐；先用新RunId短测校验新记录完整性，不能直接开展正式对照。
 
 aeba55f计时文件单独上传并核对SHA256 f9b263b86d87e5c5be98c37dac46f64ca2dc0bf15fd0d15f3dba36f4bba92073一致。outs_0930a新库六轮2/5秒于UTC12:12:39至12:14:49 exit0/OOMfalse、六次1 passed及结束标记，840请求42消息零错误/漏发/核对差异。原始全部拉回，SMOKE_ONLY，42条schema2 trace及42条同摘要output日志完整对应，六轮TRANSACTION_TRACES_CHECKED；SDK及阶段检查也通过。每轮7条输出调用耗时峰501/98/114/655/88/104us（含预热），仅为工具短测，不解释此前15ms异常，不代表落盘完成。尚未启动新正式矩阵；下一步补齐响应队列/写出边界再决定是否需要完整对照，避免每加一个计时点就重复约45分钟负载。
+
+## 响应边界短测与正式对照启动
+
+81e8722仅在acceptance-trace构建中给响应队列项附带可选事务摘要与Instant边界；仅显式启用的验收例子记录单事务。schema3新增ACCEPTANCE_TX_RESPONSE：handler_begin、queued、write_begin、write_end均相对服务接收完整请求后的admitted时刻。queued至write_begin包括发送通道背压和等待writer；write范围为write_message调用，不代表客户端收到或磁盘落盘。最终诊断日志本身仍未计时。默认生产构建仍用原ServerFrame队列，无新配置开关。
+
+分析器要求同摘要一对一、非负整数单调边界、storage+首日志耗时不超过handler至queued范围；不要求write_end小于客户端RPC，避免两端完成调度差异误判。缺失/重复/错摘要/反序/范围负例、feature例子和默认生产Clippy、fmt、历史schema2兼容通过。两源码文件上传SHA256一致。
+
+rsps_0930a六轮新库2/5秒UTC12:27:46至12:29:56 exit0/OOMfalse，六次1 passed及结束标记。840请求42真实消息零差异，原始全拉回，SMOKE_ONLY及六轮TX/SDK/STAGE核验通过，42条schema3记录均完整关联。每轮7条交易含预热的响应排队最大10/20/21/10/20/10us，写出调用最大58/57/63/75/70/57us，仅工具短测。
+
+观测边界齐备后正式rspf_0930a于UTC12:30:37（北京时间20:30）启动，六轮120/300秒、20/s并发8四连接、off-on/on-off/off-on，两组TX/SDK/STAGE全开，预计UTC13:17附近（北京时间21:17）结束。容器dbproxy-mixed-rspf_0930a，运行中不得改源码或并行编译/负载。启动前仅基础服务，环境rspf_0930a.environment-before.txt已保存；事件订阅PID2775195从12:30:37至13:35:37自动结束，已捕获本轮start。结束查6次1 passed、exit/OOM、完整原始及三类计时匹配、同请求阶段/日志/响应边界和六类逐对P99；20%失败保留，不以新观测组替换旧组。
