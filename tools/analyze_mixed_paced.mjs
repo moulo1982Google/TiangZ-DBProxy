@@ -1,3 +1,4 @@
+import {analyzeTransactions} from './analyze_mixed_transaction.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -99,6 +100,9 @@ if(m.stage_audit){
 assert(m.sdk_audit===undefined||typeof m.sdk_audit==='boolean');
 const sdk=m.sdk_audit?analyzeSdk(rows):null;
 if(sdk)fs.writeFileSync(path.join(root,'sdk-analysis.json'),JSON.stringify(sdk,null,2));
-const analysis={sdk,stages:stages?{status:stages.status,covered_us:stages.covered_us,summaries:stages.summaries}:null,stats,publication,status:accepted&&publicationValid?(result.full_timing?'COMPLETE_SINGLE_TIMED_ROUND':'SMOKE_ONLY'):'REJECTED_LOAD',manifest:m,result,perOperation,capacity_proven:false};
+assert(m.tx_audit===undefined||typeof m.tx_audit==='boolean');
+const tx=m.tx_audit?analyzeTransactions(m,rows,read('server-paced.stdout')+'\n'+read('server-paced.stderr')):null;
+if(tx)fs.writeFileSync(path.join(root,'transaction-analysis.json'),JSON.stringify(tx,null,2));
+const analysis={transaction:tx?{status:tx.status,stages:tx.stages}:null,sdk,stages:stages?{status:stages.status,covered_us:stages.covered_us,summaries:stages.summaries}:null,stats,publication,status:accepted&&publicationValid?(result.full_timing?'COMPLETE_SINGLE_TIMED_ROUND':'SMOKE_ONLY'):'REJECTED_LOAD',manifest:m,result,perOperation,capacity_proven:false};
 fs.writeFileSync(path.join(root,'analysis.json'),JSON.stringify(analysis,null,2));console.log(JSON.stringify(analysis,null,2));
 if(!accepted||!publicationValid)process.exitCode=1;

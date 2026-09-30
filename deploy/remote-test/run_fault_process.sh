@@ -36,7 +36,9 @@ if [[ ${MIX_BASELINE:-B2} == B1 ]]; then
     json_sha256 "$DBPROXY_ACCEPTANCE_HOST_BINARY" >"$OUT/host-binary.json"
 fi
 if [[ ${MIX_OUTBOX_STATS:-none} != none ]]; then
-    cargo build --release --locked -p tiangz-dbproxy-server --example acceptance_outbox >"$OUT/outbox-host-build.log" 2>&1
+    trace_features=()
+    if [[ ${MIX_TX_AUDIT:-0} == 1 ]]; then trace_features=(--features acceptance-trace); fi
+    cargo build --release --locked -p tiangz-dbproxy-server "${trace_features[@]}" --example acceptance_outbox >"$OUT/outbox-host-build.log" 2>&1
     export DBPROXY_ACCEPTANCE_HOST_BINARY="$SRC/target/release/examples/acceptance_outbox"
     json_sha256 "$DBPROXY_ACCEPTANCE_HOST_BINARY" >"$OUT/host-binary.json"
 fi

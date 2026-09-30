@@ -20,6 +20,7 @@ for(const [i,e] of entries.entries()){
   assert.equal(m.repair_mode,'none');assert(m.outbox_audit);
   assert.equal(m.rate,20);assert.equal(m.concurrency,8);assert.equal(m.connections,4);
   assert.deepEqual(m.mix,[40,20,20,10,5,5]);
+  if(i)assert.equal(m.tx_audit??false,runs[0].analysis.manifest.tx_audit??false,'mixed transaction instrumentation');
   if(i)assert.equal(m.sdk_audit??false,runs[0].analysis.manifest.sdk_audit??false,'mixed SDK instrumentation');
   if(i)assert.equal(m.stage_audit??false,runs[0].analysis.manifest.stage_audit??false,'mixed stage instrumentation');
   if(i)for(const key of ['warmup','sample','batch','payload_bytes','payload_rule','shards','read_connections','runtime_workers','repair_rows'])assert.equal(m[key],runs[0].analysis.manifest[key]);

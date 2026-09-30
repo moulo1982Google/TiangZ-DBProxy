@@ -223,6 +223,10 @@ async fn fixed_rate_six_operations() {
     assert!(["0", "1"].contains(&sdk_mode.as_str()));
     let sdk_audit = sdk_mode == "1";
     assert!(!sdk_audit || stage_audit);
+    let tx_mode = std::env::var("MIX_TX_AUDIT").unwrap_or_else(|_| "0".into());
+    assert!(["0", "1"].contains(&tx_mode.as_str()));
+    let tx_audit = tx_mode == "1";
+    assert!(!tx_audit || sdk_audit);
     assert!(!stage_audit || stats_mode != "none");
     let mut server = if baseline == "B1" || stats_mode != "none" {
         let binary = std::env::var("DBPROXY_ACCEPTANCE_HOST_BINARY")
@@ -275,7 +279,7 @@ async fn fixed_rate_six_operations() {
     let mut ledger = std::fs::File::create(dir.join("requests.jsonl")).unwrap();
     append(
         &mut ledger,
-        &json!({"kind":"manifest","sdk_audit":sdk_audit,"stage_audit":stage_audit,"outbox_stats_mode":stats_mode,"outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
+        &json!({"kind":"manifest","tx_audit":tx_audit,"sdk_audit":sdk_audit,"stage_audit":stage_audit,"outbox_stats_mode":stats_mode,"outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
     );
     append(
         &mut ledger,

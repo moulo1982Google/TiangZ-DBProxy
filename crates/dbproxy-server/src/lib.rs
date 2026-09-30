@@ -812,6 +812,16 @@ impl DbProxyBackend for StorageBackend {
         request: TransactionalWrite,
     ) -> Result<TransactionalWriteOutcome, BackendError> {
         let mut store = self.shard(&request.record);
+        #[cfg(feature = "acceptance-trace")]
+        {
+            let operation_id = request.operation_id.clone();
+            return Ok(tiangz_dbproxy_storage::acceptance_trace::capture(
+                &operation_id,
+                store.apply(request),
+            )
+            .await?);
+        }
+        #[cfg(not(feature = "acceptance-trace"))]
         Ok(store.apply(request).await?)
     }
 

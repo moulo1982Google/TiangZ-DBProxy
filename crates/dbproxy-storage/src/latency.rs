@@ -112,6 +112,8 @@ impl StorageLatency {
         histogram.in_flight.fetch_add(1, Ordering::Relaxed);
         Timer {
             histogram,
+            #[cfg(feature = "acceptance-trace")]
+            stage,
             started: Instant::now(),
         }
     }
@@ -139,11 +141,15 @@ impl StorageLatency {
 // measure only time until cancellation, never the eventual duration of work still running in PG.
 pub(crate) struct Timer<'a> {
     histogram: &'a Histogram,
+    #[cfg(feature = "acceptance-trace")]
+    stage: Stage,
     started: Instant,
 }
 
 impl Drop for Timer<'_> {
     fn drop(&mut self) {
+        #[cfg(feature = "acceptance-trace")]
+        crate::acceptance_trace::record(self.stage.name(), self.started, Instant::now());
         self.histogram.record(self.started.elapsed());
         self.histogram.in_flight.fetch_sub(1, Ordering::Relaxed);
     }

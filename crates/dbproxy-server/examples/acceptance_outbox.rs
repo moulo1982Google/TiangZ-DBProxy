@@ -74,6 +74,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION").as_deref() != Ok("1") {
         return Err("acceptance requires explicit test opt-in".into());
     }
+    if std::env::var("MIX_TX_AUDIT").as_deref() == Ok("1") {
+        #[cfg(feature = "acceptance-trace")]
+        tiangz_dbproxy_storage::acceptance_trace::enable();
+        #[cfg(not(feature = "acceptance-trace"))]
+        return Err("transaction audit requires acceptance-trace build".into());
+    }
     let mode = std::env::var("MIX_OUTBOX_STATS")?;
     if mode != "on" && mode != "off" {
         return Err("stats mode must be on/off".into());

@@ -3,6 +3,9 @@
 //! PostgreSQL 是唯一权威写入端；Redis 只保存已经提交的快照缓存。
 //! PostgreSQL is the only authoritative write target; Redis caches committed snapshots only.
 
+#[cfg(feature = "acceptance-trace")]
+pub mod acceptance_trace;
+
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
@@ -2140,7 +2143,11 @@ impl AsyncTransactionalStore for PostgresSnapshotStore {
             let result: Vec<u8> = receipt.get(6);
             cache_repair::enqueue_in_transaction(&transaction, &request.record, new_revision)
                 .await?;
-            transaction.commit().await?;
+            {
+                #[cfg(feature = "acceptance-trace")]
+                let _commit = acceptance_trace::CommitTimer::start();
+                transaction.commit().await?;
+            }
             return Ok(TransactionalWriteOutcome::Duplicate {
                 new_revision,
                 result,
@@ -2234,7 +2241,11 @@ impl AsyncTransactionalStore for PostgresSnapshotStore {
             .await?;
         cache_repair::enqueue_in_transaction(&transaction, &request.record, committed_revision)
             .await?;
-        transaction.commit().await?;
+        {
+            #[cfg(feature = "acceptance-trace")]
+            let _commit = acceptance_trace::CommitTimer::start();
+            transaction.commit().await?;
+        }
         Ok(TransactionalWriteOutcome::Applied {
             new_revision: committed_revision,
             result: request.result,
