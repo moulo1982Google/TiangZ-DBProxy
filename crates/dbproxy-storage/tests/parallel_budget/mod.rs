@@ -49,13 +49,15 @@ pub fn smoke_environment(get: impl Fn(&str) -> Option<String>) -> Result<Budget,
         ("P07_WORKERS", "2"),
         ("P07_ROUNDS", "1"),
         ("P07_CLAIMS_PER_SECOND", "4"),
-        ("P07_STATS", "0"),
     ] {
         if get(name).is_some_and(|value| value != expected) {
             return Err(
-                "unsupported execution parameters: only 1000-row 2/5 smoke, two workers/publishers, total 4/s, one round, no stats is enabled",
+                "unsupported execution parameters: only 1000-row 2/5 smoke, two workers/publishers, total 4/s, one round is enabled",
             );
         }
+    }
+    if get("P07_STATS").is_some_and(|v| v != "0" && v != "1") {
+        return Err("stats must be 0 or 1");
     }
     validate(2, 5, 1000, true)
 }
@@ -84,6 +86,7 @@ fn budgets_preserve_reserve_without_increasing_rate() {
 #[test]
 fn unsupported_environment_is_rejected_before_database_work() {
     assert!(smoke_environment(|_| None).is_ok());
+    assert!(smoke_environment(|key| (key == "P07_STATS").then(|| "1".into())).is_ok());
     for (name, valid, invalid) in [
         ("P07_WARMUP_SECONDS", "2", "120"),
         ("P07_SAMPLE_SECONDS", "5", "300"),
@@ -92,7 +95,7 @@ fn unsupported_environment_is_rejected_before_database_work() {
         ("P07_WORKERS", "2", "4"),
         ("P07_ROUNDS", "1", "3"),
         ("P07_CLAIMS_PER_SECOND", "4", "8"),
-        ("P07_STATS", "0", "1"),
+        ("P07_STATS", "0", "2"),
     ] {
         assert!(smoke_environment(|key| (key == name).then(|| valid.into())).is_ok());
         for value in [invalid, "", "-1", "NaN", "18446744073709551616"] {

@@ -240,6 +240,7 @@ async fn two_workers_fixed_budget() {
         File::create(output.join("journal.jsonl")).unwrap(),
     ));
     // Intentionally smoke-only: formal timing/distributions require a separate review.
+    let stats_enabled = std::env::var("P07_STATS").is_ok_and(|v| v == "1");
     let warmup = budget.warmup;
     let sample = budget.sample;
     let waves = budget.waves;
@@ -331,7 +332,7 @@ async fn two_workers_fixed_budget() {
         }
         _ => {}
     }
-    journal.record(json!({"kind":"fixture","schema":6,"mode":mode,"rows":budget.rows,"claim_calls":budget.calls,"warmup_seconds":warmup,"sample_seconds":sample,"workers":2,"publishers":2,"claims_per_second":4,"stats":false,"seal_required":true}));
+    journal.record(json!({"kind":"fixture","schema":7,"mode":mode,"rows":budget.rows,"claim_calls":budget.calls,"warmup_seconds":warmup,"sample_seconds":sample,"workers":2,"publishers":2,"claims_per_second":4,"stats":stats_enabled,"seal_required":true}));
     distribution(&sql, &journal, &mode, "before", &budget).await;
     sql.batch_execute("ANALYZE dbproxy_outbox").await.unwrap();
     let first = PostgresSnapshotStore::connect_existing(&url)
@@ -361,7 +362,7 @@ async fn two_workers_fixed_budget() {
         }
         let publisher = publishers[(wave % 2) as usize];
         let before = start.elapsed().as_micros();
-        let (a, b) = tokio::join!(
+        let (a, b, stats) = tokio::join!(
             observed(
                 &journal,
                 start,
@@ -377,8 +378,23 @@ async fn two_workers_fixed_budget() {
                 1,
                 "claim",
                 second.claim_for_publisher("parallel-worker-1", 30_000, Some(publisher))
-            )
+            ),
+            async {
+                if wave % 2 != 0 {
+                    return None;
+                }
+                journal.record(json!({"kind":"stats_slot","wave":wave,"worker":0,"enabled":stats_enabled,"scheduled_us":scheduled}));
+                if stats_enabled {
+                    Some(observed(&journal, start, wave, 0, "stats", first.stats()).await)
+                } else {
+                    None
+                }
+            }
         );
+        if wave % 2 == 0 {
+            let value = stats.map(|v| v.expect("stats outcome unknown; evidence retained"));
+            journal.record(json!({"kind":"stats_result","wave":wave,"worker":0,"enabled":stats_enabled,"at_us":start.elapsed().as_micros(),"counts":value.map(|v| json!({"pending":v.pending,"processing":v.processing,"dead_lettered":v.dead_lettered,"oldest_age_ms":v.oldest_age_ms}))}));
+        }
         if matches!(mode.as_str(), "none" | "all-blocked") {
             assert!(a.expect("claim outcome unknown").is_none());
             assert!(b.expect("claim outcome unknown").is_none());
@@ -481,7 +497,7 @@ async fn two_workers_fixed_budget() {
         }
     }
     assert!(overlaps > 0, "no observed concurrent claim intervals");
-    journal.record(json!({"kind":"result","status":"SMOKE_ONLY","workers":2,"publishers":2,"rows":budget.rows,"waves":waves,"claims":seen.len(),"overlap_waves":overlaps,"warmup_seconds":warmup,"sample_seconds":sample,"stats":false}));
+    journal.record(json!({"kind":"result","status":"SMOKE_ONLY","workers":2,"publishers":2,"rows":budget.rows,"waves":waves,"claims":seen.len(),"overlap_waves":overlaps,"warmup_seconds":warmup,"sample_seconds":sample,"stats":stats_enabled}));
     journal.seal(&output);
     connection.abort();
 }

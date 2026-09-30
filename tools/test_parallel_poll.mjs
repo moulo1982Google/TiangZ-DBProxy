@@ -182,3 +182,26 @@ const formalRaw=encode(formal), checked=analyze(formalRaw,sealOf(formalRaw));
 assert.equal(checked.status,'BOUNDED_LEDGER_ONLY');assert.equal(checked.claim_calls,1680);assert.equal(checked.formal_claim_calls,1200);
 console.log('schema6: nine resized distributions + 54 rejections; synthetic 33600-row/840-wave ledger checked (not database evidence)');
 for(const [w,s,n,m] of [[120,300,33560,true],[120,300,1000,false],[120,300,1000,true],[2,5,1001,false],[2,5,100000,true],[Number.MAX_SAFE_INTEGER,300,33600,true],[120,301,33600,true],[2,5,'1000',false]]) assert.throws(()=>validateBudget(w,s,n,m));
+for(const source of versionedFixtures)for(const enabled of [false,true]){
+  const current=resized(source,1000);current[0].schema=7;current[0].stats=enabled;current.at(-1).stats=enabled;
+  for(let wave=0;wave<14;wave+=2){
+    const t=wave*500000,empty=['none','all-blocked'].includes(source[0].mode),mode=source[0].mode;
+    const dead=['all-blocked','dead-heads'].includes(mode)?4:0,processing=mode==='none'?1000:mode==='leased'?900:mode==='leased-heads'?4:0;
+    const records=[{kind:'stats_slot',wave,worker:0,enabled,scheduled_us:t}];
+    if(enabled)records.push({kind:'started',wave,worker:0,operation:'stats',at_us:t+1},{kind:'operation',wave,worker:0,operation:'stats',begin_us:t+2,end_us:t+99,outcome:'completed'});
+    records.push({kind:'stats_result',wave,worker:0,enabled,at_us:t+100,counts:enabled?{pending:1000-(empty?0:wave*2)-dead-processing,processing,dead_lettered:dead,oldest_age_ms:1}:null});
+    current.splice(current.findIndex(v=>v.wave===wave&&v.kind==='wave')+1,0,...records);
+  }
+  const raw=encode(current);assert.equal(analyze(raw,sealOf(raw)).stats_calls,enabled?7:0);
+  for(const mutate of [
+    x=>x.splice(x.findIndex(v=>v.kind==='stats_result'),1),
+    x=>x.find(v=>v.kind==='stats_slot').worker=1,
+    x=>x.find(v=>v.kind==='stats_result').at_us=0,
+    x=>x.find(v=>v.kind==='stats_slot').wave=1,
+    x=>x.at(-1).stats=!enabled,
+    x=>x.find(v=>v.kind==='stats_result').counts=enabled?{pending:0,processing:0,dead_lettered:0,oldest_age_ms:0}:{},
+    x=>x.splice(1,0,{...x.find(v=>v.kind==='stats_slot')}),
+  ]){const bad=structuredClone(current);mutate(bad);const rawBad=encode(bad);assert.throws(()=>analyze(rawBad,sealOf(rawBad)));}
+  if(enabled){const bad=structuredClone(current);bad.find(v=>v.operation==='stats'&&v.kind==='operation').outcome='unknown';const rawBad=encode(bad);assert.throws(()=>analyze(rawBad,sealOf(rawBad)));}
+}
+console.log('schema7: nine off/on fixtures, 135 strict stats negative cases');

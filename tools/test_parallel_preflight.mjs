@@ -14,6 +14,7 @@ const run = (script, values) => {
 const preflight = 'deploy/remote-test/p07_parallel_preflight.sh';
 assert.equal(run(preflight, {}).status, 0);
 assert.equal(run(preflight, valid).status, 0);
+assert.equal(run(preflight, {...valid,P07_STATS:"1"}).status, 0);
 let rejected = 0;
 for (const key of Object.keys(valid)) for (const value of ['', '-1', 'NaN', '18446744073709551616', '999']) {
   for (const script of [preflight, 'deploy/remote-test/launch_p07_parallel.sh', 'deploy/remote-test/run_p07_parallel.sh']) {

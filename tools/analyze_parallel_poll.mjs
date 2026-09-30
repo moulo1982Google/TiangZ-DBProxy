@@ -15,7 +15,14 @@ export function validateBudget(warmup, sample, total, mixed) {
 
 export function analyze(raw, seal) {
   assert(raw.endsWith('\n'), 'journal must be sealed with a final newline');
-  const rows = raw.trimEnd().split('\n').map(s => JSON.parse(s));
+  const allRows = raw.trimEnd().split('\n').map(s => JSON.parse(s));
+  const schema7=allRows[0]?.schema===7;
+  const isStats=v=>['stats_slot','stats_result'].includes(v.kind)||v.operation==='stats';
+  const statsRows=schema7?allRows.filter(isStats):[];
+  const rows=schema7?allRows.filter(v=>!isStats(v)):allRows;
+  let statsCursor=0,statsOverlaps=0;
+  const statsEnabled=schema7?allRows[0].stats:false;
+  if(schema7) assert.equal(typeof statsEnabled,'boolean');
   let cursor = 0, previousEnd = 0, overlaps = 0;
   const take = kind => { const v = rows[cursor++]; assert.equal(v?.kind, kind); return v; };
   const uint = v => assert(Number.isSafeInteger(v) && v >= 0, 'invalid timing/count');
@@ -35,11 +42,11 @@ export function analyze(raw, seal) {
     const f=take('fixture'); mode=f.mode;
     assert(['ready','spread-ready','none','all-blocked','leased','backoff','leased-heads','backoff-heads','dead-heads'].includes(mode));
     mixed=['leased','backoff','leased-heads','backoff-heads','dead-heads'].includes(mode);
-    budget=validateBudget(f.schema===6?f.warmup_seconds:2,f.schema===6?f.sample_seconds:5,f.schema===6?f.rows:1000,mixed);
+    budget=validateBudget(f.schema>=6?f.warmup_seconds:2,f.schema>=6?f.sample_seconds:5,f.schema>=6?f.rows:1000,mixed);
     status=budget.sample===5?'SMOKE_ONLY':'BOUNDED_LEDGER_ONLY';
     if(mixed) for(const n of next) {n[0]=budget.blocked;n[1]=budget.blocked+1;}
-    if(f.schema===5||f.schema===6) {
-      assert.deepEqual(f,{kind:'fixture',schema:f.schema,mode,rows:budget.total,claim_calls:budget.calls,warmup_seconds:budget.warmup,sample_seconds:budget.sample,workers:2,publishers:2,claims_per_second:4,stats:false,seal_required:true});
+    if([5,6,7].includes(f.schema)) {
+      assert.deepEqual(f,{kind:'fixture',schema:f.schema,mode,rows:budget.total,claim_calls:budget.calls,warmup_seconds:budget.warmup,sample_seconds:budget.sample,workers:2,publishers:2,claims_per_second:4,stats:statsEnabled,seal_required:true});
       assert.deepEqual(seal,{schema:1,file:'journal.jsonl',bytes:Buffer.byteLength(raw),sha256:createHash('sha256').update(raw).digest('hex')},'missing or inconsistent journal seal');
     } else assert.equal(f.schema,mode==='spread-ready'?4:mixed?3:2);
     assert.equal(f.rows,budget.total);assert.equal(f.claim_calls,budget.calls);
@@ -73,6 +80,30 @@ export function analyze(raw, seal) {
       return [completed.get(0), completed.get(1)];
     }
     const c = operations('claim');
+    let statsEnd=0;
+    if(schema7&&wave%2===0) {
+      const takeStats=kind=>{const v=statsRows[statsCursor++];assert.equal(v?.kind,kind);assert.equal(v.wave,wave);assert.equal(v.worker,0);return v;};
+      assert.deepEqual(takeStats('stats_slot'),{kind:'stats_slot',wave,worker:0,enabled:statsEnabled,scheduled_us:w.scheduled_us});
+      if(statsEnabled){
+        const started=takeStats('started'), op=takeStats('operation');
+        assert.equal(started.operation,'stats');assert.equal(op.operation,'stats');assert.equal(op.outcome,'completed');
+        uint(started.at_us);uint(op.begin_us);uint(op.end_us);
+        assert(started.at_us>=w.dispatch_us&&op.begin_us>=started.at_us&&op.end_us>=op.begin_us);
+        statsEnd=op.end_us;
+        if(c.some(v=>Math.max(v.begin_us,op.begin_us)<Math.min(v.end_us,op.end_us)))statsOverlaps++;
+      }
+      const r=takeStats('stats_result');assert.equal(r.enabled,statsEnabled);uint(r.at_us);
+      assert(r.at_us>=Math.max(statsEnd,...c.map(v=>v.end_us)));statsEnd=r.at_us;
+      if(statsEnabled){
+        assert.deepEqual(Object.keys(r.counts).sort(),['dead_lettered','oldest_age_ms','pending','processing']);
+        for(const value of Object.values(r.counts))uint(value);
+        const empty=['none','all-blocked'].includes(mode);
+        assert.equal(r.counts.dead_lettered,['all-blocked','dead-heads'].includes(mode)?4:0);
+        assert.equal(r.counts.pending+r.counts.processing+r.counts.dead_lettered,budget.total-(empty?0:wave*2));
+        const base=mode==='none'?budget.total:mode==='leased'?budget.blocked*2:mode==='leased-heads'?4:0;
+        assert(r.counts.processing>=base&&r.counts.processing<=base+(empty?0:2));
+      } else assert.equal(r.counts,null);
+    }
     let a = c;
     if(mode==='ready'||mode==='spread-ready'||mixed) {
     const keys = new Set();
@@ -93,7 +124,7 @@ export function analyze(raw, seal) {
       }
       assert(!seen.has(l.event)); seen.add(l.event);
     }
-    a = operations('ack', Math.max(...c.map(v => v.end_us)));
+    a = operations('ack', Math.max(statsEnd,...c.map(v => v.end_us)));
     for (const ack of a) assert(ack.begin_us >= Math.max(...c.map(v => v.end_us)));
     } else {
       for(const worker of [0,1]) assert.deepEqual(take('empty'),{kind:'empty',wave,worker,publisher});
@@ -101,7 +132,7 @@ export function analyze(raw, seal) {
     const end = take('wave_completed'); assert.equal(end.wave, wave);
     uint(end.begin_us); uint(end.end_us);
     assert(end.begin_us >= w.dispatch_us && end.begin_us <= Math.min(...c.map(v => v.begin_us)));
-    assert(end.end_us >= Math.max(...a.map(v => v.end_us))); previousEnd = end.end_us;
+    assert(end.end_us >= Math.max(statsEnd,...a.map(v => v.end_us))); previousEnd = end.end_us;
     if (Math.max(...c.map(v => v.begin_us)) < Math.min(...c.map(v => v.end_us))) overlaps++;
     claims.push(...c.map(v => ({wave, worker:v.worker, duration_us:v.end_us-v.begin_us})));
   }
@@ -115,10 +146,12 @@ export function analyze(raw, seal) {
   const result = take('result');
   assert.equal(result.status,status); assert.equal(result.waves,budget.waves);
   assert.equal(result.workers,2); assert.equal(result.publishers,2); assert.equal(result.rows,budget.total);
-  assert.equal(result.claims,mode==='ready'||mode==='spread-ready'||mixed?budget.calls:0); assert.equal(result.stats,false);
+  assert.equal(result.claims,mode==='ready'||mode==='spread-ready'||mixed?budget.calls:0); assert.equal(result.stats,statsEnabled);
   assert.equal(result.warmup_seconds,budget.warmup); assert.equal(result.sample_seconds,budget.sample);
   assert(overlaps > 0); assert.equal(result.overlap_waves,overlaps); assert.equal(cursor,rows.length);
-  return {status, validation:'PARALLEL_CLAIMS_CHECKED', mode, waves:budget.waves, claim_calls:budget.calls, returned:seen.size, formal_claim_calls:budget.sample*4, overlap_waves:overlaps, claims_timing:claims};
+  assert.equal(statsCursor,statsRows.length);
+  if(statsEnabled)assert(statsOverlaps>0,'no actual stats/claim overlap');
+  return {stats_calls:statsEnabled?statsCursor/4:0,stats_overlap_waves:statsOverlaps,status, validation:'PARALLEL_CLAIMS_CHECKED', mode, waves:budget.waves, claim_calls:budget.calls, returned:seen.size, formal_claim_calls:budget.sample*4, overlap_waves:overlaps, claims_timing:claims};
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const dir = process.argv[2];
