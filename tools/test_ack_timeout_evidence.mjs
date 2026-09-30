@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {reconcileAckTimeout} from './ack_timeout_evidence.mjs';
 const run='p7at_local';
-const fixture={schema:1,run_id:run,database:run,scope:'leased_rows_ack_blocked_then_released',
+export const fixture={schema:1,run_id:run,database:run,scope:'leased_rows_ack_blocked_then_released',
   timeout_ms:5000,retries:0,extra_claims:0,blocker_pid:10,locked_us:100,blocked_us:300,
   after_timeout_us:5000300,release_us:5000400,final_us:5100000,rollback_confirmed:true,
   final_active_peers:0,total_rows:2,leases:[0,1].map(worker=>{
