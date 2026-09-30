@@ -136,3 +136,7 @@ P07新增990530d双独立连接有界工具，p7ps_0930a新库1000行2/5秒短�
 ### P07 真实PG领取超时空库负例完成
 
 入口c520b3b/工具e60a5c8，p7ct_0930a于UTC20:30:56.996→20:31:11.196新空库串行执行exit0/OOMfalse、1 passed。实际双PG PID被本库关系锁阻塞，双方原5秒timeout unknown完整留档，确认rollback后两请求不再active、空表0，严格EXPECTED_CLAIM_TIMEOUT_ONLY。原始/封存/12源码hash/环境资源已回收，详见outbox-costs末节。只补真实claim阻塞超时，不代表消息提交后/ack未知或全流程有界；正式九分布、高积压、容量缺口保持，仍不升压。
+
+### P07 两条真实ack超时后的最终状态已核对
+
+p7at_0930a新库UTC21:11:51.947→21:12:06.150，原5秒两个ack均unknown；实际双PID阻塞、超时后仍阻塞且租约未变、确认rollback后两条UPDATE完成发布的证据与封存全部通过。入口661c98f，详见outbox-costs末节。0重试，保留unknown客户端结果，不等同提交后丢响应注入或全流程有界。正式九分布/高积压/容量仍缺，保持不升压。

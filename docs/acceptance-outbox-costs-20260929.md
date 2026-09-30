@@ -577,3 +577,17 @@ analyze_ack_timeout.mjs严格读10条原始journal与bytes/SHA256/LF封存，关
 因为outbox_parallel_poll现在编译新子模块，两个现有launcher和配对分析器来源清单增加parallel_ack_timeout模块，未来13文件；旧12文件claim与11文件配对证据不回填，仍保留原工具版本结果。旧单轮及九模式配对合成检查通过。当前实际仍5基础服务，无其他编译/验收进程。
 
 本阶段未上传任何源码、未新建服务器库、未实测ack故障，不报真实ack未知已覆盖。下一步实际补专用ack runner/launcher（exact parallel_ack_timeout::real_ack_timeout、p7at_、禁止P07覆盖、原环境/来源/资源/事件证据），先本地入口拒绝检查，再新RunId新库串行一次必要实测。运行失败保持原证据和断言；完成后原unknown仍是unknown，仅以最终PG状态作独立核对。该路径不是“已经提交后响应丢失”精确注入，也不是全流程有界；正式九分布/P06高积压/P09容量缺口不变，继续不升压。
+
+## P07 真实ack超时后继续执行已核对（入口661c98f，p7at_0930a）
+
+专用ack runner固定exact parallel_ack_timeout::real_ack_timeout，p7at_前缀/单参数及全部P07覆盖在外部动作前拒绝，真实Bash正例及36负例通过。工具56f460e加入口5个上传文件SHA逐项一致。启动前/结束后实际5基础服务、无其他编译/验收；运行期间未修改上传源码。
+
+新库p7at_0930a UTC2026-09-30 21:11:51.947→21:12:06.150，容器exit0/OOMfalse，1 passed及P07_ACK_TIMEOUT_PROBE_COMPLETED。仅两行两个不同partition，领取后token各1、attempt0、有效30秒租约。专属blocker442716在相对151737us持行锁，worker442712/442714在155883us被实际PG证明等待该blocker。两个ack原5秒耗时5001324/5001672us，客户端均unknown。5159213us再次确认两个请求仍active/Lock等待同blocker，MVCC两行仍未发布且原租约完整有效；5161564us确认ROLLBACK，5166221us核对两个PG请求不再active，两行均published，owner/until清空、token1/attempt0不变。0重试、0额外领取。
+
+原始10条journal及seal、build/test/PG日志、13文件源码摘要、镜像容器、前后环境和资源全部拉回target/server_20260929/ack_timeout_p7at_0930a及p7at_0930a.*。严格分析输出ACK_UNKNOWN_RECONCILED_AS_PUBLISHED / SEALED_ACK_UNKNOWN_RECONCILIATION_CHECKED。环境时间包围、基础服务ID/启动/限额/挂载、工作台资源、13源码hash与本地逐项一致，review.json保留。两资源样本单区间PG max/oom/oom_kill/scan/steal增量0，不解除停止升压边界。
+
+实际证明本驱动路径中丢弃超时future没有取消这两条已发送UPDATE，释放锁后继续完成。客户端结果仍为unknown，最终PG发布状态是独立事后核对；不是把unknown改写为成功响应。故障发生在提交前等待行锁，不声称“提交已完成但响应丢失”精确注入完成，更不声称全流程有界。这个必要新工具负例已完成，不重复。
+
+p7at_0930a.events在本轮前启动180秒，预计UTC21:14:51自然退出；当前已回收自身start/die两条、stderr空，下一轮到期补拉完整窗口，不停止监听。非容器宿主活动未排除。只提交本任务文件，其他人的roadmap保持未提交。
+
+下一步回到P07正式九分布的规模/漂移约束评估：离线输出120/300、两相位三对的逐分布预置量、各publisher与partition起止可领比例以及全组累积保留库/行数，明确33600行混合储备消耗50%只满足现有数学下限，不代表稳态或资源许可。现有40k上界下不能靠加行数消除漂移，也不能偷偷缩短正式时长。先形成严格可核对的计划/拒绝条件，再决定原边界下可以实际执行的剩余范围；不直接启动33600正式，不升压。正式多worker九分布、P06高积压、P09容量仍未完成，全部旧异常保留。
