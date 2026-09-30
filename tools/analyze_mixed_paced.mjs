@@ -10,6 +10,15 @@ const rows=read('requests.jsonl').trim().split(/\r?\n/).map(JSON.parse);
 const checks=read('reconciliation.jsonl').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);
 const result=JSON.parse(read('result.json'));
 const manifest=rows.filter(r=>r.kind==='manifest');assert.equal(manifest.length,1);const m=manifest[0];
+if(m.probe_seal){
+ const seal=JSON.parse(read('probe-sealed.json'));assert.equal(seal.schema_version,1);
+ for(const [field,file] of [['stats_bytes','outbox-stats.jsonl'],['stage_bytes','stage-snapshots.jsonl']]){
+  if(field==='stage_bytes'&&!m.stage_audit){assert.equal(seal[field],null);continue;}
+  assert(Number.isSafeInteger(seal[field])&&seal[field]>0);
+  assert.equal(fs.statSync(path.join(root,file)).size,seal[field],'sealed file changed');
+  assert(read(file).endsWith('\n'),'unterminated sealed JSONL');
+ }
+}
 // Historical B2 runs predate the explicit baseline field.
 const baseline=m.baseline??'B2';assert(['B1','B2'].includes(baseline));
 let repair=null;

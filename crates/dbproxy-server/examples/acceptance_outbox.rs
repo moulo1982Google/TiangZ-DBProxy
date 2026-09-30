@@ -15,6 +15,12 @@ fn probe(
         let enabled = std::env::var("MIX_OUTBOX_STATS").unwrap() == "on";
         let path = std::env::var("MIX_OUTBOX_STATS_LOG").unwrap();
         let mut file = std::fs::File::create(path).unwrap();
+        let stop = std::path::PathBuf::from(std::env::var("MIX_PROBE_STOP").unwrap());
+        let sealed = std::path::PathBuf::from(std::env::var("MIX_PROBE_SEALED").unwrap());
+        assert!(
+            !stop.exists() && !sealed.exists(),
+            "fresh probe paths required"
+        );
         let mut stages = (std::env::var("MIX_STAGE_AUDIT").as_deref() == Ok("1"))
             .then(|| std::fs::File::create(std::env::var("MIX_STAGE_LOG").unwrap()).unwrap());
         let start = tokio::time::Instant::now();
@@ -24,6 +30,9 @@ fn probe(
             tokio::select! {
                 _ = shutdown.changed() => break,
                 _ = interval.tick() => {},
+            }
+            if stop.exists() {
+                break;
             }
             if let Some(stages) = &mut stages {
                 // Read existing in-memory counters only; no extra SQL, worker or metrics poll.
@@ -67,6 +76,26 @@ fn probe(
             writeln!(file,"{}",serde_json::json!({"unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),"elapsed_ms":start.elapsed().as_millis(),"enabled":enabled,"call_us":call.elapsed().as_micros(),"result":result})).unwrap();
             file.flush().unwrap();
         }
+        // Publish acknowledgement only after both writers are flushed and closed.
+        file.flush().unwrap();
+        let stats_bytes = file.metadata().unwrap().len();
+        drop(file);
+        let stage_bytes = stages.map(|mut file| {
+            file.flush().unwrap();
+            let len = file.metadata().unwrap().len();
+            drop(file);
+            len
+        });
+        let temp = sealed.with_extension("tmp");
+        std::fs::write(
+            &temp,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version":1,"stats_bytes":stats_bytes,"stage_bytes":stage_bytes
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(temp, sealed).unwrap();
     })
 }
 

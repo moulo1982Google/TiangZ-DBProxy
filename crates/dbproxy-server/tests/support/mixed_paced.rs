@@ -237,6 +237,8 @@ async fn fixed_rate_six_operations() {
                 .arg(&deploy)
                 .env("MIX_OUTBOX_STATS_LOG", dir.join("outbox-stats.jsonl"))
                 .env("MIX_STAGE_LOG", dir.join("stage-snapshots.jsonl"))
+                .env("MIX_PROBE_STOP", dir.join("probe.stop"))
+                .env("MIX_PROBE_SEALED", dir.join("probe-sealed.json"))
                 .env("FAULT_PG_A", &url)
                 .env("FAULT_AUTH_A", TOKEN_A)
                 .env("FAULT_REDIS_A", &env.redis[0])
@@ -279,7 +281,7 @@ async fn fixed_rate_six_operations() {
     let mut ledger = std::fs::File::create(dir.join("requests.jsonl")).unwrap();
     append(
         &mut ledger,
-        &json!({"kind":"manifest","tx_audit":tx_audit,"sdk_audit":sdk_audit,"stage_audit":stage_audit,"outbox_stats_mode":stats_mode,"outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
+        &json!({"kind":"manifest","probe_seal":stats_mode!="none","tx_audit":tx_audit,"sdk_audit":sdk_audit,"stage_audit":stage_audit,"outbox_stats_mode":stats_mode,"outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
     );
     append(
         &mut ledger,
@@ -495,6 +497,37 @@ async fn fixed_rate_six_operations() {
     println!("MIXED_PACED_RESULT {result}");
     assert_eq!(completed.len() as u64 + not_sent, total);
     if stats_mode != "none" {
+        std::fs::write(dir.join("probe.stop"), b"stop").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !dir.join("probe-sealed.json").exists() {
+                assert!(
+                    server.0.try_wait().unwrap().is_none(),
+                    "probe host exited before seal"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("probe did not seal evidence");
+        let sealed: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("probe-sealed.json")).unwrap()).unwrap();
+        assert_eq!(sealed["schema_version"], 1);
+        assert_eq!(
+            sealed["stats_bytes"].as_u64().unwrap(),
+            std::fs::metadata(dir.join("outbox-stats.jsonl"))
+                .unwrap()
+                .len()
+        );
+        if stage_audit {
+            assert_eq!(
+                sealed["stage_bytes"].as_u64().unwrap(),
+                std::fs::metadata(dir.join("stage-snapshots.jsonl"))
+                    .unwrap()
+                    .len()
+            );
+        } else {
+            assert!(sealed["stage_bytes"].is_null());
+        }
         let rows = std::fs::read_to_string(dir.join("outbox-stats.jsonl")).unwrap();
         let observations: Vec<Value> = rows
             .lines()
