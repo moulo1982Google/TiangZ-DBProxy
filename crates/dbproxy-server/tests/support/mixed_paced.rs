@@ -214,6 +214,10 @@ async fn fixed_rate_six_operations() {
     let stats_mode = std::env::var("MIX_OUTBOX_STATS").unwrap_or_else(|_| "none".into());
     assert!(["none", "off", "on"].contains(&stats_mode.as_str()));
     assert!(stats_mode == "none" || (baseline == "B2" && repair_mode == "none"));
+    let stage_mode = std::env::var("MIX_STAGE_AUDIT").unwrap_or_else(|_| "0".into());
+    assert!(["0", "1"].contains(&stage_mode.as_str()));
+    let stage_audit = stage_mode == "1";
+    assert!(!stage_audit || stats_mode != "none");
     let mut server = if baseline == "B1" || stats_mode != "none" {
         let binary = std::env::var("DBPROXY_ACCEPTANCE_HOST_BINARY")
             .expect("B1 requires the explicitly built test host");
@@ -222,6 +226,7 @@ async fn fixed_rate_six_operations() {
                 .arg("--tenants")
                 .arg(&deploy)
                 .env("MIX_OUTBOX_STATS_LOG", dir.join("outbox-stats.jsonl"))
+                .env("MIX_STAGE_LOG", dir.join("stage-snapshots.jsonl"))
                 .env("FAULT_PG_A", &url)
                 .env("FAULT_AUTH_A", TOKEN_A)
                 .env("FAULT_REDIS_A", &env.redis[0])
@@ -264,7 +269,7 @@ async fn fixed_rate_six_operations() {
     let mut ledger = std::fs::File::create(dir.join("requests.jsonl")).unwrap();
     append(
         &mut ledger,
-        &json!({"kind":"manifest","outbox_stats_mode":stats_mode,"outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
+        &json!({"kind":"manifest","stage_audit":stage_audit,"outbox_stats_mode":stats_mode,"outbox_audit":std::env::var("MIX_OUTBOX_AUDIT").as_deref()==Ok("1"),"run":env.run_id,"baseline":baseline,"repair_mode":repair_mode,"repair_rows":repair_rows,"repair_cache_ttl_ms":if repair_mode=="none" {Value::Null} else {json!(1_800_000)},"rate":rate,"warmup":warm,"sample":sample,"concurrency":concurrency,"connections":4,"shards":2,"read_connections":2,"runtime_workers":4,"mix":[40,20,20,10,5,5],"batch":BATCH,"payload_bytes":1024,"payload_rule":"(n+i+byte)%251 wrapping u64","cleanup":if baseline=="B1" {"test-host-disabled"} else {"production-enabled"},"full_timing":warm==120&&sample==300}),
     );
     append(
         &mut ledger,
@@ -490,6 +495,17 @@ async fn fixed_rate_six_operations() {
                 .iter()
                 .all(|v| v["result"].get("error").is_none())
         );
+    }
+    if stage_audit {
+        let rows = std::fs::read_to_string(dir.join("stage-snapshots.jsonl")).unwrap();
+        assert!(rows.lines().count() >= 2, "stage capture did not execute");
+        for row in rows.lines() {
+            let row: Value = serde_json::from_str(row).unwrap();
+            assert_eq!(row["schema_version"], 1);
+            assert_eq!(row["kind"], "stage_snapshot");
+            assert!(!row["request_stages"].as_array().unwrap().is_empty());
+            assert!(!row["storage_stages"].as_array().unwrap().is_empty());
+        }
     }
     if !publication.is_null() {
         assert_eq!(publication["mismatches"], 0);

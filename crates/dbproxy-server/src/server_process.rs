@@ -24,6 +24,7 @@ pub fn main(receipt_cleanup: bool) -> Result<(), Box<dyn Error>> {
 
 pub type AcceptanceWorker = fn(
     Arc<StorageBackend>,
+    Arc<DbProxyMetrics>,
     watch::Receiver<bool>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
@@ -302,7 +303,11 @@ async fn run_servers(
         let span = tenant_span(id.as_deref());
         if let Some(backend) = durable_backend {
             if let Some(worker) = acceptance_worker {
-                workers.spawn(worker(Arc::clone(&backend), shutdown_rx.clone()));
+                workers.spawn(worker(
+                    Arc::clone(&backend),
+                    Arc::clone(metrics),
+                    shutdown_rx.clone(),
+                ));
             }
             if receipt_cleanup {
                 workers.spawn(

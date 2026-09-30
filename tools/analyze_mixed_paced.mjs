@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import {analyzeStageSnapshots} from './analyze_mixed_stages.mjs';
 const root=process.argv[2];assert(root,'usage: node tools/analyze_mixed_paced.mjs <mixed-paced directory>');
 const read=n=>fs.readFileSync(path.join(root,n),'utf8');
 const rows=read('requests.jsonl').trim().split(/\r?\n/).map(JSON.parse);
@@ -87,6 +88,13 @@ if(m.outbox_stats_mode && m.outbox_stats_mode!=='none'){
  else assert(all.every(s=>s.result===null));
 }
 const publicationValid=!publication||(publication.mismatches===0&&publication.redis_rows===publication.pg_rows&&publication.entries.every(e=>e.valid&&e.published&&e.redis_ids.length===1));
-const analysis={stats,publication,status:accepted&&publicationValid?(result.full_timing?'COMPLETE_SINGLE_TIMED_ROUND':'SMOKE_ONLY'):'REJECTED_LOAD',manifest:m,result,perOperation,capacity_proven:false};
+assert(m.stage_audit===undefined||typeof m.stage_audit==='boolean');
+let stages=null;
+if(m.stage_audit){
+ const starts=rows.filter(r=>r.kind==='measurement_start');assert.equal(starts.length,1);
+ stages=analyzeStageSnapshots(m,starts[0].unix_ms,read('stage-snapshots.jsonl').trim().split(/\r?\n/).map(JSON.parse));
+ fs.writeFileSync(path.join(root,'stage-analysis.json'),JSON.stringify(stages,null,2));
+}
+const analysis={stages:stages?{status:stages.status,covered_us:stages.covered_us,summaries:stages.summaries}:null,stats,publication,status:accepted&&publicationValid?(result.full_timing?'COMPLETE_SINGLE_TIMED_ROUND':'SMOKE_ONLY'):'REJECTED_LOAD',manifest:m,result,perOperation,capacity_proven:false};
 fs.writeFileSync(path.join(root,'analysis.json'),JSON.stringify(analysis,null,2));console.log(JSON.stringify(analysis,null,2));
 if(!accepted||!publicationValid)process.exitCode=1;
