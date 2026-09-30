@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# P07 fixed-rate Outbox polling; shared-connection stats on/off, three timed rounds.
+# P07 two-worker smoke; formal timing/stats remain disabled pending evidence tooling.
 set -euo pipefail
+source "$(dirname "$0")/p07_parallel_preflight.sh"
 RUN_ID=${1:?new run id required}
 [[ $RUN_ID =~ ^[a-z][a-z0-9_]{0,18}$ ]] || exit 2
 DATA=${DBPROXY_TEST_DATA:-/data/dbproxy-test}
@@ -22,9 +23,9 @@ trap finish EXIT
 docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cpus 4 \
     --memory 16g --memory-swap 16g -e CARGO_BUILD_JOBS=4 \
     -e P07_PARALLEL_MODE="${P07_PARALLEL_MODE:-ready}" \
-    -e P07_PUBLISHERS="${P07_PUBLISHERS:-1}" \
-    -e P07_WARMUP_SECONDS="${P07_WARMUP_SECONDS:-120}" \
-    -e P07_SAMPLE_SECONDS="${P07_SAMPLE_SECONDS:-300}" -e P07_ROUNDS="${P07_ROUNDS:-3}" \
+    -e P07_PUBLISHERS=2 -e P07_WORKERS=2 -e P07_ROWS=1000 \
+    -e P07_WARMUP_SECONDS=2 -e P07_SAMPLE_SECONDS=5 -e P07_ROUNDS=1 \
+    -e P07_CLAIMS_PER_SECOND=4 -e P07_STATS=0 \
     -v "$DATA/evidence:/evidence" -v "$DATA/pglog:/pglog:ro" \
     -v "$DATA/src/crates/dbproxy-storage/tests:/src/crates/dbproxy-storage/tests:ro" \
     -v "$DATA/src/deploy/remote-test:/src/deploy/remote-test:ro" \

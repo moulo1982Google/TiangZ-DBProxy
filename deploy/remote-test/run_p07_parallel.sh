@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(dirname "$0")/p07_parallel_preflight.sh"
 source "$(dirname "$0")/common.sh"
 export PATH=/usr/local/cargo/bin:$PATH
 RUN_ID=${1:?new run id required}

@@ -4,6 +4,8 @@ use std::{collections::HashSet, fs::File, future::Future, io::Write, sync::Mutex
 use tiangz_dbproxy_storage::{OutboxRoute, PostgresSnapshotStore};
 use tokio::time::{Instant, sleep_until, timeout};
 
+mod parallel_budget;
+
 struct Journal(Mutex<File>);
 impl Journal {
     fn record(&self, value: Value) {
@@ -170,6 +172,8 @@ async fn failed_worker_does_not_cancel_delayed_peer() {
 #[tokio::test]
 #[ignore = "requires a fresh dedicated PostgreSQL database"]
 async fn two_workers_fixed_budget() {
+    let budget = parallel_budget::smoke_environment(|key| std::env::var(key).ok())
+        .expect("parallel polling preflight rejected; no database changes made");
     assert_eq!(
         std::env::var("DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION").as_deref(),
         Ok("1")
@@ -181,9 +185,9 @@ async fn two_workers_fixed_budget() {
         File::create(output.join("journal.jsonl")).unwrap(),
     ));
     // Intentionally smoke-only: formal timing/distributions require a separate review.
-    let warmup = 2_u64;
-    let sample = 5_u64;
-    let waves = (warmup + sample) * 2;
+    let warmup = budget.warmup;
+    let sample = budget.sample;
+    let waves = budget.waves;
     let mode = std::env::var("P07_PARALLEL_MODE").unwrap_or_else(|_| "ready".into());
     assert!(matches!(
         mode.as_str(),
