@@ -350,3 +350,13 @@ UTC2026-09-30 12:30:37至13:16:24，exit0/OOMfalse，六次1 passed及OUTBOX_PAI
 267资源样本，PG峰4.744GiB，主机可用最低38.966GiB，max/oom/oom_kill增量0，pgscan/pgsteal各35986，内存full PSI峰0.002278%。有回收，不解除升压边界。收集时连续事件只有本轮start/die、stderr空，当前只有5基础服务；非容器宿主活动未排除，观察器按13:35:37自然结束，不停止。
 
 退出路径核对：mixed_paced在服务仍运行时读取校验阶段文件；随后Server::drop调用Child::kill/wait，采样器仍每秒writeln并flush。此先读再杀存在验证后继续写入、强杀截断的竞态，与本次尾行损坏一致；尚无写入中断瞬间证据，不能声称已修复。下一步先修验收采样器退出/封存协议，让采样器停止并等待完整flush后再校验文件，继续严格拒绝截断；只作用于验收工具，先本地验证及新RunId短测，不直接重跑45分钟矩阵。剩余多publisher并发worker、P06高积压、容量范围仍缺。
+
+## 采样器封存修复与seals_0930a短测
+
+工具321762a仅修改验收例子、驱动及离线分析：驱动完成请求与核对后创建probe.stop；采样器在下一tick边界停止，完成stats/stage flush，关闭两文件，再以临时文件rename发布probe-sealed.json（schema1及两文件字节数）。驱动最多等待10秒并检查宿主存活，收到确认且核对长度后才读JSONL；之后Server::drop强杀不再中断采样写入。manifest显式probe_seal，离线分析要求确认、准确长度及最终换行，仍逐行严格解析，旧历史无此字段保持原解析规则。没有修改生产服务或旧失败数据。
+
+本地feature例子及fault_process Clippy -D warnings、fmt通过。独立复制历史短测夹具验证封存正例、缺确认、错字节数及缺末尾换行负例；原始文件未改。两上传源SHA256分别1d880ac935e55b922f97490ecd116518f563572ff5f7d30195d0b5148fa5925e和3ad4443e06dca663ec342bfa87f39dc60f2b79fee0d3bb4fac6c92c62054f9fe，远端一致。
+
+seals_0930a六轮新库2/5秒UTC2026-09-30 13:42:28至13:44:40，exit0/OOMfalse，六次1 passed及OUTBOX_PAIRS_COMPLETED。840请求42真实同键消息零错误/未发送/核对差异，guardnull。六份封存确认存在，stats/stage字节数与进程退出后完整原始一致；42条trace/output/response对应，六轮STAGE_INTERVALS_CHECKED/SDK_CALLBACKS_CHECKED/TRANSACTION_TRACES_CHECKED，SMOKE_ONLY。全部原始已拉回。只验证工具协议，不作为性能结论，不修复或覆盖rspf旧证据失败。
+
+rspf事件观察器到期后再次拉回，仍只有自身start/die、stderr空，非容器宿主负载未排除。当前只有5基础服务，无新正式验收。此次没有业务计时新观测，故不自动重跑45分钟矩阵；下一步推进剩余P06工具前置：让修复注入随业务guard停止，并明确已注入/未注入核对语义，先本地验证，不因此授权高压故障或升压。性能诊断仍有跨端未覆盖路径，不能归纯网络；多publisher并发worker和容量缺口继续保留。
