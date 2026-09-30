@@ -6,6 +6,7 @@ use tiangz_dbproxy_storage::{OutboxRoute, PostgresSnapshotStore};
 use tokio::time::{Instant, sleep_until, timeout};
 
 mod parallel_budget;
+mod parallel_claim_timeout;
 
 struct Journal(Mutex<File>);
 impl Journal {

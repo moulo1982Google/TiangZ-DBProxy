@@ -9,6 +9,7 @@ const modes=['ready','spread-ready','none','all-blocked','leased','backoff','lea
 export const requiredSources=['crates/dbproxy-storage/tests/outbox_parallel_poll.rs','crates/dbproxy-storage/tests/parallel_budget/mod.rs','deploy/remote-test/p07_parallel_preflight.sh','deploy/remote-test/run_p07_parallel.sh','deploy/remote-test/launch_p07_parallel.sh','deploy/remote-test/common.sh','deploy/remote-test/sample_containers.sh','crates/dbproxy-storage/src/outbox.rs','crates/dbproxy-storage/src/outbox_stats.sql','crates/dbproxy-storage/src/outbox_claim.sql'];
 const image='sha256:ae3b3d8e17608b277067e3a44ee3e45056a987655b023aad4b025dc0f6811470';
 requiredSources.push('deploy/remote-test/capture_p07_environment.sh');
+requiredSources.push('crates/dbproxy-storage/tests/parallel_claim_timeout/mod.rs');
 function sources(raw) {
   assert(raw.endsWith('\n'));
   const found=new Map();

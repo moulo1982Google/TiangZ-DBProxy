@@ -33,6 +33,7 @@ docker run -d --name "$WB" --network dbproxy-test --cpuset-cpus 20-27,48-55 --cp
     "$IMAGE" bash /src/deploy/remote-test/run_p07_parallel.sh "$RUN_ID" >/dev/null
 docker exec "$WB" sha256sum /src/crates/dbproxy-storage/tests/outbox_parallel_poll.rs \
     /src/crates/dbproxy-storage/tests/parallel_budget/mod.rs \
+    /src/crates/dbproxy-storage/tests/parallel_claim_timeout/mod.rs \
     /src/deploy/remote-test/p07_parallel_preflight.sh \
     /src/deploy/remote-test/run_p07_parallel.sh \
     /src/deploy/remote-test/launch_p07_parallel.sh \
