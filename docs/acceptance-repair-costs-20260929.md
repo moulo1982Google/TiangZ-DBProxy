@@ -135,3 +135,11 @@ rgs_0930a新库六轮2/5秒（control/repair、repair/control、control/repair�
 源码提供夹具干扰线索：PostgresSnapshotStore::save路径在保存事务内部调用cache_repair::enqueue_in_transaction；prepare先启动服务再预置两次save，后台worker已可处理这些自动队列项。因此“只有显式500ms enqueue才会修复、未注入后缀保持原缓存”这个假设无效。当前未保留每项预置前后队列/缓存时间线，不能仅凭源码断言9项变化的精确时刻与持有者，但足以拒绝隔离成本结论。之前rgs三组42次显式enqueue不等于42次唯一修复执行；历史P06组数据正确性事实保留，单独归因显式注入负载的成本结论需重新限定，不删除旧报告。
 
 下一步先设计并验证新库夹具建立边界，显式记录自动预置修复的完成状态、开始测量时队列与缓存基线，避免后台预置修复混入观测；不能通过删除队列/缓存、放宽untouched断言或生产关闭开关绕过。原rgstop失败完整保留，不盲目重跑。停止信号生效只是本次部分结论；高积压故障、容量及隔离修复成本均未通过。当前无新验收负载，仍不升压。
+
+## rgbas_0930a：当前缓存基线下停止负例核验
+
+工具5c2711e在预置后最多等待30秒，让正常worker完成save自动产生的修复，逐次记录repair-baseline.jsonl队列观测；随后逐项要求缓存与PG完整快照一致、revision2，保存实际缓存基线，并再次要求该namespace队列为空。未删除队列/缓存、未停止worker、未增加生产开关。该夹具明确标记current_cache_reenqueue，只验证当前缓存重复入队的停止与核对语义，不能替代陈旧缓存修复成本或高积压实验。离线分析严格要求基线条数、顺序、版本、matches及最终空队列。Clippy -D warnings、fmt和Node语法检查通过，上传源码SHA256 57bd3177e669f5b5fe89f52b168b08bc0f36e026bd9f844020e2a498298cb4cc一致。
+
+rgbas_0930a_r0新库于UTC2026-09-30 14:26:53至14:27:43结束，容器exit1/OOMfalse，原始全拉回。基线队列观测为0，14项均与PG revision2一致，baseline_ready pending0。n40 dispatch153533us触发原guard，40响应、100未发送，已发业务错误及核对差异0。repair admitted5/not_injected9/stoppedtrue/remaining0/mismatches0/untouched_mismatches0，完整操作意图/完成账本严格对应。离线分析顺利完成全部一致性断言并生成REJECTED_LOAD，退出1；测试仍在原not_sent==0断言失败，不把预期guard负例改成正常负载通过。
+
+本轮验证了停止通知、已领取前缀排空和未领取后缀保持稳定的组合路径；此前rgstop的9项不符与失败原样保留。初次队列观测已为0，因此本轮没有实际覆盖“等待非空预置队列排空”的分支。尚未验证真实enqueue超时的提交未知结果，只已有本地超时账本测试。下一步优先补无guard当前基线正常路径与分析器基线负例，并设计真正陈旧缓存修复的可观测夹具，不能通过降低未注入断言或把当前缓存重复入队算陈旧修复来结束P06。保持不升压、不重复正式低速矩阵。
