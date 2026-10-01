@@ -1,5 +1,7 @@
 # Outbox 有界批量发布
 
+2026-10-02 改进版独立重建与 R2 复测完成：Linux Rust 228/格式/Clippy/Release 和另行实际执行的 9 项真实 PG/Redis 检查通过，同一冻结客户端 300+900 秒健康负载及 300 秒停载观察通过。终态 3870 个事件全发布，独立 SQL 趋势/有界积压/排空门禁和 Redis 原始载荷一致性通过；平均 0.385 核、父组峰值 333.32 MiB，保持原 AOF/PG/请求预算。实际轻量快照最大 34 字节；故障、真实存档或 24 小时资格未由本轮覆盖。保护业务复核、本轮资源回收及首次后置工具失败详见[容量复测报告](remote-capacity-2c4g-100-2026-10-01.md)；不继承旧制品长稳结论，未 push。
+
 2026-10-01：云上 2C4G/100 玩家修改前基线确认 Outbox 输入约 3.24 条/s，两个默认 worker 串行 AOF 确认只能发布约 1.99 条/s，终态仍有 1530 条未发布。资源余量不能替代队列跟得上的证据。用户要求修改后重测，当前为本地开发修复，尚未完成改进版云上验收；详见[容量基线与复测](remote-capacity-2c4g-100-2026-10-01.md)。
 
 ## 实现边界
@@ -22,4 +24,4 @@ RESP fixture 验证 16 个 XADD 共用一次确认、AOF 失败与取消后全�
 
 第一次新增批量 fixture 在 Windows 失败：对每条命令调用 `tokio::sleep(Duration::ZERO)`，实际引入累计调度延迟，使 150 ms 测试取消发生在写入阶段而非计划中的 AOF 等待，观察到只收 15 条。零延迟现在直接执行，原非零注入保留；9 项 Publisher 回归通过，首次失败日志保留。禁止调大产品预算或删除失败断言绕过。复测 `cargo test -p tiangz-dbproxy-storage --lib outbox_publisher --locked`。
 
-完整 Rust/Clippy/TS SDK、独立 PG/Redis 及 Linux 发布重建结果待最终记录；不能继承旧 RC2 字节的完整通过历史。
+Windows Rust 226/Clippy/TS SDK 29 与 Publisher 9 项 fixture 已通过；新 Linux Rust 228、格式/Clippy、Release 重建和另行执行的 9 项真实 PG/Redis 检查，以及云上 R2 短时容量已完成，详细身份/命令/日志见上述报告。默认 ignored 项、故障/完整长稳或真实游戏大载荷仍按各自证据报告，不能继承旧 RC2 字节的完整通过历史。
