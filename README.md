@@ -8,6 +8,8 @@
 
 云上 [2C4G/100 玩家基线与复测](docs/remote-capacity-2c4g-100-2026-10-01.md)发现默认 Outbox 发布落后事件输入；开发分支增加[有界批量发布](docs/outbox-batch-publication.md)，最多 16 个独立排序组共用一次同连接 AOF 确认，保持租约、顺序、至少一次与原预算。新 Linux 重建/真实存储回归和同负载 300+900 秒、300 秒停载观察通过，终态 3870 个事件全发布；轻量负载的短时结果不替代故障、真实存档容量或完整长稳资格。
 
+沿用同一通过短时复测的制品，已启动[2C4G / 100 玩家云上故障长稳](docs/cloud-fault-soak-2026-10-02.md)：逐级完整 30 分钟至 24 小时，每阶段五类故障、独立原始证据复核及空载观察；首轮控制器失败留档后从新现场重启，尚未形成完整阶段或 24 小时通过。
+
 0.7 增加独立[只读容量命令](docs/capacity-observation.md)，观察分区表/回执/事实/Outbox 的估算行数和物理字节，可显式开启有期限的服务器时间扫描；不执行迁移或自动清理。真实恢复契约与本轮隔离验证见[恢复验收记录](docs/v0.7-recovery-acceptance.md)。
 
 [![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)
