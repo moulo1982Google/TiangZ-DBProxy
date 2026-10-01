@@ -6,6 +6,8 @@
 
 0.7 开发分支的[可靠 Redis 确认预算](docs/redis-durability-budget.md)将入队与后台 Outbox 的 AOF/I/O 等待分别配置，并让排队、重连、写入、确认消费原总预算。默认 AOF 仍为 2 秒，可靠 ACK 不降级；新连接不能确认旧连接的写入。新增阶段耗时、超时与队列等待观测，修改版需要重新构建、重启及独立长稳。
 
+云上 [2C4G/100 玩家基线](docs/remote-capacity-2c4g-100-2026-10-01.md)发现默认 Outbox 发布落后事件输入；开发分支现增加[有界批量发布](docs/outbox-batch-publication.md)，最多 16 个独立排序组共用一次同连接 AOF 确认，保持租约、顺序、至少一次与原预算。改进版需要独立重建复测，不能继承旧候选的长稳结果。
+
 0.7 增加独立[只读容量命令](docs/capacity-observation.md)，观察分区表/回执/事实/Outbox 的估算行数和物理字节，可显式开启有期限的服务器时间扫描；不执行迁移或自动清理。真实恢复契约与本轮隔离验证见[恢复验收记录](docs/v0.7-recovery-acceptance.md)。
 
 [![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)

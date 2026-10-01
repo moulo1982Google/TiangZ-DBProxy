@@ -395,6 +395,112 @@ async fn workers_compete_for_one_lease_without_blocking_other_partitions() {
 
 #[tokio::test]
 #[ignore = "requires dedicated PostgreSQL test URL and explicit migration opt-in"]
+async fn batched_claims_compete_only_for_partition_heads_and_preserve_dead_letter_fences() {
+    bounded(async {
+        let mut fixture = Fixture::new().await;
+        let queue = fixture.store.outbox_queue();
+        for invalid_limit in [0, 65] {
+            assert!(
+                queue
+                    .claim_batch_for_publisher("invalid", 30_000, Some(&fixture.id), invalid_limit)
+                    .await
+                    .is_err()
+            );
+        }
+        for partition in 0..16 {
+            for suffix in ["head", "following"] {
+                let (request, effects) = fixture.request(
+                    &format!("{suffix}-{partition}"),
+                    &format!("group-{partition}"),
+                );
+                fixture
+                    .store
+                    .commit_records(request, effects)
+                    .await
+                    .unwrap();
+            }
+        }
+        let barrier = Arc::new(Barrier::new(8));
+        let mut tasks = JoinSet::new();
+        for worker in 0..8 {
+            let store = PostgresSnapshotStore::connect_existing(&fixture.url)
+                .await
+                .unwrap();
+            let barrier = barrier.clone();
+            let publisher = fixture.id.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                store
+                    .outbox_queue()
+                    .claim_batch_for_publisher(
+                        &format!("batch-worker-{worker}"),
+                        30_000,
+                        Some(&publisher),
+                        4,
+                    )
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut heads = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            let batch = result.unwrap();
+            assert!(batch.len() <= 4);
+            heads.extend(batch);
+        }
+        assert_eq!(heads.len(), 16);
+        let partitions = heads
+            .iter()
+            .map(|lease| &lease.event.partition_key)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(partitions.len(), 16);
+        assert!(
+            heads
+                .iter()
+                .all(|lease| lease.event.event_id.contains("head-"))
+        );
+        assert!(
+            queue
+                .claim_batch_for_publisher("no-follower", 30_000, Some(&fixture.id), 16)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(queue.fail(&heads[0], "poison head", 1, 1).await.unwrap());
+        for head in &heads[1..] {
+            assert!(queue.acknowledge(head).await.unwrap());
+            assert!(
+                !queue.acknowledge(head).await.unwrap(),
+                "ACK is still fenced per lease"
+            );
+        }
+        let followers = queue
+            .claim_batch_for_publisher("next-batch", 30_000, Some(&fixture.id), 16)
+            .await
+            .unwrap();
+        assert_eq!(followers.len(), 15);
+        assert!(
+            followers
+                .iter()
+                .all(|lease| lease.event.event_id.contains("following-")
+                    && lease.event.partition_key != heads[0].event.partition_key)
+        );
+        for follower in &followers {
+            assert!(queue.acknowledge(follower).await.unwrap());
+        }
+        assert!(
+            queue
+                .claim_batch_for_publisher("poison-remains", 30_000, Some(&fixture.id), 16)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL test URL and explicit migration opt-in"]
 async fn expired_lease_cannot_ack_or_fail_before_or_after_same_worker_reclaims() {
     bounded(async {
         let mut fixture = Fixture::new().await;

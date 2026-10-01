@@ -60,9 +60,9 @@ pub use backlog::{
     SnapshotBacklogAck, SnapshotBacklogLease,
 };
 pub use cache_repair::{CacheRepairLease, CacheRepairStats, PostgresCacheRepairQueue};
-pub use outbox::{
-    OutboxLease, OutboxStats, PostgresOutboxQueue, RedisOutboxPublisher, RedisStreamPublisher,
-};
+mod outbox_publisher;
+pub use outbox::{OutboxLease, OutboxStats, PostgresOutboxQueue};
+pub use outbox_publisher::{RedisOutboxPublisher, RedisStreamPublisher};
 
 const SCHEMA_MIGRATION_BOOTSTRAP: &str = include_str!("../migrations/000_schema_migrations.sql");
 const SNAPSHOT_MIGRATION: &str = include_str!("../migrations/001_snapshot.sql");

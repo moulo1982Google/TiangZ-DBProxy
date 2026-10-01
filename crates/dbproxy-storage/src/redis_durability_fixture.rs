@@ -15,6 +15,7 @@ pub(crate) enum Failure {
     Unconfirmed,
     Stall,
     Disconnect,
+    WriteError,
 }
 pub(crate) struct Plan {
     pub write: &'static [u8],
@@ -27,6 +28,7 @@ pub(crate) struct Plan {
 pub(crate) struct Observed {
     pub writes: Vec<usize>,
     pub ack_ms: Vec<(usize, u64)>,
+    pub commands: Vec<(usize, Vec<Vec<u8>>)>,
 }
 pub(crate) struct Fixture {
     pub url: String,
@@ -77,11 +79,23 @@ impl Fixture {
                         }
                         let reply: &[u8] = if args[0] == plan.write {
                             observed.lock().unwrap().writes.push(index);
-                            if index == 0 {
+                            observed
+                                .lock()
+                                .unwrap()
+                                .commands
+                                .push((index, args.clone()));
+                            if index == 0 && !plan.first_write_delay.is_zero() {
                                 tokio::time::sleep(plan.first_write_delay).await;
                             }
                             if plan.write == b"XADD" {
-                                b"$3\r\n1-0\r\n"
+                                if index == 0
+                                    && matches!(plan.failure, Failure::WriteError)
+                                    && args[4] == b"batch-event-1"
+                                {
+                                    b"-WRONGTYPE fixture write failure\r\n"
+                                } else {
+                                    b"$3\r\n1-0\r\n"
+                                }
                             } else {
                                 b":1\r\n"
                             }
@@ -110,6 +124,9 @@ impl Fixture {
                                         break;
                                     }
                                     Failure::Unconfirmed => b"*2\r\n:0\r\n:0\r\n",
+                                    Failure::WriteError => {
+                                        panic!("failed pipeline cannot be acknowledged")
+                                    }
                                 }
                             } else {
                                 tokio::time::sleep(plan.second_ack_delay).await;

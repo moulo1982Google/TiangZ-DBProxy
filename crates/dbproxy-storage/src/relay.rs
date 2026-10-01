@@ -39,6 +39,7 @@ impl OutboxRoute {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct PublishMessage<'a> {
     pub event: &'a OutboxEvent,
     pub destination: &'a str,
@@ -64,6 +65,20 @@ pub trait Publisher: Send + Sync {
     /// 仅在约定的 MQ 持久确认后成功；不能代表业务消费者已处理。
     /// Success means broker durability acknowledgement, not consumer completion.
     async fn publish(&self, message: PublishMessage<'_>) -> Result<PublishReceipt, PublishError>;
+
+    /// Receipts retain input order. Each success requires the same durability as `publish`.
+    /// A driver may share one broker confirmation across independent ordering groups.
+    /// The default keeps existing publishers source-compatible; the relay bounds the deadline.
+    async fn publish_batch(
+        &self,
+        messages: &[PublishMessage<'_>],
+    ) -> Vec<Result<PublishReceipt, PublishError>> {
+        let mut results = Vec::with_capacity(messages.len());
+        for message in messages {
+            results.push(self.publish(*message).await);
+        }
+        results
+    }
 }
 
 impl PostgresOutboxQueue {
