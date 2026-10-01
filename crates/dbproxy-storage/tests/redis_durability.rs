@@ -11,6 +11,114 @@ use tiangz_dbproxy_storage::{
 };
 
 #[tokio::test]
+#[ignore = "requires dedicated AOF Redis and DBPROXY_RUN_REDIS_BUDGET_TESTS=1; publishes streams"]
+async fn batch_confirmation_preserves_real_stream_ids_routes_and_payloads() {
+    assert_eq!(
+        std::env::var("DBPROXY_RUN_REDIS_BUDGET_TESTS").as_deref(),
+        Ok("1")
+    );
+    let url = std::env::var("DBPROXY_REDIS_URL").expect("dedicated Redis URL");
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut connection = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let config: Vec<String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("appendonly")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(config, ["appendonly", "yes"]);
+    let metrics = Arc::new(StorageMetrics::default());
+    let publisher = RedisOutboxPublisher::connect_with_config(
+        &url,
+        "legacy:",
+        RedisDurabilityConfig::default(),
+        Duration::from_secs(5),
+        metrics.clone(),
+    )
+    .await
+    .unwrap();
+    let streams = [
+        format!("batch-aof:{suffix}:first"),
+        format!("batch-aof:{suffix}:second"),
+    ];
+    let events = (0..16)
+        .map(|index| OutboxEvent {
+            event_id: format!("real-batch-{suffix}-{index}"),
+            topic: "legacy.topic".into(),
+            partition_key: format!("partition-{index}"),
+            payload: vec![index as u8, 0, 255],
+            occurred_at_unix_ms: index,
+        })
+        .collect::<Vec<_>>();
+    let messages = events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| PublishMessage {
+            event,
+            destination: &streams[index % 2],
+            operation_id: "batch-operation",
+            trade_id: "batch-trade",
+        })
+        .collect::<Vec<_>>();
+    let receipts = Publisher::publish_batch(&publisher, &messages).await;
+    assert_eq!(receipts.len(), 16);
+    assert!(receipts.iter().all(Result::is_ok));
+    for stream in &streams {
+        let entries: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+            .arg(stream)
+            .arg("-")
+            .arg("+")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(entries.ids.len(), 8);
+        for entry in entries.ids {
+            let id: String =
+                redis::from_redis_value(entry.map.get("event_id").unwrap().clone()).unwrap();
+            let index = events
+                .iter()
+                .position(|event| event.event_id == id)
+                .unwrap();
+            assert_eq!(&messages[index].destination, &stream.as_str());
+            assert_eq!(entry.id, receipts[index].as_ref().unwrap().message_id);
+            assert_eq!(
+                redis::from_redis_value::<Vec<u8>>(entry.map.get("payload").unwrap().clone())
+                    .unwrap(),
+                events[index].payload
+            );
+            assert_eq!(
+                redis::from_redis_value::<String>(entry.map.get("partition_key").unwrap().clone())
+                    .unwrap(),
+                events[index].partition_key
+            );
+            assert_eq!(
+                redis::from_redis_value::<String>(entry.map.get("operation_id").unwrap().clone())
+                    .unwrap(),
+                "batch-operation"
+            );
+        }
+    }
+    let aof = metrics
+        .latency_snapshot()
+        .into_iter()
+        .find(|stage| stage.stage == "outbox_aof")
+        .unwrap();
+    assert_eq!(
+        aof.buckets.iter().sum::<u64>(),
+        1,
+        "one durability confirmation for sixteen publications"
+    );
+    assert_eq!(aof.timeouts, 0);
+}
+
+#[tokio::test]
 #[ignore = "requires a dedicated empty AOF Redis and DBPROXY_RUN_REDIS_BUDGET_TESTS=1; writes/claims snapshots and publishes streams"]
 async fn two_three_five_second_profiles_preserve_ack_and_payloads() {
     assert_eq!(
