@@ -297,9 +297,13 @@ impl StorageBackend {
                 .await?,
             );
         }
+        for (index, shard) in shards.iter().enumerate() {
+            shard.identify_connection(index).await?;
+        }
         // Queue polling uses one dedicated PostgreSQL connection so background maintenance never
         // holds the mutex of a request shard. Both queues share it because claims are short.
         let maintenance = PostgresSnapshotStore::connect(postgres_url).await?;
+        maintenance.identify_connection(None).await?;
         let cache_repairs = maintenance.cache_repair_queue();
         let outbox = maintenance.outbox_queue();
         outbox

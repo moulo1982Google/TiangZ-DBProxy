@@ -2,9 +2,8 @@
 //! Request queue deadlines and reconnect failure cooldown, never SQL execution deadlines.
 
 use std::time::{Duration, Instant};
-use tokio::{sync::MutexGuard, time::timeout};
 
-use crate::{ReconnectingPostgresClient, SharedPostgresClient, StorageError, duration_millis};
+use crate::StorageError;
 
 pub const DEFAULT_POSTGRES_CONNECTION_WAIT_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_POSTGRES_RECONNECT_COOLDOWN_MS: u64 = 500;
@@ -49,22 +48,6 @@ impl PostgresRequestConfig {
             return Err(StorageError::InvalidPostgresReconnectCooldown);
         }
         Ok(self)
-    }
-}
-
-/// 超时仅丢弃锁等待者；拿到锁后由调用者执行重连与 SQL。
-/// Expiry drops only the mutex waiter; reconnect and SQL run after acquisition.
-pub(crate) async fn lock_client(
-    client: &SharedPostgresClient,
-    wait: Option<Duration>,
-) -> Result<MutexGuard<'_, ReconnectingPostgresClient>, StorageError> {
-    match wait {
-        Some(wait) => timeout(wait, client.lock()).await.map_err(|_| {
-            StorageError::PostgresConnectionWaitTimeout {
-                timeout_ms: duration_millis(wait),
-            }
-        }),
-        None => Ok(client.lock().await),
     }
 }
 

@@ -76,7 +76,11 @@ impl PostgresOutboxQueue {
         let maximum = maximum as i64;
         let lease_ms = i64::try_from(lease_ms)
             .map_err(|_| StorageError::QueueProtocol("lease duration is too large".to_string()))?;
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("outbox_claim_batch_for_publisher", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let rows = client
             .query(
@@ -147,7 +151,11 @@ RETURNING event.event_id, event.operation_id, event.trade_id, event.topic,
     }
 
     pub async fn acknowledge(&self, lease: &OutboxLease) -> Result<bool, StorageError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("outbox_acknowledge", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let updated = client
             .execute(
@@ -183,7 +191,11 @@ WHERE event_id = $1 AND lease_owner = $2 AND published_at IS NULL
             .map_err(|_| StorageError::QueueProtocol("retry delay is too large".to_string()))?;
         let error: String = error.chars().take(MAX_ERROR_CHARS).collect();
         let maximum = i64::from(max_attempts);
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("outbox_fail", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let updated = client
             .execute(
@@ -228,7 +240,11 @@ WHERE event_id = $1 AND lease_owner = $2 AND published_at IS NULL
     }
 
     pub async fn stats(&self) -> Result<OutboxStats, StorageError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("outbox_stats", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let row = client
             .query_one(

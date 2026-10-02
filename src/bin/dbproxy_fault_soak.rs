@@ -19,6 +19,8 @@ use tiangz_dbproxy_core::{
 use tiangz_dbproxy_protocol::{MAX_BATCH_SNAPSHOT_WRITES, ProtocolError, wire};
 use tokio::{task::JoinSet, time::Instant};
 
+#[path = "fault_soak/diagnostics.rs"]
+mod diagnostics;
 #[path = "fault_soak/seed.rs"]
 mod seed;
 use seed::seed_and_warm_players;
@@ -55,6 +57,7 @@ struct PlayerState {
 #[derive(Default)]
 struct Counters {
     error_diagnostics: AtomicU64,
+    recent_errors: diagnostics::ErrorDiagnostics,
     load_ok: AtomicU64,
     load_errors: AtomicU64,
     missing_snapshots: AtomicU64,
@@ -277,6 +280,7 @@ async fn main() -> Result<(), DynError> {
             "runId": run_id.to_string(),
             "elapsedSeconds": started.elapsed().as_secs_f64(),
             "totals": total.json(),
+            "errorDiagnostics": counters.recent_errors.export(false),
             "checks": {
                 "finalClientVisibleStatePassed": final_state_passed,
                 "observedConsistencyPassed": observed_consistency_passed,
@@ -528,7 +532,12 @@ async fn apply_direct_transaction(
         }
         Err(error) => {
             counters.transaction_errors.fetch_add(1, Ordering::Relaxed);
-            record_operation_error(counters, "apply_transaction", &error);
+            record_correlated_error(
+                counters,
+                "apply_transaction",
+                &error,
+                Some(&request.operation_id),
+            );
         }
     }
 }
@@ -577,7 +586,7 @@ async fn apply_trade(
         }
         Err(error) => {
             counters.trade_errors.fetch_add(1, Ordering::Relaxed);
-            record_operation_error(counters, "apply_trade", &error);
+            record_correlated_error(counters, "apply_trade", &error, Some(&request.operation_id));
         }
     }
 }
@@ -603,19 +612,33 @@ fn retryable_operation_error(error: &ClientError) -> bool {
 /// 保留有限错误样本；永久契约错误立即加入最终失败计数，不混为普通故障重试。
 /// Retains bounded samples and makes permanent contract failures part of the final failure counters.
 fn record_operation_error(counters: &Counters, stage: &str, error: &ClientError) {
+    record_correlated_error(counters, stage, error, None);
+}
+
+fn record_correlated_error(
+    counters: &Counters,
+    stage: &str,
+    error: &ClientError,
+    correlation: Option<&str>,
+) {
     let retryable = retryable_operation_error(error);
     let permanent_sample =
         !retryable && counters.invariant_errors.fetch_add(1, Ordering::Relaxed) < 16;
-    let sampled = counters.error_diagnostics.fetch_add(1, Ordering::Relaxed) < 16;
-    if sampled || permanent_sample {
+    counters.error_diagnostics.fetch_add(1, Ordering::Relaxed);
+    let text = error.to_string();
+    let sampled = counters
+        .recent_errors
+        .record(stage, retryable, correlation, &text);
+    if sampled.is_some() || permanent_sample {
         emit(
             if retryable {
                 "SOAK_OPERATION_ERROR"
             } else {
                 "SOAK_CONTRACT_ERROR"
             },
-            json!({ "stage":stage, "retryable":retryable,
-                "error":error.to_string().chars().take(512).collect::<String>() }),
+            json!({ "stage":stage, "retryable":retryable, "sample":sampled,
+                "correlation":correlation.map(tiangz_dbproxy_storage::postgres_operation_fingerprint),
+                "error":text.chars().take(512).collect::<String>() }),
         );
     }
 }
@@ -705,6 +728,9 @@ async fn report_progress(
             }),
         );
         previous = current;
+        if let Some(evidence) = counters.recent_errors.export(true) {
+            emit("SOAK_RECENT_ERRORS", evidence);
+        }
     }
 }
 

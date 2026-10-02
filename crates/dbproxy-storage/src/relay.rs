@@ -88,7 +88,11 @@ impl PostgresOutboxQueue {
         if keys.is_empty() {
             return Ok(());
         }
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("relay_ensure_unregistered_routes", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         if client
             .query_opt(
@@ -109,7 +113,11 @@ impl PostgresOutboxQueue {
         id: &str,
         fingerprint: &str,
     ) -> Result<(), StorageError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("relay_register_publisher", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let tx = client.transaction().await?;
         tx.execute("INSERT INTO dbproxy_outbox_publishers VALUES($1,'redisStream',$2) ON CONFLICT DO NOTHING", &[&id,&fingerprint]).await?;
@@ -146,7 +154,11 @@ impl PostgresOutboxQueue {
                 "invalid or reserved outbox route".into(),
             ));
         }
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("relay_register_route", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let tx = client.transaction().await?;
         let key = route.key();
@@ -172,7 +184,11 @@ impl PostgresOutboxQueue {
     /// 启动前检查所有未发布事件的 Publisher，不能丢弃缺失配置的旧积压。
     /// Refuses startup when pending events require an unavailable publisher.
     pub async fn required_publishers(&self) -> Result<Vec<String>, StorageError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("relay_required_publishers", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         Ok(client.query("SELECT publisher_id FROM dbproxy_outbox_routes UNION SELECT publisher_id FROM dbproxy_outbox WHERE published_at IS NULL", &[]).await?
             .into_iter().map(|r|r.get(0)).collect())

@@ -7,7 +7,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-struct Peer(JoinHandle<()>);
+pub(super) struct Peer(JoinHandle<()>);
 impl Drop for Peer {
     fn drop(&mut self) {
         self.0.abort();
@@ -16,7 +16,7 @@ impl Drop for Peer {
 
 // Minimal private PostgreSQL wire peer: authenticate, signal the first command, then stall.
 // No real database, schema migration or SQL execution is involved.
-async fn postgres(
+pub(super) async fn postgres(
     metrics: Arc<StorageMetrics>,
 ) -> (PostgresSnapshotStore, oneshot::Receiver<()>, Peer) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -144,7 +144,11 @@ fn snapshot() -> SnapshotEnvelope {
 async fn request_postgres_queue_expires_without_sending_sql() {
     let (mut store, mut arrived, _pg, _redis) = tiered(false).await;
     store.postgres.connection_wait_timeout = Some(Duration::from_millis(20));
-    let held = store.postgres.client.lock().await;
+    let held = store
+        .postgres
+        .request_client("backlog_save_batch", Some("held-operation"), 100)
+        .await
+        .unwrap();
     let record = snapshot().record;
     let mut pending = Box::pin(store.postgres.load(&record));
     std::future::poll_fn(|cx| {
@@ -164,6 +168,21 @@ async fn request_postgres_queue_expires_without_sending_sql() {
     ));
     assert_eq!(count(&store.metrics, "postgres_operation"), 0);
     assert_eq!(
+        stage(&store.metrics, "postgres_connection_wait").timeouts,
+        1
+    );
+    let context = store.postgres.client.diagnostics.inspect();
+    assert_eq!(
+        context["holder"]["request"]["operation"],
+        "backlog_save_batch"
+    );
+    assert_eq!(context["holder"]["request"]["batch_size"], 100);
+    assert_eq!(
+        context["holder"]["request"]["correlation"],
+        postgres_operation_fingerprint("held-operation")
+    );
+    assert_eq!(context["waiter_count"], 0);
+    assert_eq!(
         stage(&store.metrics, "postgres_connection_wait").in_flight,
         0
     );
@@ -172,6 +191,12 @@ async fn request_postgres_queue_expires_without_sending_sql() {
         Err(oneshot::error::TryRecvError::Empty)
     ));
     drop(held);
+    let context = store.postgres.client.diagnostics.inspect();
+    assert!(context["holder"].is_null());
+    assert_eq!(
+        context["recent_holds"].as_array().unwrap().last().unwrap()["request"]["operation"],
+        "backlog_save_batch"
+    );
 }
 
 #[tokio::test]
