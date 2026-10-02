@@ -1284,7 +1284,11 @@ impl PostgresSnapshotStore {
     /// Set policy before exposing a new connection, so public clones share one policy.
     async fn configure_requests(&mut self, config: PostgresRequestConfig) {
         self.connection_wait_timeout = Some(config.connection_wait_timeout);
-        self.client.lock().await.reconnect_cooldown = config.reconnect_cooldown;
+        self.client
+            .lock_for("configure_request_policy", None, 0, None)
+            .await
+            .expect("unbounded startup lock")
+            .reconnect_cooldown = config.reconnect_cooldown;
     }
 
     /// Identify a server connection in pg_stat_activity. Call before exposing it to workers.
@@ -1297,7 +1301,11 @@ impl PostgresSnapshotStore {
             "maintenance"
         };
         let application = format!("tzdb:{}:{role}:{}", std::process::id(), shard.unwrap_or(0));
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("identify_connection", None, 0, None)
+            .await
+            .expect("unbounded startup lock");
         client.application_name = Some(application);
         client.identity_pending = true;
         client.identify_backend().await
@@ -1336,11 +1344,15 @@ impl PostgresSnapshotStore {
     /// 在全局迁移锁下仅执行尚未登记的 schema migration。
     /// Apply each schema migration once while holding the global migration lock.
     pub async fn migrate(&self) -> Result<(), StorageError> {
-        let mut client = self
+        let client = self
             .metrics
             .latency
-            .measure(Stage::PostgresQueue, self.client.lock())
+            .measure(
+                Stage::PostgresQueue,
+                self.client.lock_for("migrate", None, 0, None),
+            )
             .await;
+        let mut client = client.expect("unbounded migration lock");
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;

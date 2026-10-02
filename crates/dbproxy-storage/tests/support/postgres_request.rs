@@ -24,6 +24,8 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, timeout},
 };
+#[path = "diagnostic_trace.rs"]
+mod diagnostic_trace;
 
 struct Peer(JoinHandle<()>);
 impl Drop for Peer {
@@ -127,6 +129,9 @@ async fn deferred_cache_cleanup_preserves_newer_targets_and_survives_lost_hints(
 #[tokio::test]
 #[ignore = "requires dedicated PostgreSQL/Redis; short healthy concurrency baseline"]
 async fn healthy_request_shard_completes_concurrent_writes_with_default_policy() {
+    let trace = diagnostic_trace::DiagnosticTrace::default();
+    let _tracing = tracing::subscriber::set_default(trace.clone());
+    let _dump = diagnostic_trace::TraceOnDrop(trace);
     timeout(Duration::from_secs(45), async {
         let url = test_url();
         let cache = std::env::var("DBPROXY_CACHE_REDIS_URL")
@@ -141,6 +146,7 @@ async fn healthy_request_shard_completes_concurrent_writes_with_default_policy()
         )
         .await
         .unwrap();
+        store.identify_connection(0).await.unwrap();
         let id = unique();
         let mut tasks = tokio::task::JoinSet::new();
         for worker in 0..16 {
@@ -169,7 +175,8 @@ async fn healthy_request_shard_completes_concurrent_writes_with_default_policy()
             .find(|s| s.stage == "postgres_connection_wait")
             .unwrap();
         let count: u64 = queue.buckets.iter().sum();
-        assert_eq!(count, 64);
+        // Each successful write also acquires the same connection for cache-repair ACK.
+        assert_eq!(count, 128);
         assert_eq!(queue.in_flight, 0);
         let mut cumulative = 0;
         let p99 = queue
