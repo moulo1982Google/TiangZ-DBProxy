@@ -1,5 +1,33 @@
 # 2C4G / 100 玩家云上故障长稳
 
+## 09:10：日志候选验证完成，自动接续已安装
+
+用户要求“改好日志的代码，等这一波 240 做完，跟上去继续”。产品日志实现本地提交 `2822c8f`，真实日志断言提交 `cceb223`；细节见 [PostgreSQL 连接排队诊断](postgres-queue-diagnostics.md)。本次不修改 PG / AOF 默认 2000ms、SDK 5000ms、四分片、后台 worker1 或原容量/耐久门禁。旧版 240m 仍按原冻结制品运行；09:10 已运行约 203 分钟、完成 17/20 次故障、数据不变量错误零，**240m 尚未获得完整资格，新版尚未部署**。
+
+最终验证：Windows `cargo test --workspace --all-targets --locked` 为 229 通过 / 52 ignored；Linux `cargo test --release --workspace --all-targets --locked` 为 231 通过 / 52 ignored。两平台格式、Clippy `-D warnings`，Linux Release 构建、TS SDK 29 通过。TS 测试使用官方生成/构建入口，协议契约没有变更。独立真实 PostgreSQL / Redis 额外执行 13 项检查：PID/持锁/重连 1、修复 ACK / 丢失 COMMIT 回包 / 取消 3、Outbox 并发 7、PG+Redis relay 1、批量 AOF 1，均通过；这些不把默认 ignored 计为已执行。
+
+另行旧、新单分片 16 写者对比均保留原 2000ms 并**实际失败**，不是通过的容量测试。新版告警记录分片 0、PG PID 1106、15 等待者、最老等待 2000ms，当前 `save_batch` 持有年龄 81ms，最近八条完整占用 52 / 183 / 119 / 261 / 38 / 36 / 167 / 325ms；这说明该本机用例可因前面多次串行占用累计超时，不能只寻找一条当前占用 2 秒的 SQL。受控真实案例同时捕获 queue_timeout 和完整 602ms 释放日志，PID 729→731 / 代次 1→2。底层慢写原因及云上 R10/R11 根因仍未确认。本机 Windows Docker 存储 / 单分片与云端四分片配置不同，不能直接互相归因。
+
+第二轮容量对比曾因共用 Cargo target 运行到旧测试 ELF，已经用 `revalidation-needed.json` 撤销其资格；第三轮独立旧版 target、重新编译候选输入并核对实际运行标记。第一轮漏传缓存 Redis 地址的失败、第二轮无效证据、第三轮两组容量失败日志及数据库 dump 全部保留；第三轮临时测试容器/卷/网络已精确回收，26 个原有本机容器身份保持，包括运行中的 battle-lab。
+
+| 新版冻结身份 | SHA-256 / 源码 |
+| --- | --- |
+| 服务与故障负载产品源码 | `cceb22331b7eff178bd6436ff00ee8d41fccb112` |
+| Linux 服务端 ELF | `defa72156b6c87347141fb8ab55d55c7b207c1b9358c8032b7895266d97fa56d` |
+| Linux fault-soak ELF | `3070a85d839a3cc3d478d59ee5ca8130a819a8bc9e67ce6a9eb1b24f82a95b9c` |
+| 最终 Linux 构建报告 | `80967b191d5c8f4395019ffbb106b760fb0ed7dbaa37b958942007e2dd5f5f4b` |
+| 新控制计划 | `6f939f14551643ddb2e21cf9740108bcfd59e31e81fcd93d6fbd3ab07671bb4d` |
+| 已上传、尚未部署的包 | `19cfbe3a9ce18af711b1127dfe78c9c55ed16393cd84eff297b9bf758bed4c8d` |
+| 接续候选清单 | `5196f193f0c4c241690602d5fd530cfa93304db9a1fede7f16ee44e7893f4c1b` |
+
+云端接续目录 `/opt/tiangz-cloud-diag-handoff-20261002`；外部观察器 `tzfault20261002-handoff.service` 与部署等待器 `tzfault20261002-diag-launch.service` 均真实运行，后者状态 `waiting-for-qualified-boundary`。已独立重核输入/制品 SHA、旧控制器 PID 260820 / 启动代次、旧计划，以及 12 个保护容器、157 配置、4 个业务 units 和三项 HTTP 200 / health UP。观察器限 64MiB / 5% CPU，等待器限 128MiB / 10% CPU / 无 swap；部署前置另限临时 256MiB，仍位于原 512MiB 客户端父组，不扩大原 2C4G 服务额度。
+
+只有旧 240m 的完整 14400 秒负载、至少 300 秒空载、当前代次真实正常退出、独立复核结果与报告/原始文件 SHA 都通过，才正常停止旧控制器和它拥有的资源。预计负载 09:47:16 结束、至少 09:52:16 后才能完成空载及复核；这是计划时间。若旧控制器已在边界开始旧版 480m，其部分计时按计划性中断保留、资格零。新所有者 `tzfault20261002diag`、新目录 `/opt/tiangz-cloud-fault-soak-diag-20261002` 使用新专用资源，完整重新运行 **480 / 960 / 1440 分钟**，每阶段另加 300 秒空载和原独立复核；任何旧版时长不折算。旧资格失败、摘要变化、保护业务异常或部署失败均不自动重放，保留证据并只停止身份匹配的本轮资源。
+
+控制前置 Node 44 通过 / 1 平台跳过、Python 7 通过；不足时长/空载、未知退出、原文件变化、旧资源未停止等边界反例 7 项通过；有界报告读取 3 项通过，约 32.23MiB 被忽略数组的跟踪分配峰值约 162KiB。新本机只读任务 `TiangZ-v07-CloudFault-Diagnostics-Probe-30min-20261002` 已注册并首次执行成功（结果 0），下一次 09:40:34，状态未变保持安静；本机关机不阻断云端接续。后续只读入口为相邻 TiangZ worktree 的 `temp/v0.7-cloud-diag-handoff-20261002/{launcher-installed,staged-audit}.json`、新候选的 `probe-cloud.py` / `latest-probe.json`，不要重放一次性 prepare/install/deploy。本轮没有 push、发布或修改保护业务。
+
+## 旧制品阶段记录
+
 2026-10-02。用户授权在本机清理完成后继续外网验证。第三轮完整 **30 / 60 / 120 分钟**均已独立复核通过，**05:47:16 北京时间**就绪新的完整 240 分钟，07:51 已完成其中约 124 分钟、11/20 次故障恢复；240 分钟和 24 小时尚未通过。沿用[短时容量复测](remote-capacity-2c4g-100-2026-10-01.md)通过的产品制品。首轮控制脚本失败，第二轮因审查发现长时复核内存风险而计划性停止；两轮证据均冻结、资格零，不拼接中断时长。旧本机 R11 不恢复，旧正常窗口 PG 排队问题仍未修复。
 
 ## 60 / 120 分钟通过与 240 分钟现场（07:51）
