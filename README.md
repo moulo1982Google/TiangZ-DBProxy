@@ -14,6 +14,8 @@
 
 用户于 2026-10-03 确认本轮只完成 DBProxy 本身的完整性、可靠性与[通用性能验收](PERFORMANCE.md#07-验收范围2026-10-03-用户确认)。SLG 的实际业务压力测试由用户在业务接近完成后另行安排，2 万在线 / 300 万注册 / 50 区服不作为本轮验收目标。MemoryBackend、真实存储和长稳结果分别报告，不把合成负载人数或历史基准当成生产容量承诺。
 
+失败 960m 的五份输入已核对原 SHA 并离线重建完整报告：本地 Windows Node 进程峰值约 168MiB、JSON 约 27MiB。该测量不还原云端 16h 驱动历史或 Linux 共享限额，不能把报告大小唯一归因、确认泄漏或宣称修复；详情见上述云上报告，尚未重新启动长稳。
+
 0.7 增加独立[只读容量命令](docs/capacity-observation.md)，观察分区表/回执/事实/Outbox 的估算行数和物理字节，可显式开启有期限的服务器时间扫描；不执行迁移或自动清理。真实恢复契约与本轮隔离验证见[恢复验收记录](docs/v0.7-recovery-acceptance.md)。
 
 [![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)
