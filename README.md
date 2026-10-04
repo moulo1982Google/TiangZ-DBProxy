@@ -1,6 +1,6 @@
 # TiangZ DBProxy
 
-2026-10-04 已完成[960m收尾工具修复的真实数据预检](docs/cloud-fault-soak-2026-10-02.md)：对账事务关闭JIT并合并扫描，保持5s；完整SQL/Stream内容及新固定时间窗容量检查通过。原失败960m资格零，新的30m/960m/1440m仍需实际运行，产品ELF和2C4G/100人预算保持，未push。
+2026-10-04 已完成[960m收尾工具修复的真实数据预检](docs/cloud-fault-soak-2026-10-02.md)：对账事务关闭JIT并合并扫描，保持5s；完整SQL/Stream内容及新固定时间窗容量检查通过。新 `tzfault20261004auditr5c` 在16:47:19开始完整30m，全部审查通过才自动接960/1440m；当前新资格尚未完成。原失败960m资格零，产品ELF和2C4G/100人预算保持，未push。
 
 0.7 PostgreSQL 排队与长稳错误观测见 [连接诊断](docs/postgres-queue-diagnostics.md)：分片/持有者/实际 backend PID、完整持有时长、修正排队超时计数及固定容量的晚期错误记录。
 
