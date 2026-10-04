@@ -1,5 +1,7 @@
 # TiangZ DBProxy
 
+2026-10-04 已完成[960m收尾工具修复的真实数据预检](docs/cloud-fault-soak-2026-10-02.md)：对账事务关闭JIT并合并扫描，保持5s；完整SQL/Stream内容及新固定时间窗容量检查通过。原失败960m资格零，新的30m/960m/1440m仍需实际运行，产品ELF和2C4G/100人预算保持，未push。
+
 0.7 PostgreSQL 排队与长稳错误观测见 [连接诊断](docs/postgres-queue-diagnostics.md)：分片/持有者/实际 backend PID、完整持有时长、修正排队超时计数及固定容量的晚期错误记录。
 
 当前开发候选为 `0.7.0-rc.2`，服务与 Rust/TypeScript SDK 使用相同版本。本地候选尚未 push 或发布；此前正式版本与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题，协议和数据库迁移不因候选编号额外改变。
