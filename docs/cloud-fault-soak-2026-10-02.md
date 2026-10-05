@@ -1,5 +1,13 @@
 # 2C4G / 100 玩家云上故障长稳
 
+## 2026-10-05 19:28：新30m完整通过，960m正常推进
+
+新30m完成1800s负载、5/5故障、300.020s空载及正常退出；独立SQL/Redis完整内容、容量/内存均过。原报告SHA `bb4be980db776d7c7895a25498542c4dc7392c28b5be8ba801ee1ce98894381e`重新核一致，5626唯一事件/5646投递/20内容一致重复，v2计数127.316ms、目标峰值338.31MiB。新960m在18:56:13.457真实就绪，旧failed时长不继承。
+
+截至19:28复算1910.468s前缀，382原始区间与保存证据逐项相同，326正常区间错误零、3/80故障恢复。累计2636读取/300事务/100交易失败全部在计划PG停机及恢复窗口，计数原样保留；缺快照/读落后/读超前/坏不变量、存储期限增量和PG争用WARN零。当前目标约450MiB、控制约144MiB、Node驱动RSS100.66MiB/堆16.13MiB，OOM/swap/max零；当前前缀不证明长时内存趋势已解决，也不提供960m完整资格。保护12容器/157配置/4units及HTTP/health再次通过，30分钟任务19:22:13结果0/下次19:52:12，云端guard正常。预计10月6日10:56:13结束负载，另需空载及独审。
+
+只读检查器首轮选择本机辅助文件的当前字节，因封存后LF/CRLF副本差异误报helper源码hash；所有10个云端helper实际匹配不可变计划，辅助副本1930字节/封存1976字节仅换行、AST一致。首错和字节证明保留，改为先核计划SHA、再按冻结payloadSha256严核远端后，重新完整prefix核验通过。不得覆盖封存同名payload、改manifest或用语义等价代替云端原字节SHA。证据在engine R7 `prefix-helper-source-inspection.raw.json`、`prefix-helper-line-ending-proof.json`、`latest-online-prefix.json`；未改现场/产品或重启长稳，无生成/重编/push。
+
 ## 2026-10-05 18:25：R7新完整阶段已运行
 
 engine正式工具提交 `31a8a5bfdcefc5682904efd01485861028fbd15d`，本仓验证记录 `3fbc982`；新owner `tzfault20261005auditr7`、engine入口 `temp/v0.7-cloud-audit-r7-20261005/`、云端 `/opt/tiangz-cloud-audit-r7-20261005`。北京时间18:21:01.992真实就绪完整30m，独立全量审查通过后自动完整960/1440m，旧失败时长零继承。计划SHA `68e8d2db5827337a7e268f18fe835d1a8acc533e60530985447fa9d982c88405`，52文件包SHA `627ba1f6fb1e2c1d5ae8a76a3b6adbf1401ad0d7eee15fa97a0ac8b17acc8c4e`，明确新审计v2期限；产品原cceb223 ELF/PG-AOF2s/SDK5s/四分片/100玩家和2C4G/512MiB不变。
