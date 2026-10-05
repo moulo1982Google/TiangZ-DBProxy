@@ -1,5 +1,15 @@
 # 2C4G / 100 玩家云上故障长稳
 
+## 2026-10-05 18:25：R7新完整阶段已运行
+
+engine正式工具提交 `31a8a5bfdcefc5682904efd01485861028fbd15d`，本仓验证记录 `3fbc982`；新owner `tzfault20261005auditr7`、engine入口 `temp/v0.7-cloud-audit-r7-20261005/`、云端 `/opt/tiangz-cloud-audit-r7-20261005`。北京时间18:21:01.992真实就绪完整30m，独立全量审查通过后自动完整960/1440m，旧失败时长零继承。计划SHA `68e8d2db5827337a7e268f18fe835d1a8acc533e60530985447fa9d982c88405`，52文件包SHA `627ba1f6fb1e2c1d5ae8a76a3b6adbf1401ad0d7eee15fa97a0ac8b17acc8c4e`，明确新审计v2期限；产品原cceb223 ELF/PG-AOF2s/SDK5s/四分片/100玩家和2C4G/512MiB不变。
+
+52文件、实际/proc两节点及负载ELF/代次、units/cgroup限额、12保护容器/157配置/4units/HTTP与health全部独立核验，诊断副本停止。封存本机和云端Node控制各65通过/1跳过、Python审查和保护测试通过，本机共19；预检规模/真实PG/完整内容验证见相邻章节，无产品重编或codegen。
+
+首次部署后身份检查恰遇18:23:02.098计划主节点强杀，18:23:02.825检查MainPID零，新代次18:23:17.435启动；原错误及事件证据保留，恢复后同一轮身份核验通过，不记部署失败、不放宽断言或重放安装。证据在 `planned-fault-verification-boundary.json`、`post-install-verification.r1.err`、`post-install-verification.json`。18:25约240s前缀1/5故障恢复，所有累计客户端/数据不变量错误暂零；完整资格仍待实际结束。
+
+新本机30分钟探测已注册、首轮0、下次18:52:12；云端每分钟安全guard正常，源脚本绑定新owner/root/计划，旧R5C反例在读状态前拒绝、旧任务Disabled。30m负载预计18:51:02结束，另外至少300s空载及全量收尾通过才接续；没有push或提前报整轮通过，下文为历史记录。
+
 ## 2026-10-05 18:17：24h规模完整收尾预检已通过
 
 在原2C4G目标/512MiB控制预算下，actual-schema 24h对应SQL、准备Redis DB12与synthetic扩大报告共同完成155.94s：280959唯一事件、281045投递、86一致重复，全部event_id/partition_key/operation_id/trade_id/payload逐条匹配。Python重新完整解析扩大报告后持有，Node同时执行真实SQL/Redis集合收尾；2973 samples/17277 intervals、37129348字节，NodeRSS175.28MiB、其控制cgroup观测峰值249.47MiB、OOM/swap/max零。该值是收尾预检观测，真实24h负载/故障资格仍未取得。
