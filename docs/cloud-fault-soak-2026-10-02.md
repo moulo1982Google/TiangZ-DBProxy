@@ -1,5 +1,13 @@
 # 2C4G / 100 玩家云上故障长稳
 
+## 2026-10-06 08:50：960m近14小时，正常短时提交抖动留档
+
+R7新960m50028.174s前缀、70/80故障恢复，10003原始区间复算/8642正常区间零错误，坏不变量/缺快照/读落后/读超前零。原累计可用性失败均在计划故障/恢复，2次AOF/1次enqueue总超时仍是故障5/10的原指标，未有正常超时。新30m资格保留、960m及1440m完整资格待实际结束；负载预计今天10:56:13结束，再300s空载和独审。
+
+PG共14条慢占用WARN，8条在故障窗口，另6条真实发生在正常窗口07:13:09，不能统称故障注入告警。四请求分片/两维护连接持有608–659ms、最老等待476–811ms；实际PG四COMMIT约629.860–635.363ms、cache_repair确认DELETE605.784ms。提交/确认步骤慢已证，具体fsync/存储/调度原因未证；30s SQL采样未命中瞬时wait_event，前后pending/dead零、观察查询约140–222ms。5s资源段目标最高平均约1.03核、throttled增量零；没有queue_timeout/正常请求失败，不修改原预算、不停本轮，也不删除正常时延证据。
+
+目标当前约0.96GiB/峰1.28GiB、控制约181–185MiB/峰306.92MiB，驱动RSS111.57MiB/堆12.46MiB，OOM/swap/max零。连续node2 PID2896256/startTicks364787726的9835资源行，PSS早/晚低位13125632/13212672字节，增长85KiB、未触原32MiB门禁；仅为前缀趋势。12保护容器/157配置/4units及HTTP/health通过，30分钟任务及云端guard正常。证据在engine R7 `latest-online-prefix.json`、`latest-continuous-memory-prefix.raw.json`、`normal-slow-holds-decoded.json`、`normal-slow-hold-samples.raw.json`、`normal-slow-hold-analysis.json`。本次只读取证/记录，无冻结代码、产品、期限、生成或push变化。
+
 ## 2026-10-05 19:28：新30m完整通过，960m正常推进
 
 新30m完成1800s负载、5/5故障、300.020s空载及正常退出；独立SQL/Redis完整内容、容量/内存均过。原报告SHA `bb4be980db776d7c7895a25498542c4dc7392c28b5be8ba801ee1ce98894381e`重新核一致，5626唯一事件/5646投递/20内容一致重复，v2计数127.316ms、目标峰值338.31MiB。新960m在18:56:13.457真实就绪，旧failed时长不继承。
