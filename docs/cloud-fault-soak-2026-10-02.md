@@ -1,5 +1,13 @@
 # 2C4G / 100 玩家云上故障长稳
 
+## 2026-10-06 14:37：512MiB风险补证，修正旧24h报告夹具漏项
+
+控制组14:26约501.14MiB、anon98.15MiB/file393.24MiB，max225、OOM/swap零；总量因干净缓存回收贴近限制，不宜按已运行时长线性外推。实查旧37,129,348字节24h夹具只扩大samples/intervals、progress仍11518、faults/schedule80/generations18，未覆盖所有增长驻留数组；必须收窄旧内存证明范围，原实际SQL/Redis预检与真实通过的960m不撤销。
+
+独立 `tzdiag20261006cachememr1` 512MiB/no-swap/CPU10%组补全progress/intervals17276、samples2973、faults/schedule120/generations27；真实冻结流式发布输出42,877,626字节40.89MiB，Python重新解析持有+Node192MiB解析及两套280959编号缓冲。两套编号同源已验证SQLite、只是SQL行/Redis JSON形状内存模拟，不是新投递检查或真实24h。加入本组稀疏文件的真实clean-page缓存费用、每阶段起点至少480MiB，避免大块磁盘写入；64s通过，发布后NodeRSS71.49MiB、审查173.98MiB，reserve采样峰241.57MiB<448，暂态总峰512.19MiB/max1125保留，OOM/swap零。
+
+11份原字节SHA在engine `temp/v0.7-control-cache-preflight-20261006-r1/downloaded-manifest.json`，发布/解析/形状/全过程内存及 `verified-result.json` 留档；单元成功停止，自己的稀疏缓存已清理，未调用live PG/Redis或改预算/冻结源，原报告/helper/保护业务核对通过、1440m仍运行。此补证降低风险，不承诺真实24h一定通过；保持实际收尾判据，不以强制GC/drop caches/加预算取绿，无产品/生成/重编/push变化。
+
 ## 2026-10-06 13:02：新完整960m通过，1440m正常启动
 
 R7新960m11:03:21.549通过独立审查：负载57600.614s、80/80故障、300.791s空载、正常退出和全部SQL/Redis元数据/payload/容量/内存校验。原报告SHA `1f33a22732cb4ca83ef53024429d1d38dd1858110415d4e0bf08e6ccca30f218`已重新核对，preflight=false/runner退出零，旧失败不补资格。562199事务回执/最终序列守恒，187212唯一交易事件、187398投递、186内容一致重复、374424分录，坏版本/失衡/未发布/死信全零；v2计数4737.557ms、最长项1284.730ms，完整独审111.611s。连续node2 PSS低位减少936960字节、驱动采样峰242.33MiB，门禁通过。6份关键结果源字节SHA下载在engine R7 `qualified-960m/`。
