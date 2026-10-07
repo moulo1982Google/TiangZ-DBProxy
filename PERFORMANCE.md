@@ -1,5 +1,7 @@
 # TiangZ DBProxy 性能基线
 
+2026-10-07新增[真实PG/Redis24小时故障长稳终验](docs/cloud-fault-soak-acceptance-2026-10-07.md)：固定cceb223 ELF、2C4G/100玩家合成负载、原2s/5s、512MiB控制预算，120故障/空载/全部SQL及Redis内容、容量/内存/正常退出通过。健康pending峰100、最老3.752s、窗口增长19.4、空载全零；目标均值约0.410核/峰1817.77MiB，正常14954区间零错误。它补充本轮完整性与资源/积压证据，不将故障长稳计数冒充下文MemoryBackend吞吐或真实SLG承载能力；测试/探测已停止，未push或发布。
+
 本文记录 DBProxy 自身的可复现性能基线。测试使用 `MemoryBackend` 屏蔽 PostgreSQL 和 Redis，只测量 Rust Client、TCP 协议、Protobuf 编解码、Tokio 调度、分片锁和 DBProxy 事务语义。
 
 这些结果不是数据库容量、整服容量或生产 SLA。真实部署还要单独验证 PostgreSQL、Redis、网络时延、数据卷和故障恢复。

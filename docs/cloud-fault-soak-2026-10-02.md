@@ -1,5 +1,11 @@
 # 2C4G / 100 玩家云上故障长稳
 
+## 2026-10-07 11:12：R7完整24h独审通过，资源与探测停止
+
+新完整30/960/1440m全部通过，24h11:11:59.183取得实际资格：86400.392s、120/120故障、300.979s空载、正常退出，全SQL/Redis完整内容/AOF/容量/内存校验通过。源报告SHA `25b87dabe58dc87291d058be05da20743fd865e696e88c95582d93a77f6841e9`、42,756,991字节重新核验，14954正常区间错误零、281179唯一事件/170一致重复、843600事务/562358分录守恒；旧failed资格不改。完整配置、身份、数值和限制见[独立终验报告](cloud-fault-soak-acceptance-2026-10-07.md)。
+
+真实控制512MiB下驱动RSS峰274.91MiB、审查RSS196.15MiB/堆84.44MiB；控制组max1724与暂态峰512.047MiB保留、OOM/swap零，收尾193.441s通过。52文件、实际PID、owner/image及三个测试容器exit0重新核，数据卷/日志保留；云端guard和本机30分钟probe已停止，12容器/157配置/4units保护及HTTP/health正常，不启动7日。证据engine R7 `qualified-1440m/`、`qualified-1440-verified.json`、`completed-1440-intervals.raw.json`。本次终验/发行证据整理，无产品/协议/生成/版本变化或push。
+
 ## 2026-10-06 14:37：512MiB风险补证，修正旧24h报告夹具漏项
 
 控制组14:26约501.14MiB、anon98.15MiB/file393.24MiB，max225、OOM/swap零；总量因干净缓存回收贴近限制，不宜按已运行时长线性外推。实查旧37,129,348字节24h夹具只扩大samples/intervals、progress仍11518、faults/schedule80/generations18，未覆盖所有增长驻留数组；必须收窄旧内存证明范围，原实际SQL/Redis预检与真实通过的960m不撤销。
