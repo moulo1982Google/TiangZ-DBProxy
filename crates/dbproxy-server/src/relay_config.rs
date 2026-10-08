@@ -1,18 +1,24 @@
 //! Redis 路由配置与显式禁用的未来 MQ 声明。
 //! Redis routing configuration with disabled declarations for future MQ backends.
 use crate::config::ConfigError;
+use crate::config::{default_aof_ack_timeout_ms, default_redis_response_timeout_ms};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    time::Duration,
 };
-use tiangz_dbproxy_storage::OutboxRoute;
+use tiangz_dbproxy_storage::{OutboxRoute, RedisDurabilityConfig};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutboxRelaySection {
     #[serde(default = "default_timeout")]
     pub publish_timeout_ms: u64,
+    #[serde(default = "default_aof_ack_timeout_ms")]
+    pub aof_ack_timeout_ms: u64,
+    #[serde(default = "default_redis_response_timeout_ms")]
+    pub redis_response_timeout_ms: u64,
     #[serde(default)]
     pub default_publisher: Option<String>,
     #[serde(default)]
@@ -24,6 +30,8 @@ impl Default for OutboxRelaySection {
     fn default() -> Self {
         Self {
             publish_timeout_ms: default_timeout(),
+            aof_ack_timeout_ms: default_aof_ack_timeout_ms(),
+            redis_response_timeout_ms: default_redis_response_timeout_ms(),
             default_publisher: None,
             publishers: vec![],
             sources: vec![],
@@ -70,6 +78,7 @@ pub struct SourceSection {
 #[derive(Clone)]
 pub struct ResolvedOutboxRelay {
     pub publish_timeout_ms: u64,
+    pub durability: RedisDurabilityConfig,
     pub publishers: Vec<ResolvedPublisher>,
     pub routes: Vec<OutboxRoute>,
     pub disabled_routes: Vec<String>,
@@ -78,6 +87,7 @@ impl Default for ResolvedOutboxRelay {
     fn default() -> Self {
         Self {
             publish_timeout_ms: default_timeout(),
+            durability: RedisDurabilityConfig::default(),
             publishers: vec![],
             routes: vec![],
             disabled_routes: vec![],
@@ -93,6 +103,7 @@ impl fmt::Debug for ResolvedOutboxRelay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ResolvedOutboxRelay")
             .field("publish_timeout_ms", &self.publish_timeout_ms)
+            .field("durability", &self.durability)
             .field(
                 "publisher_ids",
                 &self.publishers.iter().map(|p| &p.id).collect::<Vec<_>>(),
@@ -110,6 +121,18 @@ impl OutboxRelaySection {
         lease_ms: u64,
         environment: &impl Fn(&str) -> Option<String>,
     ) -> Result<ResolvedOutboxRelay, ConfigError> {
+        let durability = RedisDurabilityConfig {
+            aof_ack_timeout: Duration::from_millis(self.aof_ack_timeout_ms),
+            response_timeout: Duration::from_millis(self.redis_response_timeout_ms),
+        };
+        durability
+            .validate()
+            .map_err(|error| ConfigError(format!("outboxRelay: {error}")))?;
+        if self.publish_timeout_ms <= self.redis_response_timeout_ms {
+            return Err(ConfigError(
+                "outboxRelay requires redisResponseTimeoutMs < publishTimeoutMs".into(),
+            ));
+        }
         if !(3_000..=60_000).contains(&self.publish_timeout_ms)
             || lease_ms < self.publish_timeout_ms + 1_000
         {
@@ -202,6 +225,7 @@ impl OutboxRelaySection {
         }
         Ok(ResolvedOutboxRelay {
             publish_timeout_ms: self.publish_timeout_ms,
+            durability,
             publishers,
             routes,
             disabled_routes,

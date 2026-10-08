@@ -14,6 +14,8 @@ check-tenants 不读密钥、不联网，只验证配置结构；正式启动先
 
 外层声明共享 listenAddr、总 maxConnections、tenant ID 和配置文件。子配置复用原 storage/backlog/cacheRepair/outbox/outboxRelay，authTokenEnv 属于该租户，server.maxConnections 是租户连接预算。子配置 listenAddr 被外层覆盖，不增加业务监听。公共 frame/payload/握手/关闭预算、Runtime 线程数和日志过滤必须一致。
 
+`server.maxInFlightPerConnection` 也是共享监听设置，所有租户必须声明相同值；它限制每条连接的在途请求数，不是租户公平调度配额。0.7 开发修复会在创建后端之前拒绝不同值，错误包含字段名、声明顺序索引和租户 ID 列表，不包含凭据。此前的首租户值隐式覆盖其他租户的行为不再接受；调换声明顺序不会使冲突配置通过。部署迁移时应显式统一该值。
+
 认证前受总连接预算限制，认证后另取租户名额；满额拒绝握手，断开/异常/取消释放名额。租户指标与依赖健康通过各自 observability 端口呈现，端口必须互不冲突并限制网络来源。
 
 ## 隔离范围
@@ -30,5 +32,7 @@ check-tenants 不读密钥、不联网，只验证配置结构；正式启动先
 ## 验证边界
 
 真实 TCP + 独立 MemoryBackend 测试验证同键、同幂等号、CommitRecords/追加事实/Outbox、重连、配额及无默认令牌后门；静态检查覆盖存储、publisher、凭据和监控冲突。内存测试不证明真实 PostgreSQL/Redis 重启恢复。
+
+0.7 配置修复已通过 `cargo test -p tiangz-dbproxy-server --lib tenant_config_tests --locked`（10 条）和 `cargo test --locked -p tiangz-dbproxy-server --test tenancy`（4 条）。后者直接启动本次构建的服务端，验证 8/16 的不同限制在两种租户顺序下均失败、错误不含令牌，统一为 8 后正常启动并维持数据隔离。`cargo test --workspace --locked` 共 190 条通过、47 条显式真实存储/故障用例未运行；TS SDK 的 21 条通过。
 
 本次未改动现有 SLG/WoW335 部署、数据库或容器。正式使用前须在独立可丢弃环境补真实存储验收：后台队列不串租户、备份恢复、故障干扰与积压恢复。Redis 共实例是资源共享方案，不是强隔离承诺。

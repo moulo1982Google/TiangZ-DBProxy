@@ -15,6 +15,7 @@ pub use tenancy::TenantBackend;
 mod connection_limit_tests;
 mod memory_backend;
 mod observability;
+mod outbox_worker;
 pub mod relay_config;
 pub mod relay_metrics;
 
@@ -296,9 +297,13 @@ impl StorageBackend {
                 .await?,
             );
         }
+        for (index, shard) in shards.iter().enumerate() {
+            shard.identify_connection(index).await?;
+        }
         // Queue polling uses one dedicated PostgreSQL connection so background maintenance never
         // holds the mutex of a request shard. Both queues share it because claims are short.
         let maintenance = PostgresSnapshotStore::connect(postgres_url).await?;
+        maintenance.identify_connection(None).await?;
         let cache_repairs = maintenance.cache_repair_queue();
         let outbox = maintenance.outbox_queue();
         outbox
@@ -320,7 +325,16 @@ impl StorageBackend {
                 .await?;
             outbox_publishers.insert(
                 id.to_string(),
-                Arc::new(RedisOutboxPublisher::connect(url, DEFAULT_OUTBOX_STREAM_PREFIX).await?),
+                Arc::new(
+                    RedisOutboxPublisher::connect_with_config(
+                        url,
+                        DEFAULT_OUTBOX_STREAM_PREFIX,
+                        relay.durability,
+                        Duration::from_millis(relay.publish_timeout_ms),
+                        metrics.clone(),
+                    )
+                    .await?,
+                ),
             );
         }
         for route in &relay.routes {
@@ -339,7 +353,12 @@ impl StorageBackend {
         Ok(Self {
             shards,
             authoritative_read_namespaces: Vec::new(),
-            backlog: RedisSnapshotBacklog::connect_with_config(redis_url, config.enqueue).await?,
+            backlog: RedisSnapshotBacklog::connect_with_metrics(
+                redis_url,
+                config.enqueue,
+                metrics.clone(),
+            )
+            .await?,
             cache_repairs,
             cache_acknowledgements,
             outbox,
@@ -561,95 +580,6 @@ impl StorageBackend {
                 {
                     return Ok(DurableQueueProcessOutcome::LeaseLost);
                 }
-                if dead_lettered {
-                    Ok(DurableQueueProcessOutcome::DeadLettered)
-                } else {
-                    Ok(DurableQueueProcessOutcome::RetryScheduled)
-                }
-            }
-        }
-    }
-
-    pub async fn process_outbox_once(
-        &self,
-        worker_id: &str,
-        policy: RetryWorkerPolicy,
-    ) -> Result<DurableQueueProcessOutcome, BackendError> {
-        let policy = policy.validate()?;
-        let Some(lease) = self.outbox.claim(worker_id, policy.lease_ms).await? else {
-            return Ok(DurableQueueProcessOutcome::Empty);
-        };
-        let publisher = self
-            .outbox_publishers
-            .get(&lease.publisher_id)
-            .ok_or(BackendError::InvalidConfig("outbox publisher is missing"))?;
-        let message = tiangz_dbproxy_storage::PublishMessage {
-            event: &lease.event,
-            destination: &lease.destination,
-            operation_id: &lease.operation_id,
-            trade_id: &lease.trade_id,
-        };
-        let started = Instant::now();
-        let published = timeout(self.outbox_publish_timeout, publisher.publish(message)).await;
-        let status = match &published {
-            Ok(Ok(_)) => "success",
-            Ok(Err(_)) => "error",
-            Err(_) => "timeout",
-        };
-        self.outbox_relay_metrics.record(
-            &lease.producer,
-            &lease.publisher_id,
-            status,
-            started.elapsed().as_secs_f64(),
-        );
-        let publication =
-            published.unwrap_or(Err(tiangz_dbproxy_storage::PublishError::Transient(
-                "publication deadline exceeded; result may be unknown",
-            )));
-        match publication {
-            Ok(_) => {
-                if self.outbox.acknowledge(&lease).await? {
-                    Ok(DurableQueueProcessOutcome::Committed)
-                } else {
-                    self.outbox_relay_metrics.record(
-                        &lease.producer,
-                        &lease.publisher_id,
-                        "lease_lost",
-                        0.0,
-                    );
-                    Ok(DurableQueueProcessOutcome::LeaseLost)
-                }
-            }
-            Err(error) => {
-                let max_attempts =
-                    if matches!(error, tiangz_dbproxy_storage::PublishError::Permanent(_)) {
-                        1
-                    } else {
-                        policy.max_attempts
-                    };
-                let dead_lettered =
-                    lease.attempt_count.saturating_add(1) >= u64::from(max_attempts);
-                let retry_delay =
-                    policy.outbox_retry_delay_ms(&lease.event.event_id, lease.attempt_count);
-                if !self
-                    .outbox
-                    .fail(&lease, &error.to_string(), retry_delay, max_attempts)
-                    .await?
-                {
-                    self.outbox_relay_metrics.record(
-                        &lease.producer,
-                        &lease.publisher_id,
-                        "lease_lost",
-                        0.0,
-                    );
-                    return Ok(DurableQueueProcessOutcome::LeaseLost);
-                }
-                self.outbox_relay_metrics.record(
-                    &lease.producer,
-                    &lease.publisher_id,
-                    if dead_lettered { "dead" } else { "retry" },
-                    0.0,
-                );
                 if dead_lettered {
                     Ok(DurableQueueProcessOutcome::DeadLettered)
                 } else {
@@ -1015,41 +945,54 @@ async fn run_durable_queue_worker(
         if *shutdown.borrow() {
             return;
         }
-        let outcome = match kind {
-            DurableWorkerKind::CacheRepair => {
-                backend.process_cache_repair_once(&worker_id, policy).await
-            }
-            DurableWorkerKind::Outbox => backend.process_outbox_once(&worker_id, policy).await,
+        let outcomes = match kind {
+            DurableWorkerKind::CacheRepair => backend
+                .process_cache_repair_once(&worker_id, policy)
+                .await
+                .map(|outcome| vec![Ok(outcome)]),
+            DurableWorkerKind::Outbox => backend.process_outbox_batch(&worker_id, policy).await,
         };
-        let (metric_result, should_idle) = match outcome {
-            Ok(DurableQueueProcessOutcome::Committed) => {
-                (DurableQueueMetricResult::Committed, false)
-            }
-            Ok(DurableQueueProcessOutcome::RetryScheduled) => {
-                (DurableQueueMetricResult::RetryScheduled, false)
-            }
-            Ok(DurableQueueProcessOutcome::DeadLettered) => {
-                tracing::error!(worker = %worker_id, queue = queue_name, "durable queue item moved to dead letter");
-                (DurableQueueMetricResult::DeadLettered, false)
-            }
-            Ok(DurableQueueProcessOutcome::LeaseLost) => {
-                (DurableQueueMetricResult::LeaseLost, false)
-            }
-            Ok(DurableQueueProcessOutcome::Empty) => (DurableQueueMetricResult::Empty, true),
-            Err(error) => {
-                tracing::error!(%error, worker = %worker_id, queue = queue_name, "durable queue worker failed");
-                (DurableQueueMetricResult::Failure, true)
-            }
+        let outcomes = match outcomes {
+            Ok(outcomes) if !outcomes.is_empty() => outcomes,
+            Ok(_) => vec![Ok(DurableQueueProcessOutcome::Empty)],
+            Err(error) => vec![Err(error)],
         };
-        if let Some(metrics) = &metrics {
-            metrics.durable_queue_finished(metric_kind, metric_result);
-        }
-        if should_idle {
-            let delay = if matches!(metric_result, DurableQueueMetricResult::Failure) {
-                Duration::from_millis(policy.base_retry_delay_ms)
-            } else {
-                idle_delay
+        let mut idle = None;
+        for outcome in outcomes {
+            let (metric_result, should_idle) = match outcome {
+                Ok(DurableQueueProcessOutcome::Committed) => {
+                    (DurableQueueMetricResult::Committed, false)
+                }
+                Ok(DurableQueueProcessOutcome::RetryScheduled) => {
+                    (DurableQueueMetricResult::RetryScheduled, false)
+                }
+                Ok(DurableQueueProcessOutcome::DeadLettered) => {
+                    tracing::error!(worker = %worker_id, queue = queue_name, "durable queue item moved to dead letter");
+                    (DurableQueueMetricResult::DeadLettered, false)
+                }
+                Ok(DurableQueueProcessOutcome::LeaseLost) => {
+                    (DurableQueueMetricResult::LeaseLost, false)
+                }
+                Ok(DurableQueueProcessOutcome::Empty) => (DurableQueueMetricResult::Empty, true),
+                Err(error) => {
+                    tracing::error!(%error, worker = %worker_id, queue = queue_name, "durable queue worker failed");
+                    (DurableQueueMetricResult::Failure, true)
+                }
             };
+            if let Some(metrics) = &metrics {
+                metrics.durable_queue_finished(metric_kind, metric_result);
+            }
+            if should_idle {
+                idle = Some(
+                    if matches!(metric_result, DurableQueueMetricResult::Failure) {
+                        Duration::from_millis(policy.base_retry_delay_ms)
+                    } else {
+                        idle_delay
+                    },
+                );
+            }
+        }
+        if let Some(delay) = idle {
             tokio::select! {
                 _ = sleep(delay) => {}
                 changed = shutdown.changed() => {

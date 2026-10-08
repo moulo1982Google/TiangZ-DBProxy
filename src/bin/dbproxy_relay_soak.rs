@@ -14,6 +14,7 @@ type Failure = Box<dyn Error + Send + Sync>;
 #[test]
 fn retry_policy_does_not_hide_permanent_contract_failures() {
     assert!(retryable(&ClientError::RequestTimeout));
+    assert!(retryable(&ClientError::RequestNotSentTimeout));
     assert!(retryable(&ClientError::Protocol(ProtocolError::Io(
         std::io::Error::from(std::io::ErrorKind::ConnectionReset),
     ))));
@@ -39,6 +40,7 @@ fn retryable(error: &ClientError) -> bool {
         error,
         ClientError::ConnectTimeout
             | ClientError::RequestTimeout
+            | ClientError::RequestNotSentTimeout
             | ClientError::ConnectionUnusable
             | ClientError::ConnectionClosed
             | ClientError::Protocol(ProtocolError::Io(_))

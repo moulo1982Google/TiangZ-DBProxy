@@ -31,7 +31,11 @@ impl PostgresOutboxQueue {
     /// 只返回诊断元数据，不输出游戏 payload 或连接密钥。
     /// Returns diagnostic metadata without game payloads or connection secrets.
     pub async fn inspect(&self, event_id: &str) -> Result<Option<OutboxInspection>, StorageError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("outbox_admin_inspect", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         Ok(client.query_opt("SELECT event_id,producer,publisher_id,destination,attempt_count,expired_leases,published_at IS NOT NULL,dead_lettered_at IS NOT NULL,COALESCE(lease_until>clock_timestamp(),false),last_error FROM dbproxy_outbox WHERE event_id=$1",&[&event_id]).await?.map(|r|OutboxInspection{
             event_id:r.get(0),producer:r.get(1),publisher:r.get(2),destination:r.get(3),attempts:r.get(4),
@@ -41,7 +45,11 @@ impl PostgresOutboxQueue {
     /// 固定上限，避免管理查询一次读取全部积压。
     /// Bounds inspection instead of loading the whole backlog.
     pub async fn dead_letter_ids(&self) -> Result<Vec<String>, StorageError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("outbox_admin_dead_letter_ids", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         Ok(client.query("SELECT event_id FROM dbproxy_outbox WHERE dead_lettered_at IS NOT NULL ORDER BY dead_lettered_at,event_id LIMIT 100",&[]).await?
             .into_iter().map(|r|r.get(0)).collect())
@@ -62,7 +70,11 @@ impl PostgresOutboxQueue {
                 ));
             }
         }
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("outbox_admin_retry_dead_letter", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let tx = client.transaction().await?;
         let row=tx.query_opt("SELECT attempt_count,last_error FROM dbproxy_outbox WHERE event_id=$1 AND published_at IS NULL AND dead_lettered_at IS NOT NULL AND (lease_until IS NULL OR lease_until<=clock_timestamp()) FOR UPDATE",&[&event_id]).await?;
@@ -75,7 +87,11 @@ impl PostgresOutboxQueue {
     }
 
     pub async fn source_stats(&self) -> Result<Vec<OutboxSourceStats>, StorageError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("outbox_admin_source_stats", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         Ok(client.query("SELECT producer,publisher_id, COUNT(*) FILTER(WHERE dead_lettered_at IS NULL AND (lease_until IS NULL OR lease_until<=clock_timestamp())), COUNT(*) FILTER(WHERE dead_lettered_at IS NULL AND lease_until>clock_timestamp()),COUNT(*) FILTER(WHERE dead_lettered_at IS NOT NULL), COALESCE(EXTRACT(EPOCH FROM clock_timestamp()-MIN(created_at) FILTER(WHERE dead_lettered_at IS NULL)),0)::DOUBLE PRECISION, COALESCE(SUM(expired_leases),0)::BIGINT FROM dbproxy_outbox WHERE published_at IS NULL GROUP BY producer,publisher_id",&[]).await?
             .into_iter().map(|r|OutboxSourceStats { producer:r.get(0),publisher:r.get(1),pending:r.get::<_,i64>(2).max(0) as u64,

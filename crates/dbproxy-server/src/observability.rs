@@ -514,12 +514,24 @@ impl DbProxyMetrics {
         )
         .unwrap();
         writeln!(output, "# TYPE dbproxy_storage_stage_in_flight gauge").unwrap();
+        writeln!(output, "# HELP dbproxy_storage_stage_timeouts_total Explicitly observed stage timeouts, not all errors or cancellations").unwrap();
+        writeln!(
+            output,
+            "# TYPE dbproxy_storage_stage_timeouts_total counter"
+        )
+        .unwrap();
         let snapshot = self
             .storage_latencies
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for sample in snapshot.iter() {
             let stage = sample.stage;
+            writeln!(
+                output,
+                "dbproxy_storage_stage_timeouts_total{{stage=\"{stage}\"}} {}",
+                sample.timeouts
+            )
+            .unwrap();
             let mut cumulative = 0_u64;
             for (bound, count) in STORAGE_LATENCY_BOUNDS_MS.iter().zip(sample.buckets) {
                 cumulative += count;
@@ -1570,6 +1582,7 @@ mod tests {
             buckets: [0; STORAGE_LATENCY_BOUNDS_MS.len() + 1],
             sum_micros: 31_002_000,
             in_flight: 2,
+            timeouts: 3,
         };
         sample.buckets[0] = 2;
         sample.buckets[STORAGE_LATENCY_BOUNDS_MS.len()] = 1;
@@ -1591,6 +1604,9 @@ mod tests {
             )
         );
         assert!(output.contains("dbproxy_storage_stage_in_flight{stage=\"postgres_operation\"} 2"));
+        assert!(
+            output.contains("dbproxy_storage_stage_timeouts_total{stage=\"postgres_operation\"} 3")
+        );
         metrics.storage_latencies_updated(Vec::new());
         assert!(
             !metrics

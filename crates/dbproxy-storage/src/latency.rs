@@ -8,8 +8,8 @@ use std::{
 
 /// 毫秒有限桶；保留超出三十秒的样本到无穷桶。
 /// Millisecond bounds; samples beyond thirty seconds remain in the infinity bucket.
-pub const STORAGE_LATENCY_BOUNDS_MS: [u64; 14] = [
-    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 15_000, 30_000,
+pub const STORAGE_LATENCY_BOUNDS_MS: [u64; 15] = [
+    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 3_000, 5_000, 10_000, 15_000, 30_000,
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -24,10 +24,17 @@ pub(crate) enum Stage {
     CommittedCacheSync,
     RepairAck,
     FallbackRelease,
+    EnqueueQueue,
+    EnqueueWrite,
+    EnqueueAof,
+    EnqueueTotal,
+    OutboxWrite,
+    OutboxAof,
+    OutboxTotal,
 }
 
 impl Stage {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 17] = [
         Self::CacheLookup,
         Self::CacheWrite,
         Self::FallbackCapacity,
@@ -38,6 +45,13 @@ impl Stage {
         Self::CommittedCacheSync,
         Self::RepairAck,
         Self::FallbackRelease,
+        Self::EnqueueQueue,
+        Self::EnqueueWrite,
+        Self::EnqueueAof,
+        Self::EnqueueTotal,
+        Self::OutboxWrite,
+        Self::OutboxAof,
+        Self::OutboxTotal,
     ];
 
     fn name(self) -> &'static str {
@@ -52,6 +66,13 @@ impl Stage {
             Self::CommittedCacheSync => "committed_cache_sync",
             Self::RepairAck => "cache_repair_ack",
             Self::FallbackRelease => "fallback_lease_release",
+            Self::EnqueueQueue => "enqueue_queue",
+            Self::EnqueueWrite => "enqueue_write",
+            Self::EnqueueAof => "enqueue_aof",
+            Self::EnqueueTotal => "enqueue_total",
+            Self::OutboxWrite => "outbox_write",
+            Self::OutboxAof => "outbox_aof",
+            Self::OutboxTotal => "outbox_total",
         }
     }
 }
@@ -64,6 +85,9 @@ pub struct StorageStageSnapshot {
     pub buckets: [u64; STORAGE_LATENCY_BOUNDS_MS.len() + 1],
     pub sum_micros: u64,
     pub in_flight: u64,
+    /// 该阶段显式观察到的期限耗尽；不把取消或所有错误都当作超时。
+    /// Explicitly observed deadline exhaustion; cancellation and other errors are not inferred as timeouts.
+    pub timeouts: u64,
 }
 
 #[derive(Default)]
@@ -71,6 +95,7 @@ struct Histogram {
     buckets: [AtomicU64; STORAGE_LATENCY_BOUNDS_MS.len() + 1],
     sum_micros: AtomicU64,
     in_flight: AtomicU64,
+    timeouts: AtomicU64,
 }
 
 impl Histogram {
@@ -89,6 +114,24 @@ impl Histogram {
 pub(crate) struct StorageLatency([Histogram; Stage::ALL.len()]);
 
 impl StorageLatency {
+    pub(crate) fn enter(&self, stage: Stage) {
+        self.0[stage as usize]
+            .in_flight
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn leave(&self, stage: Stage, duration: Duration) {
+        let histogram = &self.0[stage as usize];
+        histogram.record(duration);
+        histogram.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn timed_out(&self, stage: Stage) {
+        self.0[stage as usize]
+            .timeouts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) async fn measure<F: std::future::Future>(
         &self,
         stage: Stage,
@@ -120,6 +163,7 @@ impl StorageLatency {
                         .map(|value| value.load(Ordering::Relaxed)),
                     sum_micros: histogram.sum_micros.load(Ordering::Relaxed),
                     in_flight: histogram.in_flight.load(Ordering::Relaxed),
+                    timeouts: histogram.timeouts.load(Ordering::Relaxed),
                 }
             })
             .collect()
@@ -158,8 +202,8 @@ mod tests {
         }
         assert_eq!(histogram.buckets[0].load(Ordering::Relaxed), 2);
         assert_eq!(histogram.buckets[1].load(Ordering::Relaxed), 1);
-        assert_eq!(histogram.buckets[13].load(Ordering::Relaxed), 1);
         assert_eq!(histogram.buckets[14].load(Ordering::Relaxed), 1);
+        assert_eq!(histogram.buckets[15].load(Ordering::Relaxed), 1);
         assert_eq!(histogram.sum_micros.load(Ordering::Relaxed), 61_002_001);
     }
 
@@ -177,14 +221,14 @@ mod tests {
         });
         for _ in 0..2 {
             let snapshot = metrics.snapshot();
-            assert_eq!(snapshot.len(), 10);
+            assert_eq!(snapshot.len(), Stage::ALL.len());
             assert_eq!(
                 snapshot
                     .iter()
                     .map(|sample| sample.stage)
                     .collect::<std::collections::HashSet<_>>()
                     .len(),
-                10
+                Stage::ALL.len()
             );
             assert_eq!(
                 snapshot[Stage::CacheLookup as usize]

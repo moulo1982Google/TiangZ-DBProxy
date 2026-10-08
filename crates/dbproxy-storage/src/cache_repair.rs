@@ -28,17 +28,46 @@ pub struct CacheRepairStats {
 pub struct PostgresCacheRepairQueue {
     client: SharedPostgresClient,
     acknowledgement_wait: Option<std::time::Duration>,
+    metrics: std::sync::Arc<crate::StorageMetrics>,
 }
 
 impl PostgresCacheRepairQueue {
     pub(crate) fn new(
         client: SharedPostgresClient,
         acknowledgement_wait: Option<std::time::Duration>,
+        metrics: std::sync::Arc<crate::StorageMetrics>,
     ) -> Self {
         Self {
             client,
             acknowledgement_wait,
+            metrics,
         }
+    }
+
+    async fn acknowledgement_client(
+        &self,
+        batch_size: usize,
+    ) -> Result<crate::postgres_diagnostics::PostgresGuard<'_>, StorageError> {
+        let result = self
+            .metrics
+            .latency
+            .measure(
+                crate::Stage::PostgresQueue,
+                self.client.lock_for(
+                    "cache_repair_acknowledge",
+                    None,
+                    batch_size,
+                    self.acknowledgement_wait,
+                ),
+            )
+            .await;
+        if matches!(
+            result,
+            Err(StorageError::PostgresConnectionWaitTimeout { .. })
+        ) {
+            self.metrics.latency.timed_out(crate::Stage::PostgresQueue);
+        }
+        result
     }
 
     pub async fn enqueue(
@@ -47,7 +76,11 @@ impl PostgresCacheRepairQueue {
         target_revision: Revision,
     ) -> Result<(), StorageError> {
         let target_revision = required_revision_to_i64(record, target_revision)?;
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("cache_repair_enqueue", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         enqueue_sql(client.as_client(), record, target_revision).await
     }
@@ -58,8 +91,7 @@ impl PostgresCacheRepairQueue {
         cached_revision: Revision,
     ) -> Result<bool, StorageError> {
         let cached_revision = required_revision_to_i64(record, cached_revision)?;
-        let mut client =
-            crate::postgres_request::lock_client(&self.client, self.acknowledgement_wait).await?;
+        let mut client = self.acknowledgement_client(1).await?;
         client.ensure_connected().await?;
         let removed = client
             .execute(
@@ -101,8 +133,7 @@ impl PostgresCacheRepairQueue {
             .iter()
             .map(|(record, revision)| required_revision_to_i64(record, *revision))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut client =
-            crate::postgres_request::lock_client(&self.client, self.acknowledgement_wait).await?;
+        let mut client = self.acknowledgement_client(targets.len()).await?;
         client.ensure_connected().await?;
         Ok(client
             .execute(
@@ -127,7 +158,11 @@ WHERE repair.namespace = cached.namespace
         validate_worker(worker_id, lease_ms)?;
         let lease_ms = i64::try_from(lease_ms)
             .map_err(|_| StorageError::QueueProtocol("lease duration is too large".to_string()))?;
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("cache_repair_claim", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let row = client
             .query_opt(
@@ -181,7 +216,11 @@ RETURNING repair.namespace, repair.record_key, repair.target_revision, repair.at
         let repaired_revision = repaired_revision
             .map(|revision| required_revision_to_i64(&lease.record, revision))
             .transpose()?;
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("cache_repair_acknowledge", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         // Lock before deciding: enqueue and fast-path deletion cannot change this row
@@ -228,7 +267,11 @@ RETURNING repair.namespace, repair.record_key, repair.target_revision, repair.at
             .map_err(|_| StorageError::QueueProtocol("retry delay is too large".to_string()))?;
         let error = bounded_error(error);
         let maximum = i64::from(max_attempts);
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("cache_repair_fail", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         // UPDATE can evaluate its expiry predicate before waiting on an unchanged locked
@@ -276,7 +319,11 @@ WHERE namespace = $1
 
     /// Requeue one inspected dead letter after an operator has fixed the root cause.
     pub async fn requeue_dead_letter(&self, record: &RecordKey) -> Result<bool, StorageError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("cache_repair_requeue_dead_letter", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let updated = client
             .execute(
@@ -299,7 +346,11 @@ WHERE namespace = $1 AND record_key = $2 AND dead_lettered_at IS NOT NULL
     }
 
     pub async fn stats(&self) -> Result<CacheRepairStats, StorageError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("cache_repair_stats", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let row = client
             .query_one(

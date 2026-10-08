@@ -1,5 +1,7 @@
 # DBProxy storage metrics
 
+The separate [`dbproxy_capacity` CLI](capacity-observation.md) samples the fixed storage-table inventory on demand. It uses a dedicated read-only connection, a total deadline, catalog row estimates and physical table/index sizes including partitions. Optional server-time scans have individual statement limits. It never runs on a request or Prometheus scrape, and does not implement receipt retention or automatic deletion. Missing/unknown estimates and age-query errors remain explicit rather than becoming zero.
+
 The `/metrics` endpoint exports bounded Prometheus metrics for the PostgreSQL/Redis path. No
 player ID, `RecordKey`, namespace, request ID, or operation ID is used as a label.
 

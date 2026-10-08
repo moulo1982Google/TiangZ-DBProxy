@@ -19,6 +19,12 @@ use tiangz_dbproxy_core::{
 use tiangz_dbproxy_protocol::{MAX_BATCH_SNAPSHOT_WRITES, ProtocolError, wire};
 use tokio::{task::JoinSet, time::Instant};
 
+#[path = "fault_soak/diagnostics.rs"]
+mod diagnostics;
+#[path = "fault_soak/seed.rs"]
+mod seed;
+use seed::seed_and_warm_players;
+
 type DynError = Box<dyn Error + Send + Sync>;
 
 #[derive(Clone)]
@@ -51,6 +57,7 @@ struct PlayerState {
 #[derive(Default)]
 struct Counters {
     error_diagnostics: AtomicU64,
+    recent_errors: diagnostics::ErrorDiagnostics,
     load_ok: AtomicU64,
     load_errors: AtomicU64,
     missing_snapshots: AtomicU64,
@@ -273,6 +280,7 @@ async fn main() -> Result<(), DynError> {
             "runId": run_id.to_string(),
             "elapsedSeconds": started.elapsed().as_secs_f64(),
             "totals": total.json(),
+            "errorDiagnostics": counters.recent_errors.export(false),
             "checks": {
                 "finalClientVisibleStatePassed": final_state_passed,
                 "observedConsistencyPassed": observed_consistency_passed,
@@ -310,86 +318,6 @@ fn validate_observed_consistency(counters: CounterSnapshot) -> Result<(), DynErr
         )
         .into())
     }
-}
-
-async fn seed_and_warm_players(
-    pool: &DbProxyClientPool,
-    players: usize,
-    run_id: u128,
-) -> Result<Vec<PlayerState>, DynError> {
-    let mut tasks = JoinSet::new();
-    for index in 0..players {
-        let pool = pool.clone();
-        tasks.spawn(async move {
-            let direct_record =
-                RecordKey::new("fault-soak-player", format!("{run_id}:{index}:direct"))?;
-            let queued_record =
-                RecordKey::new("fault-soak-player", format!("{run_id}:{index}:queued"))?;
-            let direct_revision = seed_snapshot(
-                &pool,
-                format!("soak:seed:{run_id}:{index}:direct"),
-                direct_record.clone(),
-                payload(index, 0, "direct"),
-                run_id as u64,
-            )
-            .await?;
-            seed_snapshot(
-                &pool,
-                format!("soak:seed:{run_id}:{index}:queued"),
-                queued_record.clone(),
-                payload(index, 0, "queued"),
-                run_id as u64,
-            )
-            .await?;
-            if pool.load(&direct_record).await?.is_none()
-                || pool.load(&queued_record).await?.is_none()
-            {
-                return Err::<_, DynError>(
-                    "seeded snapshot disappeared during cache warmup".into(),
-                );
-            }
-            Ok::<_, DynError>(PlayerState {
-                index,
-                direct_record,
-                queued_record,
-                direct_revision,
-                transaction_sequence: 0,
-                trade_sequence: 0,
-                pending_transaction: None,
-                pending_trade: None,
-            })
-        });
-    }
-    let mut states = Vec::with_capacity(players);
-    while let Some(joined) = tasks.join_next().await {
-        states.push(joined??);
-    }
-    states.sort_unstable_by_key(|state| state.index);
-    Ok(states)
-}
-
-async fn seed_snapshot(
-    pool: &DbProxyClientPool,
-    request_id: String,
-    record: RecordKey,
-    payload: Vec<u8>,
-    updated_at_unix_ms: u64,
-) -> Result<Revision, DynError> {
-    let outcome = pool
-        .save(SnapshotWrite {
-            request_id,
-            record,
-            schema: "tiangz.fault-soak.player".to_string(),
-            schema_version: 1,
-            payload,
-            expected_revision: Some(Revision::ZERO),
-            updated_at_unix_ms,
-        })
-        .await?;
-    Ok(match outcome {
-        tiangz_dbproxy_core::SnapshotWriteOutcome::Applied { revision }
-        | tiangz_dbproxy_core::SnapshotWriteOutcome::Duplicate { revision } => revision,
-    })
 }
 
 async fn run_player(
@@ -604,7 +532,12 @@ async fn apply_direct_transaction(
         }
         Err(error) => {
             counters.transaction_errors.fetch_add(1, Ordering::Relaxed);
-            record_operation_error(counters, "apply_transaction", &error);
+            record_correlated_error(
+                counters,
+                "apply_transaction",
+                &error,
+                Some(&request.operation_id),
+            );
         }
     }
 }
@@ -653,7 +586,7 @@ async fn apply_trade(
         }
         Err(error) => {
             counters.trade_errors.fetch_add(1, Ordering::Relaxed);
-            record_operation_error(counters, "apply_trade", &error);
+            record_correlated_error(counters, "apply_trade", &error, Some(&request.operation_id));
         }
     }
 }
@@ -665,6 +598,7 @@ fn retryable_operation_error(error: &ClientError) -> bool {
         error,
         ClientError::ConnectTimeout
             | ClientError::RequestTimeout
+            | ClientError::RequestNotSentTimeout
             | ClientError::ConnectionUnusable
             | ClientError::ConnectionClosed
     ) || matches!(error, ClientError::Protocol(ProtocolError::Io(error)) if matches!(error.kind(),
@@ -678,19 +612,33 @@ fn retryable_operation_error(error: &ClientError) -> bool {
 /// 保留有限错误样本；永久契约错误立即加入最终失败计数，不混为普通故障重试。
 /// Retains bounded samples and makes permanent contract failures part of the final failure counters.
 fn record_operation_error(counters: &Counters, stage: &str, error: &ClientError) {
+    record_correlated_error(counters, stage, error, None);
+}
+
+fn record_correlated_error(
+    counters: &Counters,
+    stage: &str,
+    error: &ClientError,
+    correlation: Option<&str>,
+) {
     let retryable = retryable_operation_error(error);
     let permanent_sample =
         !retryable && counters.invariant_errors.fetch_add(1, Ordering::Relaxed) < 16;
-    let sampled = counters.error_diagnostics.fetch_add(1, Ordering::Relaxed) < 16;
-    if sampled || permanent_sample {
+    counters.error_diagnostics.fetch_add(1, Ordering::Relaxed);
+    let text = error.to_string();
+    let sampled = counters
+        .recent_errors
+        .record(stage, retryable, correlation, &text);
+    if sampled.is_some() || permanent_sample {
         emit(
             if retryable {
                 "SOAK_OPERATION_ERROR"
             } else {
                 "SOAK_CONTRACT_ERROR"
             },
-            json!({ "stage":stage, "retryable":retryable,
-                "error":error.to_string().chars().take(512).collect::<String>() }),
+            json!({ "stage":stage, "retryable":retryable, "sample":sampled,
+                "correlation":correlation.map(tiangz_dbproxy_storage::postgres_operation_fingerprint),
+                "error":text.chars().take(512).collect::<String>() }),
         );
     }
 }
@@ -780,6 +728,9 @@ async fn report_progress(
             }),
         );
         previous = current;
+        if let Some(evidence) = counters.recent_errors.export(true) {
+            emit("SOAK_RECENT_ERRORS", evidence);
+        }
     }
 }
 
@@ -943,6 +894,7 @@ mod tests {
         let counters = Counters::default();
         for error in [
             ClientError::RequestTimeout,
+            ClientError::RequestNotSentTimeout,
             ClientError::ConnectionClosed,
             ClientError::Protocol(ProtocolError::Io(
                 std::io::ErrorKind::ConnectionReset.into(),

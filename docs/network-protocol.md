@@ -51,7 +51,9 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 
 ### Enqueue ACK
 
-`Enqueue*` 在 Lua 入队后执行 `WAITAOF 1 0 2000`（部署配置 `backlog.enqueueAck: "memory"` 时跳过，写入 Redis 内存即成功，协议不变）。AOF 未启用、超时或 Redis 不可用会返回 `STORAGE_UNAVAILABLE`。成功仍只代表 Redis 本地 AOF 接收；货币、背包、奖励、交易禁止走该路径。
+`postgresRedis` 后端的 `Enqueue*` 按部署配置 `backlog.enqueueAck` 确认。默认 `aof` 在 Lua 入队后执行 `WAITAOF 1 0 2000`，等待 Redis 本地 AOF 落盘；此档 AOF 未启用、等待超时或 Redis 不可用会返回 `STORAGE_UNAVAILABLE`。`memory` 跳过 AOF 等待，写入 Redis 内存即成功，Redis 崩溃可能丢失尚未落盘的已确认入队。
+
+两档都不表示 PostgreSQL 已提交，响应不携带确认档位，SDK/生成器不能单凭成功推断 AOF 耐久性；货币、背包、奖励、交易禁止走该路径。测试用 `storage.backend: "memory"` 是独立设置，只保存在 DBProxy 进程内，不提供 Redis AOF 或 PG 持久性保证。
 
 ### 多记录与交易
 

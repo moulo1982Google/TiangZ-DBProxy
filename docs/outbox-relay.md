@@ -34,7 +34,7 @@ DBProxy 负责版本化记录与事件的原子提交、固定投递目标、租
 - `connectionEnv` 只保存环境变量名。禁用 Publisher 不读取密钥，也不打开连接。未来 Kafka 的具体认证/确认等参数在驱动实现时再扩展，不接受任意透传配置。
 - Publisher ID/producer 为 1–64 个 ASCII 字母、数字、`_` 或 `-`；`legacy` 保留。最多 32 个 Publisher 声明、64 个来源版本。
 - 投递目标是完整 Stream 名称，不再临时拼接前缀。`dbproxy:outbox:` 保留给旧事件，不能用于新来源。
-- `publishTimeoutMs` 为 3000–60000，并至少比租约短 1000ms；它包含连接等待、发送与 AOF 确认。期限耗尽表示结果可能未知，不表示 MQ 一定没收到。
+- `publishTimeoutMs` 为 3000–60000，并至少比租约短 1000ms；它包含连接等待、发送与 AOF 确认。期限耗尽表示结果可能未知，不表示 MQ 一定没收到。0.7 新增独立 `aofAckTimeoutMs`（默认 2000）与 `redisResponseTimeoutMs`（默认 3000），要求 `AOF < Redis I/O < publishTimeoutMs`，首次连接和重连一致；参数关系与兼容边界见[可靠 Redis 预算](redis-durability-budget.md)。
 - Memory 后端不能激活 Publisher/来源；它只验证易失记录契约，不投递到 MQ。
 - 不开放 `table` 字段，避免把未实现的多表功能伪装为可用配置。
 
@@ -92,7 +92,7 @@ Publisher ID 固定连接协议、地址和 Redis DB 编号的摘要，不保存
 
 ## 可靠性和顺序
 
-Relay 核心负责领取/失败/死信；`Publisher` 只负责发送与确认。Redis 实现使用独立的受控连接：`XADD` 后在同一连接执行 `WAITAOF 1 0 2000`；只有本地 AOF 确认成功才尝试 PostgreSQL ACK。发送错误或取消会丢弃该连接，再次投递重新建立连接，避免在自动重连后的另一连接上确认旧写入。
+Relay 核心负责领取/失败/死信；`Publisher` 只负责发送与确认。Redis 实现使用独立的受控连接：`XADD` 后在同一连接执行 `WAITAOF 1 0 timeout`，上限为配置 AOF 等待与发布剩余预算的较小者；只有本地 AOF 确认成功才尝试 PostgreSQL ACK。发送错误或取消会丢弃该连接，再次投递重新建立连接，避免在自动重连后的另一连接上确认旧写入。
 
 这是至少一次，不是恰好一次：MQ 已收到而 PG ACK 丢失时会重复投递。本地 AOF 确认不是 Redis 多副本容灾保证，也不是消费者处理完成。
 
@@ -100,7 +100,7 @@ Relay 核心负责领取/失败/死信；`Publisher` 只负责发送与确认。
 
 同一 Publisher、destination、partition_key 按入队序号领取；写入端按同一目标取得事务级锁。前序死信继续阻塞后序，不能静默越过。至少一次和失效在途请求仍可能带来迟到的重复消息；需要严格业务序列的消费者仍应检查领域 revision/sequence，不宣称任意故障下的全局严格顺序。
 
-`partition_key` 同时决定业务顺序边界与并行容量。当前每次 claim 领取一条，完成发送/持久确认和 PostgreSQL ACK 后，同组后续事件才可领取；单 worker 的周期包含领取、发送确认和 ACK，不只是一次数据库往返。多个 worker 能推进不同排序组，不能通过增加 worker 让同组正常事件并行发送。按真正需要顺序的聚合对象选择 key，避免把所有玩家或所有订单放进一个全局 key；也不能为提高吞吐而拆散同一业务顺序。多个 producer 扇入同组时共享该容量和故障影响范围，应按组内峰值事件速率与实测投递周期估算余量。
+`partition_key` 同时决定业务顺序边界与并行容量。单条 claim 保留；0.7 开发 worker 现以[有界批次](outbox-batch-publication.md)领取最多 16 个独立组头，共用一次 Redis AOF 确认。完成发送/持久确认和 PostgreSQL ACK 后，同组后续事件才可领取；单 worker 的周期包含领取、发送确认和 ACK，不只是一次数据库往返。多个 worker 能推进不同排序组，不能通过增加 worker 让同组正常事件并行发送。按真正需要顺序的聚合对象选择 key，避免把所有玩家或所有订单放进一个全局 key；也不能为提高吞吐而拆散同一业务顺序。多个 producer 扇入同组时共享该容量和故障影响范围，应按组内峰值事件速率与实测投递周期估算余量。
 
 允许多个 producer 或路由版本共用同一 Publisher/destination（扇入）。新版事件先解析持久路由，再按实际目标与 partition_key 加锁，不按原始 topic 各自加锁；同组前序死信也会阻塞其他来源的后续事件。不同 Publisher ID 是不同排序组，即使它们实际连接同一 Redis Stream，也不保证跨 ID 的组内顺序。
 

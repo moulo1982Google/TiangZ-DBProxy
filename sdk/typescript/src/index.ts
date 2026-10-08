@@ -7,6 +7,9 @@
  * domain types must never enter this layer.
  */
 
+import { RequestBudget, type DbProxyRequestOptions } from "./request-budget.js";
+export type { DbProxyRequestOptions } from "./request-budget.js";
+
 export {
   DBPROXY_PROTOCOL_FINGERPRINT,
   DBPROXY_PROTOCOL_VERSION,
@@ -272,45 +275,58 @@ export interface DbProxyTradeTransactionResult {
  * not be reused when its response boundary is unknown.
  */
 export interface DbProxyTransport {
+  /** 仅在物理 I/O 实现 timeoutMs 后声明支持。 / True only when physical I/O honors timeoutMs. */
+  readonly supportsRequestTimeout?: boolean;
+  readonly requestTimeoutMs?: number;
+  monotonicNowMs?(): number;
   /** 仅在宿主/服务端确认新版 Relay 契约后设为 true。 / True only after host/server relay capability verification. */
   readonly supportsOutboxRelay?: boolean;
-  commitRecords?(write: DbProxyRecordCommit): Promise<DbProxyMultiTransactionalWriteResult>;
-  load(record: DbProxyRecordKey): Promise<DbProxySnapshotEnvelope | undefined>;
+  commitRecords?(write: DbProxyRecordCommit, options?: DbProxyRequestOptions): Promise<DbProxyMultiTransactionalWriteResult>;
+  load(record: DbProxyRecordKey, options?: DbProxyRequestOptions): Promise<DbProxySnapshotEnvelope | undefined>;
   loadMulti(
     records: readonly DbProxyRecordKey[],
+    options?: DbProxyRequestOptions,
   ): Promise<readonly (DbProxySnapshotEnvelope | undefined)[]>;
   /** 显式旧读；宿主必须传递版本下限，不能静默忽略。 / Explicit stale reads; hosts must honor fences. */
-  loadCached?(record: DbProxyRecordKey, minRevision?: bigint): Promise<DbProxySnapshotEnvelope | undefined>;
-  loadCachedMulti?(records: readonly DbProxyRecordKey[], minRevisions: readonly bigint[]): Promise<readonly (DbProxySnapshotEnvelope | undefined)[]>;
-  save(write: DbProxySnapshotWrite): Promise<DbProxySnapshotWriteResult>;
+  loadCached?(record: DbProxyRecordKey, minRevision?: bigint, options?: DbProxyRequestOptions): Promise<DbProxySnapshotEnvelope | undefined>;
+  loadCachedMulti?(records: readonly DbProxyRecordKey[], minRevisions: readonly bigint[], options?: DbProxyRequestOptions): Promise<readonly (DbProxySnapshotEnvelope | undefined)[]>;
+  save(write: DbProxySnapshotWrite, options?: DbProxyRequestOptions): Promise<DbProxySnapshotWriteResult>;
   saveMulti(
     writes: readonly DbProxySnapshotWrite[],
+    options?: DbProxyRequestOptions,
   ): Promise<readonly DbProxyBatchSnapshotWriteResult[]>;
-  enqueueSnapshot(write: DbProxySnapshotWrite): Promise<void>;
+  enqueueSnapshot(write: DbProxySnapshotWrite, options?: DbProxyRequestOptions): Promise<void>;
   enqueueMultiSnapshot(
     writes: readonly DbProxySnapshotWrite[],
+    options?: DbProxyRequestOptions,
   ): Promise<readonly DbProxyBatchSnapshotEnqueueResult[]>;
   applyTransaction(
     write: DbProxyTransactionalWrite,
+    options?: DbProxyRequestOptions,
   ): Promise<DbProxyTransactionalWriteResult>;
   loadTransaction(
     operationId: string,
     record: DbProxyRecordKey,
+    options?: DbProxyRequestOptions,
   ): Promise<DbProxyTransactionReceipt | undefined>;
   applyMultiTransaction(
     write: DbProxyMultiTransactionalWrite,
+    options?: DbProxyRequestOptions,
   ): Promise<DbProxyMultiTransactionalWriteResult>;
   loadMultiTransaction(
     operationId: string,
     records: readonly DbProxyRecordKey[],
+    options?: DbProxyRequestOptions,
   ): Promise<DbProxyMultiTransactionReceipt | undefined>;
-  loadTrade?(tradeId: string): Promise<DbProxyTradeEnvelope | undefined>;
+  loadTrade?(tradeId: string, options?: DbProxyRequestOptions): Promise<DbProxyTradeEnvelope | undefined>;
   applyTradeTransaction?(
     transaction: DbProxyTradeTransaction,
+    options?: DbProxyRequestOptions,
   ): Promise<DbProxyTradeTransactionResult>;
   loadTradeTransaction?(
     operationId: string,
     tradeId: string,
+    options?: DbProxyRequestOptions,
   ): Promise<DbProxyTradeReceipt | undefined>;
 }
 
@@ -335,7 +351,35 @@ export class DbProxyRemoteError extends Error {
  * the previous request may already have committed.
  */
 export class DbProxyClient {
+  private budget?: RequestBudget;
   constructor(private readonly transport: DbProxyTransport) {}
+
+  /** 为一次逻辑操作创建独立范围；原客户端不变，子范围不能延长期限。 / Creates an independent operation scope without mutating this client or extending a parent deadline. */
+  WithRequestBudget(timeoutMs = this.transport.requestTimeoutMs ?? 5000): DbProxyClient {
+    if (this.transport.supportsRequestTimeout !== true) {
+      throw new Error("DBProxy transport has not verified request timeout support");
+    }
+    const client = new DbProxyClient(this.transport);
+    client.budget = new RequestBudget(timeoutMs, this.transport.monotonicNowMs?.bind(this.transport), this.budget);
+    client.GetRemainingRequestBudgetMs();
+    return client;
+  }
+
+  /** 在退避和后续请求前读取剩余预算；耗尽不代表先前写入未提交。 / Reads time left before backoff or another call; exhaustion does not prove earlier writes uncommitted. */
+  GetRemainingRequestBudgetMs(): number {
+    if (!this.budget) throw new Error("DBProxy client has no request budget");
+    const remaining = this.budget.remainingMs();
+    if (remaining < 1) {
+      throw new DbProxyRemoteError(DbProxyErrorCode.StorageUnavailable,
+        "DBProxy request budget exhausted; an earlier write may have committed");
+    }
+    return remaining;
+  }
+
+  /** 在同步校验/复制之后取剩余时间，不给传输重置完整超时。 / Samples remaining time after validation/copying, without resetting the transport timeout. */
+  private requestOptions(): [] | [DbProxyRequestOptions] {
+    return this.budget ? [Object.freeze({ timeoutMs: this.GetRemainingRequestBudgetMs() })] : [];
+  }
 
   /** 原子提交快照、不可变事实与事件；旧宿主必须拒绝，不能丢弃效果降级。 / Atomically commits all effects; older hosts must fail closed. */
   CommitRecords(write: DbProxyRecordCommit): Promise<DbProxyMultiTransactionalWriteResult> {
@@ -344,7 +388,7 @@ export class DbProxyClient {
       throw new Error("DBProxy transport has not verified Outbox Relay support");
     }
     if (!this.transport.commitRecords) throw new Error("DBProxy transport does not support CommitRecords");
-    return this.transport.commitRecords(stable).then(result => {
+    return this.transport.commitRecords(stable, ...this.requestOptions()).then(result => {
       if (result.disposition !== "applied" && result.disposition !== "duplicate") throw new TypeError("invalid commit disposition");
       const records = result.records.map(cloneMultiTransactionRecordReceipt);
       if (records.length !== stable.writes.length || new Set(records.map(r => JSON.stringify(r.record))).size !== records.length
@@ -356,7 +400,7 @@ export class DbProxyClient {
   }
 
   Load(record: DbProxyRecordKey): Promise<DbProxySnapshotEnvelope | undefined> {
-    return this.transport.load(cloneRecordKey(record)).then((snapshot) =>
+    return this.transport.load(cloneRecordKey(record), ...this.requestOptions()).then((snapshot) =>
       snapshot ? cloneSnapshot(snapshot) : undefined
     );
   }
@@ -365,7 +409,7 @@ export class DbProxyClient {
     records: readonly DbProxyRecordKey[],
   ): Promise<readonly (DbProxySnapshotEnvelope | undefined)[]> {
     const stableRecords = cloneBatchLoadRecords(records);
-    return this.transport.loadMulti(stableRecords).then((snapshots) => {
+    return this.transport.loadMulti(stableRecords, ...this.requestOptions()).then((snapshots) => {
       if (!Array.isArray(snapshots) || snapshots.length !== stableRecords.length) {
         throw new TypeError("batch load result count does not match its request");
       }
@@ -386,7 +430,7 @@ export class DbProxyClient {
     const stable = cloneRecordKey(record);
     const minimum = minRevision === undefined ? undefined : requireUint64(minRevision, "minRevision");
     if (!this.transport.loadCached) throw new Error("DBProxy transport does not support cached reads");
-    return this.transport.loadCached(stable, minimum).then(snapshot => {
+    return this.transport.loadCached(stable, minimum, ...this.requestOptions()).then(snapshot => {
       const result = snapshot ? cloneSnapshot(snapshot) : undefined;
       if (result && (result.record.namespace !== stable.namespace || result.record.key !== stable.key)) {
         throw new TypeError("cached load snapshot identity does not match its request");
@@ -402,7 +446,7 @@ export class DbProxyClient {
     const minima = minRevisions.map(r => requireUint64(r, "minRevisions"));
     if (minima.length !== 0 && minima.length !== stable.length) throw new TypeError("revision fences must match records");
     if (!this.transport.loadCachedMulti) throw new Error("DBProxy transport does not support cached batch reads");
-    return this.transport.loadCachedMulti(stable, minima).then(snapshots => {
+    return this.transport.loadCachedMulti(stable, minima, ...this.requestOptions()).then(snapshots => {
       if (!Array.isArray(snapshots) || snapshots.length !== stable.length) throw new TypeError("batch load result count does not match its request");
       return snapshots.map((snapshot, i) => {
         const result = snapshot ? cloneSnapshot(snapshot) : undefined;
@@ -416,14 +460,14 @@ export class DbProxyClient {
   }
 
   Save(write: DbProxySnapshotWrite): Promise<DbProxySnapshotWriteResult> {
-    return this.transport.save(cloneSnapshotWrite(write));
+    return this.transport.save(cloneSnapshotWrite(write), ...this.requestOptions());
   }
 
   SaveMulti(
     writes: readonly DbProxySnapshotWrite[],
   ): Promise<readonly DbProxyBatchSnapshotWriteResult[]> {
     const stableWrites = cloneBatchSnapshotWrites(writes, false);
-    return this.transport.saveMulti(stableWrites).then((results) =>
+    return this.transport.saveMulti(stableWrites, ...this.requestOptions()).then((results) =>
       cloneBatchWriteResults(results, stableWrites.length)
     );
   }
@@ -432,14 +476,14 @@ export class DbProxyClient {
     if (write.expectedRevision !== undefined) {
       throw new TypeError("queued snapshots cannot carry expectedRevision");
     }
-    return this.transport.enqueueSnapshot(cloneSnapshotWrite(write));
+    return this.transport.enqueueSnapshot(cloneSnapshotWrite(write), ...this.requestOptions());
   }
 
   EnqueueMultiSnapshot(
     writes: readonly DbProxySnapshotWrite[],
   ): Promise<readonly DbProxyBatchSnapshotEnqueueResult[]> {
     const stableWrites = cloneBatchSnapshotWrites(writes, true);
-    return this.transport.enqueueMultiSnapshot(stableWrites).then((results) =>
+    return this.transport.enqueueMultiSnapshot(stableWrites, ...this.requestOptions()).then((results) =>
       cloneBatchEnqueueResults(results, stableWrites.length)
     );
   }
@@ -447,7 +491,7 @@ export class DbProxyClient {
   ApplyTransaction(
     write: DbProxyTransactionalWrite,
   ): Promise<DbProxyTransactionalWriteResult> {
-    return this.transport.applyTransaction(cloneTransactionalWrite(write)).then((result) => ({
+    return this.transport.applyTransaction(cloneTransactionalWrite(write), ...this.requestOptions()).then((result) => ({
       disposition: result.disposition,
       newRevision: requireUint64(result.newRevision, "transaction.newRevision"),
       result: copyBytes(result.result),
@@ -464,7 +508,7 @@ export class DbProxyClient {
       MAX_IDEMPOTENCY_KEY_BYTES,
     );
     const stableRecord = cloneRecordKey(record);
-    return this.transport.loadTransaction(stableOperationId, stableRecord).then((receipt) =>
+    return this.transport.loadTransaction(stableOperationId, stableRecord, ...this.requestOptions()).then((receipt) =>
       receipt ? cloneTransactionReceipt(receipt) : undefined
     );
   }
@@ -473,7 +517,7 @@ export class DbProxyClient {
     write: DbProxyMultiTransactionalWrite,
   ): Promise<DbProxyMultiTransactionalWriteResult> {
     const stable = cloneMultiTransactionalWrite(write);
-    return this.transport.applyMultiTransaction(stable).then((result) => ({
+    return this.transport.applyMultiTransaction(stable, ...this.requestOptions()).then((result) => ({
       disposition: result.disposition,
       records: result.records.map(cloneMultiTransactionRecordReceipt),
       result: copyBytes(result.result),
@@ -491,14 +535,14 @@ export class DbProxyClient {
     );
     const stableRecords = cloneMultiTransactionRecords(records);
     return this.transport
-      .loadMultiTransaction(stableOperationId, stableRecords)
+      .loadMultiTransaction(stableOperationId, stableRecords, ...this.requestOptions())
       .then((receipt) => receipt ? cloneMultiTransactionReceipt(receipt) : undefined);
   }
 
   LoadTrade(tradeId: string): Promise<DbProxyTradeEnvelope | undefined> {
     if (!this.transport.loadTrade) throw new Error("DBProxy transport does not support legacy trades");
     const stableTradeId = requireText(tradeId, "trade.tradeId", MAX_TRADE_ID_BYTES);
-    return this.transport.loadTrade(stableTradeId).then((trade) =>
+    return this.transport.loadTrade(stableTradeId, ...this.requestOptions()).then((trade) =>
       trade ? cloneTradeEnvelope(trade) : undefined
     );
   }
@@ -508,7 +552,7 @@ export class DbProxyClient {
   ): Promise<DbProxyTradeTransactionResult> {
     if (!this.transport.applyTradeTransaction) throw new Error("DBProxy transport does not support legacy trades");
     const stable = cloneTradeTransaction(transaction);
-    return this.transport.applyTradeTransaction(stable).then((result) => {
+    return this.transport.applyTradeTransaction(stable, ...this.requestOptions()).then((result) => {
       if (result.disposition !== "applied" && result.disposition !== "duplicate") {
         throw new TypeError("trade transaction returned an invalid disposition");
       }
@@ -530,7 +574,7 @@ export class DbProxyClient {
     );
     const stableTradeId = requireText(tradeId, "trade.tradeId", MAX_TRADE_ID_BYTES);
     return this.transport
-      .loadTradeTransaction(stableOperationId, stableTradeId)
+      .loadTradeTransaction(stableOperationId, stableTradeId, ...this.requestOptions())
       .then((receipt) => receipt ? cloneTradeReceipt(receipt) : undefined);
   }
 }

@@ -39,6 +39,7 @@ impl OutboxRoute {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct PublishMessage<'a> {
     pub event: &'a OutboxEvent,
     pub destination: &'a str,
@@ -64,6 +65,20 @@ pub trait Publisher: Send + Sync {
     /// 仅在约定的 MQ 持久确认后成功；不能代表业务消费者已处理。
     /// Success means broker durability acknowledgement, not consumer completion.
     async fn publish(&self, message: PublishMessage<'_>) -> Result<PublishReceipt, PublishError>;
+
+    /// Receipts retain input order. Each success requires the same durability as `publish`.
+    /// A driver may share one broker confirmation across independent ordering groups.
+    /// The default keeps existing publishers source-compatible; the relay bounds the deadline.
+    async fn publish_batch(
+        &self,
+        messages: &[PublishMessage<'_>],
+    ) -> Vec<Result<PublishReceipt, PublishError>> {
+        let mut results = Vec::with_capacity(messages.len());
+        for message in messages {
+            results.push(self.publish(*message).await);
+        }
+        results
+    }
 }
 
 impl PostgresOutboxQueue {
@@ -73,7 +88,11 @@ impl PostgresOutboxQueue {
         if keys.is_empty() {
             return Ok(());
         }
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("relay_ensure_unregistered_routes", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         if client
             .query_opt(
@@ -94,7 +113,11 @@ impl PostgresOutboxQueue {
         id: &str,
         fingerprint: &str,
     ) -> Result<(), StorageError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("relay_register_publisher", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let tx = client.transaction().await?;
         tx.execute("INSERT INTO dbproxy_outbox_publishers VALUES($1,'redisStream',$2) ON CONFLICT DO NOTHING", &[&id,&fingerprint]).await?;
@@ -131,7 +154,11 @@ impl PostgresOutboxQueue {
                 "invalid or reserved outbox route".into(),
             ));
         }
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("relay_register_route", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let tx = client.transaction().await?;
         let key = route.key();
@@ -157,7 +184,11 @@ impl PostgresOutboxQueue {
     /// 启动前检查所有未发布事件的 Publisher，不能丢弃缺失配置的旧积压。
     /// Refuses startup when pending events require an unavailable publisher.
     pub async fn required_publishers(&self) -> Result<Vec<String>, StorageError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .lock_for("relay_required_publishers", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         Ok(client.query("SELECT publisher_id FROM dbproxy_outbox_routes UNION SELECT publisher_id FROM dbproxy_outbox WHERE published_at IS NULL", &[]).await?
             .into_iter().map(|r|r.get(0)).collect())
