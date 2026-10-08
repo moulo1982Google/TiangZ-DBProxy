@@ -1,4 +1,4 @@
-> 本轮发布：`v0.7.0-rc2`，六仓库统一套件标签的预发行版本；本仓库相对 rc1 无代码改动，只更新版本号。rc1 标签与制品保持原身份，说明见 [RELEASE-v0.7.0-rc2.md](RELEASE-v0.7.0-rc2.md)。
+> 本轮发布：`v0.7.0` 正式版（六仓库套件 TiangZ 0.7.0）。本仓库相对 v0.7.0-rc2 无代码或协议改动，只把版本号定为 0.7.0；说明见 [RELEASE-v0.7.0.md](RELEASE-v0.7.0.md)。
 
 # TiangZ DBProxy
 
@@ -26,7 +26,7 @@
 
 0.7 PostgreSQL 排队与长稳错误观测见 [连接诊断](docs/postgres-queue-diagnostics.md)：分片/持有者/实际 backend PID、完整持有时长、修正排队超时计数及固定容量的晚期错误记录。
 
-当前开发候选为 `0.7.0-rc.2`，服务与 Rust/TypeScript SDK 使用相同版本。本地候选尚未 push 或发布；此前正式版本与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题，协议和数据库迁移不因候选编号额外改变。
+当前版本为 `0.7.0`（正式版），服务与 Rust/TypeScript SDK 使用相同版本。此前候选（0.7.0-rc.2、v0.7.0-rc1、v0.7.0-rc2）的标签与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题，协议和数据库迁移不因版本编号额外改变。
 
 0.7 开发中的 Rust SDK 已补齐排队、重连和重试共享的[请求总预算](docs/client-request-budget.md)；新增“确定未发送”超时分类，默认值仍为 5 秒。TS SDK 的 [WithRequestBudget 作用域](docs/typescript-sdk.md)让 Repository 读取/重试共用期限，旧 Transport 不会被默默当作支持超时。宿主候选与发布验证状态见上述记录。
 
