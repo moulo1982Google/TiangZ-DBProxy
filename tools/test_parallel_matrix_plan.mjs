@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import {plan,minimumRows,modes} from './plan_parallel_matrix.mjs';
+const p=plan(minimumRows);
+assert.equal(p.totals.retained_rows,2177280);assert.equal(p.totals.databases,108);
+const mixed=p.distributions.find(d=>d.mode==='leased');
+assert.deepEqual(mixed.per_publisher.fifo_rows_per_ready_partition,{initial:840,after_warmup:720,final:420});
+assert.equal(mixed.per_publisher.consumed_fraction,0.5);
+assert.equal(p.distributions.find(d=>d.mode==='none').expected_nonempty_per_run,0);
+assert.equal(p.distributions.find(d=>d.mode==='spread-ready').per_publisher.final_ready_reserve,840);
+const capped=plan(Object.fromEntries(modes.map(m=>[m,40000])));
+assert.equal(capped.distributions.find(d=>d.mode==='leased').per_publisher.consumed_fraction,0.42);
+assert.equal(capped.execution_allowed,false);
+for(const bad of [1000,33560,40040,33601,NaN,Infinity,'33600',-1])assert.throws(()=>plan({...minimumRows,leased:bad}));
+assert.throws(()=>plan({...minimumRows,extra:33600}));
+const missing={...minimumRows};delete missing.none;assert.throws(()=>plan(missing));
+console.log('offline matrix: minimum/cap/blocked/spread/FIFO checks + 10 rejected inputs; execution disabled');
