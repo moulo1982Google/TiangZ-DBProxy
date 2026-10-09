@@ -22,7 +22,7 @@ try {
   const artifact=build.split('\n').filter(l=>l.startsWith('{')).map(JSON.parse).find(x=>x.reason==='compiler-artifact'&&x.target.name==='authoritative_reads'&&x.executable);
   if(!artifact)throw Error('test binary missing');
   report.binarySha256=createHash('sha256').update(fs.readFileSync(artifact.executable)).digest('hex');
-  run('docker',['run','-d','--name',names[0],'--cpus','2','--memory','1g','--tmpfs','/var/lib/postgresql:rw,size=512m','-e','POSTGRES_PASSWORD=authority_test_only','-p','127.0.0.1::5432','postgres:18.4-bookworm']);
+  run('docker',['run','-d','--name',names[0],'--cpus','2','--memory','1g','--tmpfs','/var/lib/postgresql:rw,size=512m','-e','POSTGRES_PASSWORD=authority_test_only','-p','127.0.0.1::5432','postgres:18.6-bookworm']);
   run('docker',['run','-d','--name',names[1],'-p','127.0.0.1::6379','redis:8.8.1-trixie','redis-server','--save','','--appendonly','no']);
   const pgPort=run('docker',['port',names[0],'5432/tcp']).split(':').at(-1);
   const redisPort=run('docker',['port',names[1],'6379/tcp']).split(':').at(-1);

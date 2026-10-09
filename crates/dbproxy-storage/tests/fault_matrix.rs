@@ -9,9 +9,27 @@ use tiangz_dbproxy_storage::{
     RedisSnapshotBacklog, SnapshotBacklogAck, StorageError, TieredSnapshotStore,
 };
 
-const POSTGRES_CONTAINER: &str = "tiangz-dbproxy-postgres";
-const REDIS_CONTAINER: &str = "tiangz-dbproxy-redis";
-const CACHE_CONTAINER: &str = "tiangz-dbproxy-cache";
+fn postgres_container() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::var("DBPROXY_TEST_POSTGRES_CONTAINER")
+            .expect("explicit PG test container required")
+    })
+}
+fn redis_container() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::var("DBPROXY_TEST_REDIS_CONTAINER")
+            .expect("explicit Redis test container required")
+    })
+}
+fn cache_container() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::var("DBPROXY_TEST_CACHE_CONTAINER")
+            .expect("explicit cache test container required")
+    })
+}
 
 #[tokio::test]
 #[ignore = "会强杀本机缓存 Redis；设置 DBPROXY_RUN_DOCKER_FAULTS=1 后显式运行"]
@@ -47,10 +65,10 @@ async fn ephemeral_cache_restart_cannot_restore_an_acknowledged_old_revision() {
         .await
         .unwrap();
     let mut guard = RestartGuard {
-        container: CACHE_CONTAINER,
+        container: cache_container(),
         active: true,
     };
-    docker(&["kill", CACHE_CONTAINER]);
+    docker(&["kill", cache_container()]);
     let outcome = store
         .apply(transaction(
             &test_suffix(),
@@ -104,11 +122,13 @@ fn env_urls() -> (String, String) {
 }
 
 fn docker(args: &[&str]) {
+    println!("FAULT_EVENT start {:?} at {:?}", args, SystemTime::now());
     let status = Command::new("docker")
         .args(args)
         .status()
         .expect("docker must be available for the fault matrix");
     assert!(status.success(), "docker {:?} failed with {status}", args);
+    println!("FAULT_EVENT complete {:?} at {:?}", args, SystemTime::now());
 }
 
 fn wait_healthy(container: &str) {
@@ -172,9 +192,30 @@ impl Drop for RestartGuard {
 }
 
 fn require_opt_in() -> bool {
-    if std::env::var("DBPROXY_RUN_DOCKER_FAULTS").as_deref() != Ok("1") {
-        eprintln!("fault matrix skipped: set DBPROXY_RUN_DOCKER_FAULTS=1 explicitly");
-        return false;
+    assert_eq!(
+        std::env::var("DBPROXY_RUN_DOCKER_FAULTS").as_deref(),
+        Ok("1"),
+        "fault injection must be explicitly enabled; a missing flag is not a passed test"
+    );
+    let project =
+        std::env::var("DBPROXY_TEST_COMPOSE_PROJECT").expect("explicit test project required");
+    assert!(!project.is_empty());
+    for container in [postgres_container(), redis_container(), cache_container()] {
+        let output = Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{index .Config.Labels \"com.docker.compose.project\"}}",
+                container,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            project,
+            "container ownership mismatch: {container}"
+        );
     }
     true
 }
@@ -258,7 +299,7 @@ async fn redis_outage_falls_back_and_retry_repairs_cache() {
         }
     ));
 
-    let mut redis = RestartGuard::stop(REDIS_CONTAINER);
+    let mut redis = RestartGuard::stop(redis_container());
     let fallback = tokio::time::timeout(Duration::from_secs(5), store.load_cached(&key))
         .await
         .expect("PostgreSQL fallback must not hang when Redis is down")
@@ -349,7 +390,7 @@ async fn postgres_outage_never_reports_a_successful_write() {
     );
     store.apply(first).await.unwrap();
 
-    let mut postgres = RestartGuard::stop(POSTGRES_CONTAINER);
+    let mut postgres = RestartGuard::stop(postgres_container());
     // 默认读取不能在主库故障时返回缓存成功。
     // Default reads must fail when the primary is unavailable.
     assert!(
@@ -435,7 +476,7 @@ async fn snapshot_queue_retries_after_postgres_recovers() {
         ))
         .unwrap();
 
-    let mut postgres = RestartGuard::stop(POSTGRES_CONTAINER);
+    let mut postgres = RestartGuard::stop(postgres_container());
     let error = tokio::time::timeout(Duration::from_secs(5), queue.flush(&mut store, 1))
         .await
         .expect("snapshot flush must not hang while PostgreSQL is down")
@@ -478,7 +519,7 @@ async fn redis_aof_backlog_accumulates_while_postgres_is_down_and_drains_after_r
         .await
         .unwrap();
 
-    let mut postgres = RestartGuard::stop(POSTGRES_CONTAINER);
+    let mut postgres = RestartGuard::stop(postgres_container());
     let lease = backlog.claim(5_000).await.unwrap().unwrap();
     let error = tokio::time::timeout(Duration::from_secs(5), store.save(lease.request.clone()))
         .await
@@ -529,7 +570,7 @@ async fn durable_snapshot_backlog_survives_redis_restart() {
         .await
         .unwrap();
 
-    let mut redis = RestartGuard::stop(REDIS_CONTAINER);
+    let mut redis = RestartGuard::stop(redis_container());
     redis.restart();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

@@ -20,7 +20,10 @@ pub(crate) enum Stage {
     FallbackKey,
     FallbackLease,
     PostgresQueue,
+    PostgresReadQueue,
     PostgresOperation,
+    PostgresReadOperation,
+    PostgresWriteOperation,
     CommittedCacheSync,
     RepairAck,
     FallbackRelease,
@@ -34,14 +37,17 @@ pub(crate) enum Stage {
 }
 
 impl Stage {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 20] = [
         Self::CacheLookup,
         Self::CacheWrite,
         Self::FallbackCapacity,
         Self::FallbackKey,
         Self::FallbackLease,
         Self::PostgresQueue,
+        Self::PostgresReadQueue,
         Self::PostgresOperation,
+        Self::PostgresReadOperation,
+        Self::PostgresWriteOperation,
         Self::CommittedCacheSync,
         Self::RepairAck,
         Self::FallbackRelease,
@@ -61,7 +67,10 @@ impl Stage {
             Self::FallbackCapacity => "fallback_capacity_wait",
             Self::FallbackKey => "fallback_key_wait",
             Self::FallbackLease => "fallback_distributed_lease",
+            Self::PostgresReadQueue => "postgres_read_pool_wait",
             Self::PostgresQueue => "postgres_connection_wait",
+            Self::PostgresReadOperation => "postgres_read_operation",
+            Self::PostgresWriteOperation => "postgres_write_operation",
             Self::PostgresOperation => "postgres_operation",
             Self::CommittedCacheSync => "committed_cache_sync",
             Self::RepairAck => "cache_repair_ack",
@@ -146,6 +155,8 @@ impl StorageLatency {
         histogram.in_flight.fetch_add(1, Ordering::Relaxed);
         Timer {
             histogram,
+            #[cfg(feature = "acceptance-trace")]
+            stage,
             started: Instant::now(),
         }
     }
@@ -174,11 +185,15 @@ impl StorageLatency {
 // measure only time until cancellation, never the eventual duration of work still running in PG.
 pub(crate) struct Timer<'a> {
     histogram: &'a Histogram,
+    #[cfg(feature = "acceptance-trace")]
+    stage: Stage,
     started: Instant,
 }
 
 impl Drop for Timer<'_> {
     fn drop(&mut self) {
+        #[cfg(feature = "acceptance-trace")]
+        crate::acceptance_trace::record(self.stage.name(), self.started, Instant::now());
         self.histogram.record(self.started.elapsed());
         self.histogram.in_flight.fetch_sub(1, Ordering::Relaxed);
     }

@@ -1,0 +1,6 @@
+export function environmentFixture(begin,end) {
+  const mounts=pairs=>pairs.map(([Source,Destination,RW=true])=>({Type:'bind',Source,Destination,RW}));
+  const services=['postgres','redis','cache'].map((name,i)=>({kind:'service',name:`/dbproxy-test-${name}`,id:String(i+1).repeat(64),image:'sha256:'+'a'.repeat(64),started_at:'1969-01-01T00:00:00Z',running:true,oom:false,memory:i?2147483648:8589934592,swap:i?4294967296:8589934592,nano_cpus:i?0:4000000000,cpuset:['14-17,42-45','18,46','19,47'][i],network:'dbproxy-test',mounts:mounts(i?[[`/data/dbproxy-test/${name}`,'/data']]:[['/data/dbproxy-test/pgdata','/var/lib/postgresql'],['/data/dbproxy-test/pglog','/pglog']])}));
+  const capture=t=>[{schema:1,kind:'boundary',at:new Date(t).toISOString(),docker_root:'/sas/docker'},...services,{kind:'boundary_end',at:new Date(t+1).toISOString()}].map(v=>JSON.stringify(v)).join('\n')+'\n';
+  return {before:capture(begin-10),after:capture(end+10),Mounts:mounts([['/data/dbproxy-test/evidence','/evidence',true],['/data/dbproxy-test/pglog','/pglog',false],['/data/dbproxy-test/src/crates/dbproxy-storage/tests','/src/crates/dbproxy-storage/tests',false],['/data/dbproxy-test/src/deploy/remote-test','/src/deploy/remote-test',false]])};
+}

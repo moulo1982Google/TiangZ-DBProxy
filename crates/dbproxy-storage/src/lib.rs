@@ -3,6 +3,9 @@
 //! PostgreSQL 是唯一权威写入端；Redis 只保存已经提交的快照缓存。
 //! PostgreSQL is the only authoritative write target; Redis caches committed snapshots only.
 
+#[cfg(feature = "acceptance-trace")]
+pub mod acceptance_trace;
+
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
@@ -30,6 +33,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_postgres::{Client, NoTls, Row, Transaction};
+use tracing::Instrument;
 
 mod backlog;
 mod cache_ack;
@@ -38,14 +42,22 @@ mod cache_repair;
 pub mod capacity;
 mod latency;
 mod postgres_diagnostics;
+mod postgres_read_pool;
 mod postgres_request;
 pub use postgres_diagnostics::fingerprint as postgres_operation_fingerprint;
+pub use postgres_read_pool::{PostgresReadPool, ReadPoolUsage};
+mod receipt_retention;
 mod redis_durability;
 #[cfg(test)]
 mod redis_durability_fixture;
+mod schema_indexes;
 pub use postgres_request::{
     DEFAULT_POSTGRES_CONNECTION_WAIT_TIMEOUT_MS, DEFAULT_POSTGRES_RECONNECT_COOLDOWN_MS,
     PostgresRequestConfig,
+};
+pub use receipt_retention::{
+    DEFAULT_RECEIPT_RETENTION, MAX_RECEIPT_RETENTION, MIN_RECEIPT_RETENTION,
+    RECEIPT_CLEANUP_BATCH_SIZE, validate_receipt_retention,
 };
 pub use redis_durability::{
     DEFAULT_REDIS_AOF_ACK_TIMEOUT_MS, DEFAULT_REDIS_RESPONSE_TIMEOUT_MS, RedisDurabilityConfig,
@@ -384,7 +396,7 @@ return 0
 pub enum StorageError {
     #[error(transparent)]
     Core(#[from] StoreError),
-    #[error("postgres error: {0}")]
+    #[error("postgres error: {}", postgres_error_text(.0))]
     Postgres(#[from] tokio_postgres::Error),
     #[error("PostgreSQL connection attempt timed out after {timeout_ms}ms")]
     PostgresConnectTimeout { timeout_ms: u64 },
@@ -433,6 +445,12 @@ pub enum StorageError {
         "PostgreSQL connection wait timeout must be representable and at least one millisecond"
     )]
     InvalidPostgresConnectionWaitTimeout,
+    #[error(
+        "PostgreSQL read pool size must be between 1 and 64; configure 0 read connections to share write connections instead of creating a pool"
+    )]
+    InvalidPostgresReadConnections,
+    #[error("ordinary receipt retention must be between 1 and 8760 hours; got {seconds} seconds")]
+    InvalidReceiptRetention { seconds: u64 },
     #[error("PostgreSQL reconnect cooldown must be representable and at least one millisecond")]
     InvalidPostgresReconnectCooldown,
     #[error(
@@ -488,6 +506,8 @@ pub enum StorageError {
     TradeVersionTooLarge { trade_id: String },
     #[error("snapshot partition layout is invalid: {0}")]
     InvalidSnapshotPartitionLayout(String),
+    #[error("required database index is invalid: {0}")]
+    InvalidSchemaIndex(String),
     #[error("schema migration {version} is registered as {actual:?}, expected {expected:?}")]
     SchemaMigrationConflict {
         version: i32,
@@ -1122,19 +1142,201 @@ impl DerefMut for ReconnectingPostgresClient {
     }
 }
 
+/// 连接串未指定时的网络保护。发送超时限制未获 TCP 确认的数据，不是 SQL 执行时限；
+/// 保活探测空闲连接，实际断开时间取决于系统支持和这些选项的共同作用。
+/// Network guards for unacknowledged TCP data and dead idle connections, not SQL deadlines.
+/// Explicit connection parameters retain tokio-postgres semantics, including zero/default values.
+/// This driver's timeout/interval parameters use seconds; retries is a count. OS support varies.
+pub const DEFAULT_POSTGRES_TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_POSTGRES_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+pub const DEFAULT_POSTGRES_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+pub const DEFAULT_POSTGRES_KEEPALIVE_RETRIES: u32 = 3;
+/// 只补连接串未指定的选项；保留显式关闭及库默认值。
+/// Fill absent parameters only, preserving explicitly requested library defaults or disabling.
+pub fn postgres_config(url: &str) -> Result<tokio_postgres::Config, StorageError> {
+    let mut config: tokio_postgres::Config = url.parse()?;
+    let keys = postgres_parameter_names(url);
+    let absent = |name: &str| !keys.iter().any(|key| key == name);
+    if absent("tcp_user_timeout") {
+        config.tcp_user_timeout(DEFAULT_POSTGRES_TCP_USER_TIMEOUT);
+    }
+    if config.get_keepalives() {
+        if absent("keepalives_idle") {
+            config.keepalives_idle(DEFAULT_POSTGRES_KEEPALIVE_IDLE);
+        }
+        if absent("keepalives_interval") {
+            config.keepalives_interval(DEFAULT_POSTGRES_KEEPALIVE_INTERVAL);
+        }
+        if absent("keepalives_retries") {
+            config.keepalives_retries(DEFAULT_POSTGRES_KEEPALIVE_RETRIES);
+        }
+    }
+    Ok(config)
+}
+
+// 先由驱动验证完整语法，再只提取参数名。不能在密码或引号内容里搜索关键字。
+// Called after driver validation; extract names without mistaking quoted/escaped values for keys.
+fn postgres_parameter_names(connection: &str) -> Vec<String> {
+    if connection.starts_with("postgres://") || connection.starts_with("postgresql://") {
+        // Match the driver's credential split before looking for the query delimiter.
+        let location = connection
+            .split_once('@')
+            .map_or(connection, |(_, rest)| rest);
+        return location
+            .split_once('?')
+            .map_or_else(Vec::new, |(_, query)| {
+                form_urlencoded::parse(query.as_bytes())
+                    .map(|(key, _)| key.into_owned())
+                    .collect()
+            });
+    }
+    let mut names = Vec::new();
+    let mut chars = connection.chars().peekable();
+    while chars.peek().is_some() {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let key: String = chars.by_ref().take_while(|c| *c != '=').collect();
+        if key.trim().is_empty() {
+            break;
+        }
+        names.push(key.trim().to_owned());
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let quoted = chars.peek() == Some(&'\'');
+        if quoted {
+            chars.next();
+        }
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                chars.next();
+            } else if (quoted && c == '\'') || (!quoted && c.is_whitespace()) {
+                break;
+            }
+        }
+    }
+    names
+}
+
+#[cfg(test)]
+mod postgres_config_tests {
+    use super::*;
+
+    #[test]
+    fn network_guards_fill_unset_values() {
+        let config = postgres_config("postgres://u:p@db:5432/x").unwrap();
+        assert_eq!(
+            config.get_tcp_user_timeout(),
+            Some(&DEFAULT_POSTGRES_TCP_USER_TIMEOUT)
+        );
+        assert!(config.get_keepalives());
+        assert_eq!(
+            config.get_keepalives_idle(),
+            DEFAULT_POSTGRES_KEEPALIVE_IDLE
+        );
+        assert_eq!(
+            config.get_keepalives_interval(),
+            Some(DEFAULT_POSTGRES_KEEPALIVE_INTERVAL)
+        );
+        assert_eq!(
+            config.get_keepalives_retries(),
+            Some(DEFAULT_POSTGRES_KEEPALIVE_RETRIES)
+        );
+    }
+
+    #[test]
+    fn url_parameters_override_the_guards() {
+        let config = postgres_config(
+            "postgres://u:p@db:5432/x?tcp_user_timeout=5&keepalives_idle=60&keepalives_interval=7&keepalives_retries=9",
+        )
+        .unwrap();
+        assert_eq!(config.get_tcp_user_timeout(), Some(&Duration::from_secs(5)));
+        assert_eq!(config.get_keepalives_idle(), Duration::from_secs(60));
+        assert_eq!(
+            config.get_keepalives_interval(),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(config.get_keepalives_retries(), Some(9));
+        let off = postgres_config("postgres://u:p@db:5432/x?keepalives=0").unwrap();
+        assert!(!off.get_keepalives());
+        assert_eq!(off.get_keepalives_interval(), None);
+        assert_eq!(
+            off.get_tcp_user_timeout(),
+            Some(&DEFAULT_POSTGRES_TCP_USER_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn explicit_zero_and_library_defaults_are_preserved() {
+        for connection in [
+            "postgres://u:p@db/x?tcp_user_timeout=0&keepalives_idle=7200&keepalives_interval=0&keepalives_retries=0",
+            "host=db tcp_user_timeout = 0 keepalives_idle='7200' keepalives_interval=0 keepalives_retries=0",
+            "postgresql://u:p@db/x?%74cp_user_timeout=0&keepalives_idle=7200&keepalives_interval=0&keepalives_retries=0",
+            "postgres://u:p?literal@db/x?tcp_user_timeout=0&keepalives_idle=7200&keepalives_interval=0&keepalives_retries=0",
+        ] {
+            let config = postgres_config(connection).unwrap();
+            assert_eq!(config.get_tcp_user_timeout(), None);
+            assert_eq!(config.get_keepalives_idle(), Duration::from_secs(7200));
+            assert_eq!(config.get_keepalives_interval(), None);
+            assert_eq!(config.get_keepalives_retries(), Some(0));
+        }
+        for connection in [
+            "host=db password='tcp_user_timeout=0 keepalives_idle=7200'",
+            r"host=db password=tcp_user_timeout=0\ keepalives_idle=7200",
+            "postgres://u:tcp_user_timeout=0@db/x",
+        ] {
+            let config = postgres_config(connection).unwrap();
+            assert_eq!(
+                config.get_tcp_user_timeout(),
+                Some(&DEFAULT_POSTGRES_TCP_USER_TIMEOUT)
+            );
+            assert_eq!(
+                config.get_keepalives_idle(),
+                DEFAULT_POSTGRES_KEEPALIVE_IDLE
+            );
+        }
+    }
+}
+
 async fn open_postgres(url: &str) -> Result<Client, StorageError> {
     let timeout_duration = Duration::from_millis(DEFAULT_POSTGRES_RECONNECT_TIMEOUT_MS);
-    let (client, connection) = timeout(timeout_duration, tokio_postgres::connect(url, NoTls))
+    let config = postgres_config(url)?;
+    let (client, connection) = timeout(timeout_duration, config.connect(NoTls))
         .await
         .map_err(|_| StorageError::PostgresConnectTimeout {
             timeout_ms: DEFAULT_POSTGRES_RECONNECT_TIMEOUT_MS,
         })??;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::warn!(%error, "postgres connection stopped; the next operation will reconnect");
+    // The driver task inherits the caller's span, so its log line names the tenant.
+    tokio::spawn(
+        async move {
+            if let Err(error) = connection.await {
+                let error = postgres_error_text(&error);
+                tracing::warn!(%error, "postgres connection stopped; the next operation will reconnect");
+            }
         }
-    });
+        .in_current_span(),
+    );
     Ok(client)
+}
+
+/// 错误原因写入日志：数据库错误取级别、SQLSTATE 与消息，不含可能带键值的 detail；
+/// 其他错误逐层展开来源。`tokio_postgres::Error` 自身只显示 "db error"。
+/// Log text for a PostgreSQL error: severity, SQLSTATE and message for server errors (never the
+/// `detail`, which can carry key values); otherwise the source chain. The error's own Display is
+/// only "db error", which hid every cause in the 2026-09-24 fault runs.
+pub fn postgres_error_text(error: &tokio_postgres::Error) -> String {
+    if let Some(db) = error.as_db_error() {
+        return format!("{} {}: {}", db.severity(), db.code().code(), db.message());
+    }
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 async fn apply_schema_migration(
@@ -1241,6 +1443,7 @@ pub(crate) type SharedPostgresClient = Arc<postgres_diagnostics::PostgresConnect
 #[derive(Clone)]
 pub struct PostgresSnapshotStore {
     client: SharedPostgresClient,
+    read_pool: Option<PostgresReadPool>,
     metrics: Arc<StorageMetrics>,
     connection_wait_timeout: Option<Duration>,
     read_operation: &'static str,
@@ -1262,6 +1465,7 @@ impl PostgresSnapshotStore {
             client: Arc::new(postgres_diagnostics::PostgresConnection::new(
                 ReconnectingPostgresClient::connect(url).await?,
             )),
+            read_pool: None,
             metrics: Arc::new(StorageMetrics::default()),
             connection_wait_timeout: None,
             read_operation: "load",
@@ -1339,6 +1543,41 @@ impl PostgresSnapshotStore {
             self.metrics.latency.timed_out(Stage::PostgresQueue);
         }
         result
+    }
+
+    /// Attach one shared primary read pool before publishing this store.
+    pub fn with_read_pool(mut self, pool: PostgresReadPool) -> Self {
+        self.read_pool = Some(pool);
+        self
+    }
+
+    /// 读请求优先使用租户读池；未配置读池时走写连接，保留操作诊断与连接等待期限。
+    /// Reads prefer the tenant read pool; without one they use the write connection with its
+    /// operation diagnostics and connection-wait deadline.
+    async fn read_client(
+        &self,
+        operation: &'static str,
+        correlation: Option<&str>,
+        batch_size: usize,
+    ) -> Result<postgres_read_pool::ReadClient<'_>, StorageError> {
+        match &self.read_pool {
+            Some(pool) => {
+                self.metrics
+                    .latency
+                    .measure(Stage::PostgresQueue, async {
+                        self.metrics
+                            .latency
+                            .measure(Stage::PostgresReadQueue, pool.acquire())
+                            .await
+                            .map(postgres_read_pool::ReadClient::Pooled)
+                    })
+                    .await
+            }
+            None => self
+                .request_client(operation, correlation, batch_size)
+                .await
+                .map(postgres_read_pool::ReadClient::Shared),
+        }
     }
 
     /// 在全局迁移锁下仅执行尚未登记的 schema migration。
@@ -1428,8 +1667,42 @@ impl PostgresSnapshotStore {
             include_str!("../migrations/012_queued_fence.sql"),
         )
         .await?;
+        apply_schema_migration(
+            &transaction,
+            13,
+            "query-indexes",
+            include_str!("../migrations/013_query_indexes.sql"),
+        )
+        .await?;
+        apply_schema_migration(
+            &transaction,
+            14,
+            "cache-repair-claim-indexes",
+            include_str!("../migrations/014_cache_repair_claim_indexes.sql"),
+        )
+        .await?;
+        apply_schema_migration(
+            &transaction,
+            15,
+            "receipt-retention",
+            include_str!("../migrations/015_receipt_retention.sql"),
+        )
+        .await?;
+        schema_indexes::validate(&transaction).await?;
         transaction.commit().await?;
         Ok(())
+    }
+
+    /// 只读核对全库关键索引，供巡检使用；不会执行迁移或重建索引。
+    /// Read-only verification for diagnostics; never migrates or rebuilds indexes.
+    pub async fn validate_schema_indexes(&self) -> Result<(), StorageError> {
+        let mut client = self
+            .client
+            .lock_for("validate_schema_indexes", None, 0, None)
+            .await
+            .expect("unbounded diagnostics lock");
+        client.ensure_connected().await?;
+        schema_indexes::validate(client.as_client()).await
     }
 
     pub fn cache_repair_queue(&self) -> PostgresCacheRepairQueue {
@@ -1461,14 +1734,13 @@ impl PostgresSnapshotStore {
             .iter()
             .map(|record| record.key.clone())
             .collect::<Vec<_>>();
-        let mut client = self
-            .request_client("load_multi", None, records.len())
-            .await?;
+        let mut client = self.read_client("load_multi", None, records.len()).await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresReadOperation);
         client.ensure_connected().await?;
         let rows = client
             .query(
-                "SELECT namespace, record_key, schema_name, schema_version, revision, payload, updated_at_unix_ms FROM dbproxy_snapshots WHERE (namespace, record_key) IN (SELECT * FROM unnest($1::TEXT[], $2::TEXT[]))",
+                include_str!("snapshot_load_multi.sql"),
                 &[&namespaces, &keys],
             )
             .await?;
@@ -1579,6 +1851,7 @@ impl PostgresSnapshotStore {
             )
             .await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresWriteOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         if fence_sequences.is_some() {
@@ -1632,8 +1905,10 @@ async fn save_snapshot_in_transaction(
     updated_at: i64,
     fence: Option<i64>,
 ) -> Result<SnapshotWriteOutcome, StorageError> {
-    // Claim first so concurrent retries wait on the unique key and observe the first result.
-    let claimed = transaction
+    // Cleanup can win between ON CONFLICT DO NOTHING and the receipt read.
+    // Lock a visible receipt until commit, or reclaim the now absent key and retry.
+    let receipt = loop {
+        let claimed = transaction
         .query_opt(
             "INSERT INTO dbproxy_idempotency (request_id, namespace, record_key, schema_name, schema_version, payload, expected_revision, revision, updated_at_unix_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8) ON CONFLICT (request_id) DO NOTHING RETURNING request_id",
             &[
@@ -1649,13 +1924,20 @@ async fn save_snapshot_in_transaction(
         )
         .await?;
 
-    if claimed.is_none() {
+        if claimed.is_some() {
+            break None;
+        }
         let receipt = transaction
-            .query_one(
-                "SELECT namespace, record_key, schema_name, schema_version, payload, expected_revision, revision, updated_at_unix_ms FROM dbproxy_idempotency WHERE request_id = $1",
+            .query_opt(
+                "SELECT namespace, record_key, schema_name, schema_version, payload, expected_revision, revision, updated_at_unix_ms FROM dbproxy_idempotency WHERE request_id = $1 FOR KEY SHARE",
                 &[&request.request_id],
             )
             .await?;
+        if receipt.is_some() {
+            break receipt;
+        }
+    };
+    if let Some(receipt) = receipt {
         if !idempotency_matches(&receipt, request, schema_version, expected, updated_at) {
             return Err(StoreError::IdempotencyConflict {
                 request_id: request.request_id.clone(),
@@ -1857,8 +2139,9 @@ impl AsyncSnapshotStore for PostgresSnapshotStore {
     type Error = StorageError;
 
     async fn load(&self, record: &RecordKey) -> Result<Option<SnapshotEnvelope>, Self::Error> {
-        let mut client = self.request_client(self.read_operation, None, 1).await?;
+        let mut client = self.read_client(self.read_operation, None, 1).await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresReadOperation);
         client.ensure_connected().await?;
         let row = client
             .query_opt(
@@ -1890,9 +2173,10 @@ impl AsyncTransactionalStore for PostgresSnapshotStore {
     ) -> Result<Option<TransactionReceipt>, Self::Error> {
         validate_receipt_lookup(operation_id, record)?;
         let mut client = self
-            .request_client("load_receipt", Some(operation_id), 1)
+            .read_client("load_receipt", Some(operation_id), 1)
             .await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresReadOperation);
         client.ensure_connected().await?;
         let receipt = client
             .query_opt(
@@ -1933,6 +2217,7 @@ impl AsyncTransactionalStore for PostgresSnapshotStore {
             .request_client("apply_transaction", Some(&request.operation_id), 1)
             .await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresWriteOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         claim_operation(&transaction, &request.operation_id, "single").await?;
@@ -1979,7 +2264,11 @@ impl AsyncTransactionalStore for PostgresSnapshotStore {
             let result: Vec<u8> = receipt.get(6);
             cache_repair::enqueue_in_transaction(&transaction, &request.record, new_revision)
                 .await?;
-            transaction.commit().await?;
+            {
+                #[cfg(feature = "acceptance-trace")]
+                let _commit = acceptance_trace::CommitTimer::start();
+                transaction.commit().await?;
+            }
             return Ok(TransactionalWriteOutcome::Duplicate {
                 new_revision,
                 result,
@@ -2073,7 +2362,11 @@ impl AsyncTransactionalStore for PostgresSnapshotStore {
             .await?;
         cache_repair::enqueue_in_transaction(&transaction, &request.record, committed_revision)
             .await?;
-        transaction.commit().await?;
+        {
+            #[cfg(feature = "acceptance-trace")]
+            let _commit = acceptance_trace::CommitTimer::start();
+            transaction.commit().await?;
+        }
         Ok(TransactionalWriteOutcome::Applied {
             new_revision: committed_revision,
             result: request.result,
@@ -2098,9 +2391,10 @@ impl AsyncMultiRecordTransactionStore for PostgresSnapshotStore {
         }
         let expected_records = sorted_unique_records(records)?;
         let mut client = self
-            .request_client("load_multi_receipt", Some(operation_id), records.len())
+            .read_client("load_multi_receipt", Some(operation_id), records.len())
             .await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresReadOperation);
         client.ensure_connected().await?;
         let header = client
             .query_opt(
@@ -2183,6 +2477,7 @@ impl PostgresSnapshotStore {
             )
             .await?;
         let _postgres_timer = self.metrics.latency.start(Stage::PostgresOperation);
+        let _kind_timer = self.metrics.latency.start(Stage::PostgresWriteOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         let operation_id = request.operation_id.clone();
@@ -3105,6 +3400,12 @@ impl TieredSnapshotStore {
         self.postgres.identify_connection(Some(shard)).await
     }
 
+    /// Share the tenant read pool across every write shard and cache fallback path.
+    pub fn with_read_pool(mut self, pool: PostgresReadPool) -> Self {
+        self.postgres = self.postgres.with_read_pool(pool);
+        self
+    }
+
     /// 把缓存成功后的清理交给共享维护 worker；调用方必须驱动 flush 或持久修复。
     /// Hand successful-cache cleanup to a shared maintenance worker. The owner must drive
     /// flush or durable repair; standalone stores retain synchronous cleanup by default.
@@ -3189,6 +3490,12 @@ impl TieredSnapshotStore {
         }
 
         if !duplicate_indexes.is_empty() {
+            // 重复写的事务已提交并释放写连接；这里的回读走读池（或无读池时的分片连接），
+            // 新连接必能看到已提交版本。读池满时该回读会返回连接等待错误，不影响已提交数据。
+            // The duplicate's transaction has committed and released the write connection; this
+            // re-read uses the read pool (or the shard connection without a pool), where the
+            // committed revision is always visible. A saturated pool surfaces a wait error here
+            // without affecting the committed data.
             let records = duplicate_indexes
                 .iter()
                 .map(|index| requests[*index].record.clone())
@@ -3552,21 +3859,24 @@ impl TieredSnapshotStore {
         self.metrics.cache_refresh_started();
         let store = self.clone();
         let record = record.clone();
-        tokio::spawn(async move {
-            let _refresh_slot = refresh_slot;
-            match store.refresh_cache(&record).await {
-                Ok(()) => store.metrics.cache_refresh_completed(),
-                Err(error) => {
-                    store.metrics.cache_refresh_error();
-                    tracing::debug!(%error, namespace = %record.namespace, key = %record.key, "stale snapshot refresh failed")
+        tokio::spawn(
+            async move {
+                let _refresh_slot = refresh_slot;
+                match store.refresh_cache(&record).await {
+                    Ok(()) => store.metrics.cache_refresh_completed(),
+                    Err(error) => {
+                        store.metrics.cache_refresh_error();
+                        tracing::debug!(%error, namespace = %record.namespace, key = %record.key, "stale snapshot refresh failed")
+                    }
                 }
+                let mut refreshing = store
+                    .refreshing
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                refreshing.remove(&record);
             }
-            let mut refreshing = store
-                .refreshing
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            refreshing.remove(&record);
-        });
+            .in_current_span(),
+        );
     }
 
     async fn refresh_cache(&self, record: &RecordKey) -> Result<(), StorageError> {
@@ -3671,8 +3981,9 @@ impl TieredSnapshotStore {
         &self,
         records: &[RecordKey],
     ) -> Result<Vec<Option<SnapshotEnvelope>>, StorageError> {
-        // 复用请求分片的连接锁与排队预算；外层预算还覆盖重连和查询。
-        // Reuse the shard connection gate; the outer budget also covers reconnect/query.
+        // 读取连接来自租户读池（未配置读池时才退回请求分片连接锁）；外层预算还覆盖重连和查询。
+        // Reads use the tenant read pool (the shard connection gate only without a pool); the
+        // outer budget also covers reconnect/query.
         match timeout(
             self.read_coordinator.timeout(),
             self.postgres.load_multi(records),

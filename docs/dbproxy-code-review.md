@@ -1,5 +1,7 @@
 # DBProxy 代码审视记录
 
+2026-09-22 完成[全库索引与查询审查](database-index-audit-20260922.md)，覆盖 18 张逻辑表及快照分区；已补交易回执查询索引、改写 Outbox 历史统计扫描并增加全库启动校验。十万条历史数据与真实 PostgreSQL/Redis 回归结果见[验证记录](database-index-validation-20260922.md)。普通回执 7 天清理及其余查询的压力测试尚未实施。
+
 本轮审视范围包括 Core 契约、PostgreSQL/Redis 适配器、网络协议、服务端 worker、Rust 客户端、MemoryBackend、TypeScript SDK、配置、监控和本地故障工具。目标是查找不安全、重复、过度抽象或难以运维的实现。后续增加的快照 HASH 分区也沿用同一原则；历史归档、其他表分区和物理分库不在本轮扩张。
 
 ## 已修复的高风险问题

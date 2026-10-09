@@ -143,6 +143,35 @@ without duplicate PostgreSQL stage timing. Dedicated maintenance queue connectio
 existing policy. See [PostgreSQL request budgets](postgres-request-budget.md) for worker scope
 and the distinction between an unsent Store operation and an RPC with an unknown commit result.
 
+## PostgreSQL read pool occupancy
+
+- `dbproxy_postgres_read_pool_capacity` is the configured `storage.postgresReadConnections` for
+  this tenant; `0` means the pool is disabled and reads share the shard write connections.
+- `dbproxy_postgres_read_pool_in_use` is the number of leased pool connections at the last
+  storage poll, including holders that are still reconnecting. Waiters are not counted; their
+  wait time lands in `dbproxy_storage_stage_seconds{stage="postgres_read_pool_wait"}` and their
+  count in `dbproxy_storage_stage_in_flight{stage="postgres_read_pool_wait"}`.
+
+`in_use == capacity` together with growing `postgres_read_pool_wait` means the pool is the
+bottleneck; `in_use < capacity` with slow `postgres_read_operation` means PostgreSQL itself is
+slow. Both gauges are sampled, so short bursts between polls are invisible.
+
+## Request stage timings
+
+`dbproxy_request_stage_seconds{operation,stage}` is a cumulative histogram of completed request
+stages on the server, with the same fixed operation set as `dbproxy_rpc_duration_seconds` and
+three stages:
+
+- `task_schedule`: from parsing a request to its task starting on the runtime.
+- `record_order_wait`: waiting for earlier requests on the same connection that share a record,
+  operation or trade ID.
+- `handler`: the backend call itself, including storage stages.
+
+`dbproxy_request_stage_max_seconds{operation,stage}` is the slowest completed sample since
+process start and never resets. Socket receive and response send are outside every stage, so
+the three stages of one request do not add up to the client-observed round trip. Labels are
+fixed; no record keys or request IDs are exported.
+
 ## PostgreSQL outbox
 
 - `dbproxy_outbox_pending`, `dbproxy_outbox_processing`, and

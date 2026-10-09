@@ -2,6 +2,28 @@
 
 这套 Compose 启动本机开发使用的 PostgreSQL、Redis、Prometheus和Grafana，不包含线上部署配置。
 
+## 测试环境与授权约定
+
+本机真实数据库测试分两步推进，AI 助手必须遵守：
+
+1. **先准备代码和测试用例。** 完成不依赖外部服务的检查，明确哪些测试尚未执行。报告：“代码和测试用例已准备好，下一步准备用真实 PG、Redis 测试。”同时说明所需 Docker 环境、镜像版本、测试范围及会创建的测试库。
+2. **等用户确认环境和执行范围后再实测。** 例如用户回复：“我安装 Docker，你按 DP 手册的 PG 18.6 和 Redis 8.8.1 镜像测试。”随后才能在该范围内拉取镜像、启动测试容器、创建测试库并运行测试。已有明确授权的同一范围无需重复确认；需要更换环境、版本或扩大测试范围时，重新说明并确认。
+
+当前规定的镜像与 `docker-compose.yml` 一致：
+
+- PostgreSQL：`postgres:18.6-bookworm`
+- Redis：`redis:8.8.1-trixie`
+
+2026-09-22 已经用户授权从 PG 18.4 升至 18.6；原测试库数据核对、升级后读写和新库回归均通过，见[升级验证记录](../../docs/postgresql-18.6-upgrade-20260922.md)。历史报告保留当时使用的版本。
+
+缺少 Docker 或数据库时，应报告“代码和用例已就绪，真实环境测试待执行”，等待用户安排。不得把“继续”“推进开发”解释为环境准备授权；不得自行下载安装 Docker、数据库软件或便携包，也不得擅自改用其他数据库版本、Windows 移植版或远程服务来补齐环境。目录放在 `target/`、只监听本机、未安装系统服务或测试后关闭，都不能代替事先授权。
+
+测试结果必须区分代码检查、已授权环境中的实测和手册规定的正式验收。替代环境的测试结果不能冒充规定镜像的验收。本文中的启动、故障测试和清理命令是操作说明，不构成执行授权；删除数据卷或已有测试文件也不得作为“收尾”擅自进行。
+
+此约定来自 2026-09-22 的协作纠正：助手曾在缺少 Docker 时自行下载、启动 Windows PG/Redis 临时环境。问题是把开发推进授权扩大成环境变更授权；后续按上述两步流程执行，保留实际测试记录，但不将其算作规定镜像验收。
+
+## 本机依赖配置
+
 Redis 使用 AOF 和 Docker 命名卷保存普通快照 backlog。AOF 只保证本机部署下的恢复边界，不等于 Redis 集群或跨机高可用。
 
 用户名：`tiangz`
@@ -112,3 +134,20 @@ powershell -ExecutionPolicy Bypass -File tools/network_smoke.ps1
 仅在本机演练需要比较存储路径时，设置 `DBPROXY_VALIDATION_PG_DATA_DIR` 为已存在的独立空目录，再在主配置、laptop、validation 三份文件之后叠加 `docker-compose.validation-postgres-bind.yml`，仅对 `postgres` 执行 `up -d --no-deps --wait`。该文件保留原 named volume，使用新的 PG 数据目录，不复制原业务库。不得让两个 PG 实例同时打开该目录。
 
 回退时不叠加 bind 文件，使用原三份 Compose 配置对 `postgres` 执行 `up -d --no-deps --force-recreate`；原卷仍在。它不迁移 Docker Desktop 全局数据，不影响其他项目。路径对照必须保留镜像、持久化参数和验收负载，完整证据见[2026-09-07 存储路径验收](../../docs/storage-path-acceptance-2026-09-07.md)。
+
+## 已授权的 4 核 / 8 GiB PG 测试配置
+
+2026-09-22 用户确认本机资源足够并授权修改 Docker 测试配置。叠加顺序为基础配置、laptop、performance；最后一个文件覆盖 PG 的 CPU、内存和启动参数：
+
+```powershell
+$env:DBPROXY_REDIS_APPENDONLY = 'yes'
+docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.laptop.yml -f deploy/local/docker-compose.performance.yml up -d --wait postgres redis
+```
+
+使用自有测试项目时保留其 `-p` 项目名与原 env 文件，避免挂到另一组数据卷。本次实际项目为 `tiangz-dbproxy-index-validation`，env 文件为 `target/docker-index-validation/.env`。仍有固定容器名称，不能认为换项目名就能并行启动多个实例。
+
+PG 18.6，CPU 配额 4 核，内存上限 8 GiB，无额外 swap 配额，shared_buffers 2 GiB，共享内存挂载上限 1 GiB；共享内存占用仍计入容器内存。work_mem 2 MiB、maintenance_work_mem 64 MiB、autovacuum_work_mem 32 MiB、max_connections 30、wal_buffers 8 MiB、jit off 保持固定。Redis 继续使用 laptop 配置和 AOF，不启动 Prometheus/Grafana。fsync、synchronous_commit、full_page_writes 保持开启。
+
+容器 CPU 配额不代表独占物理核心。Docker 虚拟磁盘的容量也不等于宿主磁盘剩余空间；容量测试前另行核对实际存储。此前 1 GiB PG 的报告保留原配置，不改写为新规格结果。
+
+本次检查记录见 `target/pg-4c8g-validation/`。采用独立空库进行索引、回执、网络和后台清理检查，跳过旧库升级用例；完整性能、持续运行和故障验收仍按[测试计划](../../docs/acceptance-performance-fault-test-plan.md)执行，不能用环境检查代替。

@@ -221,8 +221,12 @@ impl AsyncTradeStore for PostgresSnapshotStore {
         if trade_id.trim().is_empty() {
             return Err(StoreError::EmptyTradeId.into());
         }
-        let mut client = self.request_client("load_trade", Some(trade_id), 1).await?;
+        let mut client = self.read_client("load_trade", Some(trade_id), 1).await?;
         let _postgres_timer = self.metrics.latency.start(super::Stage::PostgresOperation);
+        let _kind_timer = self
+            .metrics
+            .latency
+            .start(super::Stage::PostgresReadOperation);
         client.ensure_connected().await?;
         let row = client
             .query_opt(
@@ -257,9 +261,13 @@ impl AsyncTradeStore for PostgresSnapshotStore {
             return Err(StoreError::EmptyTradeId.into());
         }
         let mut client = self
-            .request_client("load_trade_receipt", Some(operation_id), 1)
+            .read_client("load_trade_receipt", Some(operation_id), 1)
             .await?;
         let _postgres_timer = self.metrics.latency.start(super::Stage::PostgresOperation);
+        let _kind_timer = self
+            .metrics
+            .latency
+            .start(super::Stage::PostgresReadOperation);
         client.ensure_connected().await?;
         let Some((header, records, ledger, outbox)) =
             load_receipt_parts(client.as_client(), operation_id).await?
@@ -314,6 +322,10 @@ impl AsyncTradeStore for PostgresSnapshotStore {
             )
             .await?;
         let _postgres_timer = self.metrics.latency.start(super::Stage::PostgresOperation);
+        let _kind_timer = self
+            .metrics
+            .latency
+            .start(super::Stage::PostgresWriteOperation);
         client.ensure_connected().await?;
         let transaction = client.transaction().await?;
         claim_operation(&transaction, &operation_id, "trade").await?;
