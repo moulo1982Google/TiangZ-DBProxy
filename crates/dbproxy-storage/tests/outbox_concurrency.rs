@@ -581,3 +581,177 @@ async fn simultaneous_admin_retry_has_one_winner_and_one_audit_record() {
         assert_eq!(state.destination, lease.destination);
     }).await;
 }
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL test URL and explicit migration opt-in"]
+async fn blocked_heads_never_allow_followers_to_overtake() {
+    bounded(async {
+        for mode in ["backoff", "leased", "locked", "dead"] {
+            let mut fixture = Fixture::new().await;
+            let mut messages = vec![("head".to_string(), "ordered")];
+            messages.extend((0..40).map(|n| (format!("follower-{n}"), "ordered")));
+            messages.push(("free".to_string(), "independent"));
+            for (name, partition) in messages {
+                let (request, effects) = fixture.request(&name, partition);
+                fixture.store.commit_records(request, effects).await.unwrap();
+            }
+            let head = format!("{}-head", fixture.id);
+            let queue = fixture.store.outbox_queue();
+            match mode {
+                "backoff" => {
+                    fixture.sql.execute("UPDATE dbproxy_outbox SET available_at=clock_timestamp()+interval '1 hour' WHERE event_id=$1", &[&head]).await.unwrap();
+                }
+                "leased" | "dead" => {
+                    let lease = queue.claim_for_publisher("head-worker", 300_000, Some(&fixture.id)).await.unwrap().unwrap();
+                    assert_eq!(lease.event.event_id, head);
+                    if mode == "dead" {
+                        assert!(queue.fail(&lease, "test dead head", 1, 1).await.unwrap());
+                    }
+                }
+                _ => {}
+            }
+            let lock = fixture.sql.transaction().await.unwrap();
+            if mode == "locked" {
+                lock.query_one("SELECT event_id FROM dbproxy_outbox WHERE event_id=$1 FOR UPDATE", &[&head]).await.unwrap();
+            }
+            let free = queue.claim_for_publisher("free-worker", 300_000, Some(&fixture.id)).await.unwrap().unwrap();
+            assert_eq!(free.event.partition_key, "independent", "{mode}");
+            assert!(queue.acknowledge(&free).await.unwrap());
+            assert!(queue.claim_for_publisher("follower-worker", 300_000, Some(&fixture.id)).await.unwrap().is_none(), "{mode}");
+            assert!(queue.claim_for_publisher("unknown-worker", 300_000, Some("missing-publisher")).await.unwrap().is_none());
+            lock.rollback().await.unwrap();
+        }
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL test URL and explicit migration opt-in"]
+async fn locked_prefix_falls_back_and_continuous_claims_preserve_order() {
+    bounded(async {
+        for prefix in [31_i64, 32, 33, 40] {
+        let mut fixture = Fixture::new().await;
+        for n in 1..=70 {
+            let (request, effects) = fixture.request(&format!("event-{n:03}"), &format!("partition-{n:03}"));
+            fixture.store.commit_records(request, effects).await.unwrap();
+        }
+        let queue = fixture.store.outbox_queue();
+        let lock = fixture.sql.transaction().await.unwrap();
+        let rows = lock.query("SELECT event_id FROM dbproxy_outbox WHERE publisher_id=$1 ORDER BY enqueue_order LIMIT $2 FOR UPDATE", &[&fixture.id, &prefix]).await.unwrap();
+        assert_eq!(rows.len(), prefix as usize);
+        let barrier = Arc::new(Barrier::new(8));
+        let mut tasks = JoinSet::new();
+        for n in 0..8 {
+            let store = PostgresSnapshotStore::connect_existing(&fixture.url).await.unwrap();
+            let barrier = barrier.clone();
+            let publisher = fixture.id.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                store.outbox_queue().claim_for_publisher(&format!("prefix-worker-{n}"), 300_000, Some(&publisher)).await.unwrap().unwrap()
+            });
+        }
+        let mut claimed = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            claimed.push(result.unwrap());
+        }
+        let mut ids: Vec<_> = claimed.iter().map(|lease| lease.event.event_id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, ((prefix+1)..=(prefix+8)).map(|n| format!("{}-event-{n:03}", fixture.id)).collect::<Vec<_>>());
+        for lease in claimed {
+            assert!(queue.acknowledge(&lease).await.unwrap());
+        }
+        lock.rollback().await.unwrap();
+        for n in (1..=70).filter(|n| !((prefix+1)..=(prefix+8)).contains(n)) {
+            let lease = queue.claim_for_publisher("prefix-worker", 300_000, Some(&fixture.id)).await.unwrap().unwrap();
+            assert_eq!(lease.event.event_id, format!("{}-event-{n:03}", fixture.id));
+            assert!(queue.acknowledge(&lease).await.unwrap());
+        }
+        assert!(queue.claim_for_publisher("prefix-worker", 300_000, Some(&fixture.id)).await.unwrap().is_none());
+        }
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL test URL and explicit migration opt-in"]
+async fn publisher_destination_matrix_keeps_same_key_groups_independent() {
+    bounded(async {
+        let mut cases = 0;
+        for mode in ["backoff", "leased", "locked", "dead"] {
+            for blocked_group in 0..4 {
+                let mut fixture = Fixture::new().await;
+                let queue = fixture.store.outbox_queue();
+                let publishers = [format!("{}-p0", fixture.id), format!("{}-p1", fixture.id)];
+                let destinations = [format!("{}-d0", fixture.id), format!("{}-d1", fixture.id)];
+                for publisher in &publishers { queue.register_publisher(publisher, "isolated-no-mq-test").await.unwrap(); }
+                let mut ids = vec![vec![String::new(); 2]; 4];
+                // The blocked group's head is first for its publisher, so acquiring its lease
+                // below cannot accidentally block a different destination.
+                for group in std::iter::once(blocked_group).chain((0..4).filter(|g| *g != blocked_group)) {
+                    let producer = format!("{}-source-{group}", fixture.id);
+                    queue.register_route(&OutboxRoute { producer: producer.clone(), publisher: publishers[group / 2].clone(), destination: destinations[group % 2].clone(), version: 1 }).await.unwrap();
+                    for (sequence, event_id) in ids[group].iter_mut().enumerate() {
+                        let (request, mut effects) = fixture.request(&format!("g{group}-{sequence}"), "same-key");
+                        let mut envelope = EventEnvelope::from_outbox(&effects.outbox_events[0]).unwrap().unwrap();
+                        envelope.producer = producer.clone();
+                        *event_id = envelope.event_id.clone();
+                        effects.outbox_events[0] = envelope.into_outbox().unwrap();
+                        fixture.store.commit_records(request, effects).await.unwrap();
+                    }
+                }
+                let head = &ids[blocked_group][0];
+                match mode {
+                    "backoff" => { fixture.sql.execute("UPDATE dbproxy_outbox SET available_at=clock_timestamp()+interval '1 hour' WHERE event_id=$1", &[head]).await.unwrap(); },
+                    "leased" | "dead" => {
+                        let lease = queue.claim_for_publisher("blocked-head", 300_000, Some(&publishers[blocked_group / 2])).await.unwrap().unwrap();
+                        assert_eq!(&lease.event.event_id, head);
+                        if mode == "dead" { assert!(queue.fail(&lease, "route matrix head", 1, 1).await.unwrap()); }
+                    },
+                    _ => {},
+                }
+                let lock = fixture.sql.transaction().await.unwrap();
+                if mode == "locked" { lock.query_one("SELECT event_id FROM dbproxy_outbox WHERE event_id=$1 FOR UPDATE", &[head]).await.unwrap(); }
+                for sequence in 0..2 {
+                    let mut leases = Vec::new();
+                    for publisher in &publishers {
+                        // Leave all returned leases active. Followers cannot be returned until
+                        // acknowledgement, even when another publisher/destination has the same key.
+                        for _ in 0..4 {
+                            match queue.claim_for_publisher("matrix-worker", 300_000, Some(publisher)).await.unwrap() {
+                                Some(lease) => {
+                                    let group = ids.iter().position(|pair| pair[sequence] == lease.event.event_id).expect("follower overtook its head or an unexpected event was claimed");
+                                    assert_ne!(group, blocked_group, "blocked group advanced: {mode}");
+                                    assert_eq!(&lease.publisher_id, publisher);
+                                    assert_eq!(lease.destination, destinations[group % 2]);
+                                    leases.push(lease);
+                                },
+                                None => break,
+                            }
+                        }
+                        assert!(queue.claim_for_publisher("duplicate-check", 300_000, Some(publisher)).await.unwrap().is_none());
+                    }
+                    let mut actual: Vec<_> = leases.iter().map(|l| l.event.event_id.clone()).collect();
+                    let mut expected: Vec<_> = (0..4).filter(|g| *g != blocked_group).map(|g| ids[g][sequence].clone()).collect();
+                    actual.sort(); expected.sort();
+                    assert_eq!(actual, expected, "route group isolation failed: {mode}, blocked={blocked_group}");
+                    for lease in leases { assert!(queue.acknowledge(&lease).await.unwrap()); }
+                }
+                lock.rollback().await.unwrap();
+                match mode {
+                    "backoff" => { fixture.sql.execute("UPDATE dbproxy_outbox SET available_at=clock_timestamp() WHERE event_id=$1", &[head]).await.unwrap(); },
+                    "leased" => fixture.expire(head).await,
+                    "dead" => { assert!(queue.retry_dead_letter(head, "route-matrix", "repaired").await.unwrap()); },
+                    _ => {},
+                }
+                for expected in &ids[blocked_group] {
+                    let lease = queue.claim_for_publisher("repaired-worker", 300_000, Some(&publishers[blocked_group / 2])).await.unwrap().unwrap();
+                    assert_eq!(&lease.event.event_id, expected);
+                    assert_eq!(lease.destination, destinations[blocked_group % 2]);
+                    assert!(queue.acknowledge(&lease).await.unwrap());
+                }
+                for publisher in &publishers { assert!(queue.claim_for_publisher("empty", 300_000, Some(publisher)).await.unwrap().is_none()); }
+                cases += 1;
+                println!("A12_ROUTE_CASE mode={mode} blocked_group={blocked_group} groups=4 events=8 passed");
+            }
+        }
+        assert_eq!(cases, 16);
+        println!("A12_ROUTE_RESULT cases={cases} groups_per_case=4 events_per_case=8");
+    }).await;
+}

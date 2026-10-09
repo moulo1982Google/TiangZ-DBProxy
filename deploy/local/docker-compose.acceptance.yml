@@ -1,0 +1,15 @@
+# Use after base, laptop, performance and validation overlays.
+# A unique project/container prefix and different ports keep fault runs isolated.
+services:
+  postgres:
+    container_name: ${DBPROXY_TEST_RUN:?set a unique acceptance project name}-postgres
+    ports: !override
+      - "127.0.0.1:15432:5432"
+  redis:
+    container_name: ${DBPROXY_TEST_RUN:?set a unique acceptance project name}-redis
+    ports: !override
+      - "127.0.0.1:16379:6379"
+  cache:
+    container_name: ${DBPROXY_TEST_RUN:?set a unique acceptance project name}-cache
+    ports: !override
+      - "127.0.0.1:16380:6379"

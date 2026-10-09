@@ -46,7 +46,7 @@ configs/deploy/external-multiprocess/StartMachine.json
 
 ## 4C8G 七日故障演练
 
-单机开发演练使用 `docker-compose.chaos.yml`：PostgreSQL 固定为 18.4；可靠队列 Redis 固定为 8.8.1、限制为 768 MiB/0.5 CPU，并启用 AOF `everysec`、512 MiB `maxmemory` 和 `noeviction`；快照缓存 Redis 同版本、限制为 384 MiB/0.25 CPU，关闭 AOF/RDB、使用易失 `tmpfs` 和 `allkeys-lru`。缓存与 AOF Redis 必须分离：否则 Redis 重启可能从 AOF 恢复旧快照与旧 freshness 标记，在 PostgreSQL cache-repair 赶上前产生短暂旧读。缓存重启为空时，DBProxy 会安全回源 PostgreSQL并重新预热。
+单机开发演练使用 `docker-compose.chaos.yml`：PostgreSQL 固定为 18.6；可靠队列 Redis 固定为 8.8.1、限制为 768 MiB/0.5 CPU，并启用 AOF `everysec`、512 MiB `maxmemory` 和 `noeviction`；快照缓存 Redis 同版本、限制为 384 MiB/0.25 CPU，关闭 AOF/RDB、使用易失 `tmpfs` 和 `allkeys-lru`。缓存与 AOF Redis 必须分离：否则 Redis 重启可能从 AOF 恢复旧快照与旧 freshness 标记，在 PostgreSQL cache-repair 赶上前产生短暂旧读。缓存重启为空时，DBProxy 会安全回源 PostgreSQL并重新预热。
 
 第二个 Redis 是职责隔离，不是 replica。同一台 4C8G 主机仍不部署 PostgreSQL standby 或 Redis replica：同机副本不能提供整机高可用，却会污染恢复故障边界和资源数据。主从、多节点自动切换与多可用区属于后续独立验收。
 

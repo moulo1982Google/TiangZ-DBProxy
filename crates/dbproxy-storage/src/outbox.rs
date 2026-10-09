@@ -84,39 +84,7 @@ impl PostgresOutboxQueue {
         client.ensure_connected().await?;
         let rows = client
             .query(
-                r#"
-WITH candidate AS (
-    SELECT current_event.event_id
-    FROM dbproxy_outbox AS current_event
-    WHERE current_event.published_at IS NULL
-      AND current_event.dead_lettered_at IS NULL
-      AND current_event.available_at <= clock_timestamp()
-      AND ($3::TEXT IS NULL OR current_event.publisher_id = $3)
-      AND (current_event.lease_until IS NULL OR current_event.lease_until <= clock_timestamp())
-      AND NOT EXISTS (
-          SELECT 1
-          FROM dbproxy_outbox AS prior_event
-          WHERE prior_event.publisher_id = current_event.publisher_id
-            AND prior_event.destination = current_event.destination
-            AND prior_event.partition_key = current_event.partition_key
-            AND prior_event.published_at IS NULL
-            AND prior_event.enqueue_order < current_event.enqueue_order
-      )
-    ORDER BY current_event.enqueue_order
-    FOR UPDATE OF current_event SKIP LOCKED
-    LIMIT $4
-)
-UPDATE dbproxy_outbox AS event
-SET lease_owner = $1,
-    lease_token = event.lease_token + 1,
-    expired_leases = event.expired_leases + CASE WHEN event.lease_until IS NOT NULL THEN 1 ELSE 0 END,
-    lease_until = clock_timestamp() + ($2::BIGINT * interval '1 millisecond')
-FROM candidate
-WHERE event.event_id = candidate.event_id
-RETURNING event.event_id, event.operation_id, event.trade_id, event.topic,
-          event.partition_key, event.payload, event.occurred_at_unix_ms, event.attempt_count,
-          event.producer, event.publisher_id, event.destination, event.lease_token
-"#,
+                include_str!("outbox_claim.sql"),
                 &[&worker_id, &lease_ms, &publisher, &maximum],
             )
             .await?;
@@ -247,17 +215,7 @@ WHERE event_id = $1 AND lease_owner = $2 AND published_at IS NULL
             .expect("unbounded maintenance lock");
         client.ensure_connected().await?;
         let row = client
-            .query_one(
-                r#"
-SELECT
-    COUNT(*) FILTER (WHERE published_at IS NULL AND dead_lettered_at IS NULL AND (lease_until IS NULL OR lease_until <= clock_timestamp())),
-    COUNT(*) FILTER (WHERE published_at IS NULL AND dead_lettered_at IS NULL AND lease_until > clock_timestamp()),
-    COUNT(*) FILTER (WHERE dead_lettered_at IS NOT NULL),
-    (EXTRACT(EPOCH FROM (clock_timestamp() - MIN(created_at) FILTER (WHERE published_at IS NULL AND dead_lettered_at IS NULL))) * 1000)::DOUBLE PRECISION
-FROM dbproxy_outbox
-"#,
-                &[],
-            )
+            .query_one(include_str!("outbox_stats.sql"), &[])
             .await?;
         Ok(OutboxStats {
             pending: count(row.get(0), "outbox pending count")?,

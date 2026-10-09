@@ -270,7 +270,14 @@ impl EnqueueBatcher {
         metrics: Arc<StorageMetrics>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(config.queue_capacity);
-        tokio::spawn(run_enqueue_batcher(receiver, sink, config, metrics.clone()));
+        // 在租户后端连接时创建；保留该 span，日志能看出属于哪个租户。
+        // Created while the tenant's backend connects; keep that span for its log lines.
+        tokio::spawn(tracing::Instrument::in_current_span(run_enqueue_batcher(
+            receiver,
+            sink,
+            config,
+            metrics.clone(),
+        )));
         Self {
             sender,
             capacity: config.queue_capacity,

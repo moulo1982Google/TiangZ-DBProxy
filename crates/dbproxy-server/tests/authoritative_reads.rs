@@ -57,6 +57,7 @@ async fn default_reads_over_tcp_never_serve_stale_or_negative_cache() {
                 &pg,
                 &redis,
                 StorageBackendConfig {
+                    read_connection_count: 2,
                     shard_count: 2,
                     tiered: TieredSnapshotStoreConfig {
                         fallback: CacheFallbackConfig {

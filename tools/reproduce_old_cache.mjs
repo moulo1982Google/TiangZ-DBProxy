@@ -24,7 +24,7 @@ try {
   const binary = build.find(x => x.reason === 'compiler-artifact' && x.target.name === 'postgres_redis' && x.executable)?.executable;
   if (!binary) throw Error('missing test binary');
   report.binary = binary; report.binarySha256 = createHash('sha256').update(fs.readFileSync(binary)).digest('hex');
-  run('docker', ['run', '-d', '--name', names[0], '--label', 'tiangz.purpose=old-cache-reproduction', '-e', 'POSTGRES_PASSWORD=repro_local_only', '-p', '127.0.0.1::5432', 'postgres:18.4-bookworm']);
+  run('docker', ['run', '-d', '--name', names[0], '--label', 'tiangz.purpose=old-cache-reproduction', '-e', 'POSTGRES_PASSWORD=repro_local_only', '-p', '127.0.0.1::5432', 'postgres:18.6-bookworm']);
   run('docker', ['run', '-d', '--name', names[1], '--label', 'tiangz.purpose=old-cache-reproduction', '-p', '127.0.0.1::6379', 'redis:8.8.1-trixie', 'redis-server', '--save', '', '--appendonly', 'no']);
   report.images = names.map(name => JSON.parse(run('docker', ['inspect', name]))[0].Image);
   const pgPort = run('docker', ['port', names[0], '5432/tcp']).split(':').at(-1);

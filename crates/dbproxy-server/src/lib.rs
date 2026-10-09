@@ -16,6 +16,8 @@ mod connection_limit_tests;
 mod memory_backend;
 mod observability;
 mod outbox_worker;
+mod request_timing;
+pub use request_timing::RequestStageSnapshot;
 pub mod relay_config;
 pub mod relay_metrics;
 
@@ -63,6 +65,7 @@ use tokio::{
     task::JoinSet,
     time::{sleep, timeout},
 };
+use tracing::Instrument;
 
 use observability::{
     BacklogMetricResult, DurableQueueMetricKind, DurableQueueMetricResult, HandshakeRejection,
@@ -204,9 +207,12 @@ pub trait DbProxyBackend: Send + Sync + 'static {
 /// Real PostgreSQL/Redis backend. Stable record sharding avoids one global client lock.
 pub struct StorageBackend {
     shards: Vec<TieredSnapshotStore>,
+    /// Shared primary read pool; `None` when reads share the shard write connections.
+    read_pool: Option<tiangz_dbproxy_storage::PostgresReadPool>,
     authoritative_read_namespaces: Vec<String>,
     backlog: RedisSnapshotBacklog,
     cache_repairs: PostgresCacheRepairQueue,
+    receipt_cleanup: PostgresSnapshotStore,
     cache_acknowledgements: CacheRepairAcknowledgements,
     outbox: PostgresOutboxQueue,
     outbox_publishers: HashMap<String, Arc<dyn tiangz_dbproxy_storage::Publisher>>,
@@ -215,10 +221,23 @@ pub struct StorageBackend {
     metrics: Arc<StorageMetrics>,
 }
 
+/// Dedicated PostgreSQL connections per tenant per process beyond shards and the read pool:
+/// one shared by the outbox/cache-repair queues and one for ordinary receipt cleanup.
+pub const MAINTENANCE_POSTGRES_CONNECTIONS: usize = 2;
+
+impl StorageBackendConfig {
+    /// Resident PostgreSQL connections one process opens for one tenant with this layout.
+    pub const fn postgres_connection_budget(&self) -> usize {
+        self.shard_count + self.read_connection_count + MAINTENANCE_POSTGRES_CONNECTIONS
+    }
+}
+
 /// Connection layout and cache policies for the real storage backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StorageBackendConfig {
     pub shard_count: usize,
+    /// Shared primary read pool per tenant; zero retains legacy shared connections.
+    pub read_connection_count: usize,
     pub tiered: TieredSnapshotStoreConfig,
     /// 普通快照入队的组提交与确认档位。 / Group commit and acknowledgement level for ordinary snapshot enqueues.
     pub enqueue: EnqueueBatchConfig,
@@ -237,6 +256,7 @@ impl StorageBackend {
             redis_url,
             StorageBackendConfig {
                 shard_count,
+                read_connection_count: 2,
                 tiered: TieredSnapshotStoreConfig::default(),
                 enqueue: EnqueueBatchConfig::default(),
             },
@@ -283,6 +303,11 @@ impl StorageBackend {
         if config.shard_count == 0 {
             return Err(BackendError::InvalidConfig("storage shard count is zero"));
         }
+        if config.read_connection_count > 64 {
+            return Err(BackendError::InvalidConfig(
+                "read connection count exceeds 64",
+            ));
+        }
         let metrics = Arc::new(StorageMetrics::default());
         let cache_acknowledgements = CacheRepairAcknowledgements::default();
         let mut shards = Vec::with_capacity(config.shard_count);
@@ -300,10 +325,27 @@ impl StorageBackend {
         for (index, shard) in shards.iter().enumerate() {
             shard.identify_connection(index).await?;
         }
+        let mut read_pool = None;
+        if config.read_connection_count > 0 {
+            let reads = tiangz_dbproxy_storage::PostgresReadPool::connect(
+                postgres_url,
+                config.read_connection_count,
+                config.tiered.postgres,
+            )
+            .await?;
+            shards = shards
+                .into_iter()
+                .map(|s| s.with_read_pool(reads.clone()))
+                .collect();
+            read_pool = Some(reads);
+        }
         // Queue polling uses one dedicated PostgreSQL connection so background maintenance never
         // holds the mutex of a request shard. Both queues share it because claims are short.
+        // Receipt cleanup takes the second one. Keep MAINTENANCE_POSTGRES_CONNECTIONS in step.
         let maintenance = PostgresSnapshotStore::connect(postgres_url).await?;
         maintenance.identify_connection(None).await?;
+        let receipt_cleanup = PostgresSnapshotStore::connect_existing(postgres_url).await?;
+        receipt_cleanup.identify_connection(None).await?;
         let cache_repairs = maintenance.cache_repair_queue();
         let outbox = maintenance.outbox_queue();
         outbox
@@ -352,6 +394,7 @@ impl StorageBackend {
         }
         Ok(Self {
             shards,
+            read_pool,
             authoritative_read_namespaces: Vec::new(),
             backlog: RedisSnapshotBacklog::connect_with_metrics(
                 redis_url,
@@ -360,6 +403,7 @@ impl StorageBackend {
             )
             .await?,
             cache_repairs,
+            receipt_cleanup,
             cache_acknowledgements,
             outbox,
             outbox_publishers,
@@ -390,6 +434,11 @@ impl StorageBackend {
 
     pub fn metrics(&self) -> &StorageMetrics {
         &self.metrics
+    }
+
+    /// Sampled read pool occupancy; `None` when reads share write connections.
+    pub fn read_pool_usage(&self) -> Option<tiangz_dbproxy_storage::ReadPoolUsage> {
+        self.read_pool.as_ref().map(|pool| pool.usage())
     }
 
     pub async fn backlog_stats(&self) -> Result<RedisSnapshotBacklogStats, BackendError> {
@@ -694,6 +743,16 @@ impl DbProxyBackend for StorageBackend {
         request: TransactionalWrite,
     ) -> Result<TransactionalWriteOutcome, BackendError> {
         let mut store = self.shard(&request.record);
+        #[cfg(feature = "acceptance-trace")]
+        {
+            let operation_id = request.operation_id.clone();
+            return Ok(tiangz_dbproxy_storage::acceptance_trace::capture(
+                &operation_id,
+                store.apply(request),
+            )
+            .await?);
+        }
+        #[cfg(not(feature = "acceptance-trace"))]
         Ok(store.apply(request).await?)
     }
 
@@ -1022,6 +1081,7 @@ pub async fn run_storage_metrics_poller(
         }
         metrics.storage_metrics_updated(backend.metrics().snapshot());
         metrics.storage_latencies_updated(backend.metrics().latency_snapshot());
+        metrics.read_pool_usage_updated(backend.read_pool_usage());
         match backend.backlog_stats().await {
             Ok(stats) => {
                 metrics.redis_dependency_updated(true);
@@ -1424,6 +1484,7 @@ async fn handle_connection(
         (backend, Arc::clone(&config.metrics))
     };
     let _tenant_slot = tenant_slot;
+    let span = tenant_span(selected.map(|tenant| tenant.id.as_str()));
     let accepted = wire::ServerFrame {
         body: Some(wire::server_frame::Body::Hello(wire::ServerHello {
             supports_outbox_relay: true,
@@ -1437,7 +1498,20 @@ async fn handle_connection(
     tracing::debug!(client_name = %hello.client_name, "DBProxy client authenticated");
 
     let (reader, writer) = stream.into_split();
-    serve_requests(reader, writer, config, backend, request_metrics, shutdown).await
+    serve_requests(reader, writer, config, backend, request_metrics, shutdown)
+        .instrument(span)
+        .await
+}
+
+/// 多租户时给请求处理与后台任务的日志加上租户名；单租户不加。
+/// Span that tags every log line of one tenant's request handling and background workers. ERROR
+/// level so it stays enabled whenever any event is: a span disabled by the filter would drop the
+/// tenant from WARN/ERROR lines inside it. Single-tenant deployments get no span.
+pub fn tenant_span(tenant: Option<&str>) -> tracing::Span {
+    match tenant {
+        Some(tenant) => tracing::error_span!("tenant", tenant = %tenant),
+        None => tracing::Span::none(),
+    }
 }
 
 /// 一条连接上并发处理多个请求，响应按完成顺序返回并以 rpc_id 对应；
@@ -1455,7 +1529,8 @@ async fn serve_requests(
     let limit = config.max_in_flight_per_connection;
     let permits = Arc::new(Semaphore::new(limit));
     let (responses, outgoing) = mpsc::channel(limit);
-    let responder = tokio::spawn(write_responses(writer, outgoing, config.max_frame_bytes));
+    let responder =
+        tokio::spawn(write_responses(writer, outgoing, config.max_frame_bytes).in_current_span());
     let mut requests = JoinSet::new();
     let mut ordering = RequestOrdering::default();
     let read_result = loop {
@@ -1490,23 +1565,67 @@ async fn serve_requests(
         let Some(wire::client_frame::Body::Request(request)) = frame.body else {
             break Err(ConnectionError::MissingHandshake);
         };
+        let admitted_at = std::time::Instant::now();
+        #[cfg(feature = "acceptance-trace")]
+        let response_trace = if tiangz_dbproxy_storage::acceptance_trace::enabled() {
+            match request.body.as_ref() {
+                Some(wire::request_envelope::Body::ApplyTransaction(tx)) => {
+                    use sha2::{Digest, Sha256};
+                    Some(format!("{:x}", Sha256::digest(tx.operation_id.as_bytes())))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let operation = observability::RpcOperation::from_body(request.body.as_ref());
         let (predecessors, completion) = ordering.admit(order_keys(request.body.as_ref()));
         let backend = Arc::clone(&backend);
         let metrics = Arc::clone(&metrics);
         let responses = responses.clone();
         let max_payload_bytes = config.max_payload_bytes;
-        requests.spawn(async move {
-            let _permit = permit;
-            for mut predecessor in predecessors {
-                // 前序请求结束时丢弃发送端，changed 随即返回错误。 / A finished predecessor drops its sender.
-                while predecessor.changed().await.is_ok() {}
+        requests.spawn(
+            async move {
+                let _permit = permit;
+                metrics.request_timings.record(
+                    operation,
+                    request_timing::RequestStage::Schedule,
+                    admitted_at.elapsed(),
+                );
+                let ordered_at = std::time::Instant::now();
+                for mut predecessor in predecessors {
+                    // 前序请求结束时丢弃发送端，changed 随即返回错误。 / A finished predecessor drops its sender.
+                    while predecessor.changed().await.is_ok() {}
+                }
+                metrics.request_timings.record(
+                    operation,
+                    request_timing::RequestStage::Order,
+                    ordered_at.elapsed(),
+                );
+                let handler_at = std::time::Instant::now();
+                let response =
+                    dispatch_isolated(request, backend.as_ref(), &metrics, max_payload_bytes).await;
+                metrics.request_timings.record(
+                    operation,
+                    request_timing::RequestStage::Handler,
+                    handler_at.elapsed(),
+                );
+                drop(completion);
+                #[cfg(feature = "acceptance-trace")]
+                let response = (
+                    response,
+                    response_trace.map(|digest| ResponseTrace {
+                        digest,
+                        admitted_at,
+                        handler_at,
+                        queued_at: Instant::now(),
+                    }),
+                );
+                // 写出任务已退出时连接已失效，丢弃响应。 / The writer has failed, so the connection is gone.
+                let _ = responses.send(response).await;
             }
-            let response =
-                dispatch_isolated(request, backend.as_ref(), &metrics, max_payload_bytes).await;
-            drop(completion);
-            // 写出任务已退出时连接已失效，丢弃响应。 / The writer has failed, so the connection is gone.
-            let _ = responses.send(response).await;
-        });
+            .in_current_span(),
+        );
     };
     // 已接收的请求都执行完并尽量写回响应，与逐个处理时收尾一致。
     // Finish every accepted request and try to write its response, as the sequential loop did.
@@ -1560,13 +1679,43 @@ async fn dispatch_isolated(
     })
 }
 
+#[cfg(not(feature = "acceptance-trace"))]
+type OutgoingResponse = wire::ServerFrame;
+#[cfg(feature = "acceptance-trace")]
+type OutgoingResponse = (wire::ServerFrame, Option<ResponseTrace>);
+#[cfg(feature = "acceptance-trace")]
+struct ResponseTrace {
+    digest: String,
+    admitted_at: Instant,
+    handler_at: Instant,
+    queued_at: Instant,
+}
+
 async fn write_responses(
     mut writer: OwnedWriteHalf,
-    mut outgoing: mpsc::Receiver<wire::ServerFrame>,
+    mut outgoing: mpsc::Receiver<OutgoingResponse>,
     maximum: usize,
 ) -> Result<(), ProtocolError> {
     while let Some(response) = outgoing.recv().await {
+        #[cfg(feature = "acceptance-trace")]
+        let (response, trace) = response;
+        #[cfg(feature = "acceptance-trace")]
+        let write_at = Instant::now();
         write_message(&mut writer, &response, maximum).await?;
+        #[cfg(feature = "acceptance-trace")]
+        if let Some(t) = trace {
+            let finished_at = Instant::now();
+            tracing::info!(
+                "ACCEPTANCE_TX_RESPONSE {}",
+                serde_json::json!({
+                    "schema_version":1,"operation_sha256":t.digest,
+                    "handler_begin_us":t.handler_at.duration_since(t.admitted_at).as_micros(),
+                    "queued_us":t.queued_at.duration_since(t.admitted_at).as_micros(),
+                    "write_begin_us":write_at.duration_since(t.admitted_at).as_micros(),
+                    "write_end_us":finished_at.duration_since(t.admitted_at).as_micros()
+                })
+            );
+        }
     }
     Ok(())
 }
@@ -2649,6 +2798,55 @@ impl Hasher for StableHasher {
         for byte in bytes {
             self.0 ^= u64::from(*byte);
             self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+}
+
+/// One bounded cleanup batch per tenant; separate from request and queue connections.
+/// Full batches pause for one second, idle/failing batches for one minute. `retention` is the
+/// configured `storage.receiptRetentionHours`; an out-of-range value fails every batch loudly.
+pub async fn run_receipt_cleanup_worker(
+    backend: Arc<StorageBackend>,
+    tenant: String,
+    retention: Duration,
+    metrics: Arc<DbProxyMetrics>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tracing::info!(
+        %tenant,
+        retention_hours = retention.as_secs_f64() / 3600.0,
+        "ordinary receipt cleanup started"
+    );
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let delay = match backend
+            .receipt_cleanup
+            .cleanup_expired_receipts(retention)
+            .await
+        {
+            Ok(deleted) => {
+                metrics.receipt_cleanup_completed(Some(deleted));
+                if deleted > 0 {
+                    tracing::info!(%tenant, deleted, elapsed_ms = started.elapsed().as_millis() as u64, "ordinary receipt cleanup completed");
+                }
+                if deleted == tiangz_dbproxy_storage::RECEIPT_CLEANUP_BATCH_SIZE {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_secs(60)
+                }
+            }
+            Err(error) => {
+                metrics.receipt_cleanup_completed(None);
+                tracing::warn!(%tenant, %error, "ordinary receipt cleanup failed; retry in 60 seconds");
+                Duration::from_secs(60)
+            }
+        };
+        tokio::select! {
+            _ = sleep(delay) => {},
+            _ = shutdown.changed() => { if *shutdown.borrow() || shutdown.has_changed().is_err() { return; } }
         }
     }
 }

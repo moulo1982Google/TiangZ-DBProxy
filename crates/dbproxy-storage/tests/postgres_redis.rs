@@ -404,6 +404,9 @@ async fn postgres_snapshot_table_uses_32_hash_partitions() {
             (10, "cache-repair-leases".to_string()),
             (11, "outbox-index-cleanup".to_string()),
             (12, "queued-fence".to_string()),
+            (13, "query-indexes".to_string()),
+            (14, "cache-repair-claim-indexes".to_string()),
+            (15, "receipt-retention".to_string()),
         ]
     );
 

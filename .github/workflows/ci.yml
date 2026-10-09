@@ -16,6 +16,54 @@ on:
   workflow_dispatch:
 
 jobs:
+  indexes:
+    name: PostgreSQL 全库索引回归
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18.6-bookworm
+        env:
+          POSTGRES_USER: tiangz
+          POSTGRES_PASSWORD: tiangz_dev
+          POSTGRES_DB: index_regression
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tiangz -d index_regression"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/index_regression
+      DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION: "1"
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: 空库、索引漂移和十万条历史数据回归
+        run: cargo test -p tiangz-dbproxy-storage --test schema_indexes --locked -- --ignored --nocapture --test-threads=1
+      - name: 批量读取与队列积压查询回归
+        env:
+          DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/query_plan_regression
+        run: |
+          docker exec "${{ job.services.postgres.id }}" createdb -U tiangz query_plan_regression
+          cargo test -p tiangz-dbproxy-storage --test query_plans --test repair_claim_plans --test outbox_hybrid_plans --locked -- --ignored --nocapture --test-threads=1
+      - name: Outbox 顺序与并发回归
+        env:
+          DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/outbox_safety_regression
+        run: |
+          docker exec "${{ job.services.postgres.id }}" createdb -U tiangz outbox_safety_regression
+          cargo test -p tiangz-dbproxy-storage --test outbox_concurrency --locked -- --ignored --nocapture --test-threads=1
+
+      - name: 普通回执保留期与清理索引回归
+        env:
+          DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/receipt_regression
+        run: |
+          docker exec "${{ job.services.postgres.id }}" createdb -U tiangz receipt_regression
+          cargo test -p tiangz-dbproxy-storage --test receipt_retention --locked -- --ignored --nocapture --test-threads=1
+
   check:
     name: 格式、测试与 Clippy
     runs-on: ubuntu-latest
@@ -46,7 +94,7 @@ jobs:
   release:
     name: 发布前完整验收
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v'))
-    needs: check
+    needs: [check, indexes]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -55,6 +103,10 @@ jobs:
       DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION: "1"
       DBPROXY_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6379/0
       DBPROXY_RUN_DOCKER_FAULTS: "1"
+      DBPROXY_TEST_COMPOSE_PROJECT: tiangz-dbproxy-local
+      DBPROXY_TEST_POSTGRES_CONTAINER: tiangz-dbproxy-postgres
+      DBPROXY_TEST_REDIS_CONTAINER: tiangz-dbproxy-redis
+      DBPROXY_TEST_CACHE_CONTAINER: tiangz-dbproxy-cache
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -98,6 +150,13 @@ jobs:
           cargo test -p tiangz-dbproxy-storage --test cache_repair_concurrency --locked -- --ignored --nocapture --test-threads=1
       - name: 真实网络闭环测试
         run: cargo test -p tiangz-dbproxy-server --test postgres_redis_network --locked -- --ignored --nocapture --test-threads=1
+      - name: 普通回执后台清理回归
+        env:
+          DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION: "1"
+          DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/receipt_worker_regression
+        run: |
+          docker exec tiangz-dbproxy-postgres createdb -U tiangz receipt_worker_regression
+          cargo test -p tiangz-dbproxy-server --test receipt_cleanup_worker --locked -- --ignored --nocapture --test-threads=1
       - name: Redis 与 PostgreSQL 故障矩阵
         env:
           DBPROXY_CACHE_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6380/0

@@ -148,3 +148,9 @@
 - PostgreSQL/Redis 多副本高可用、备份和跨机恢复演练；
 - Redis Stream 消费组、消费者幂等表和保留/裁剪策略；
 - 正式环境基于真实写入率调整 worker 数量、告警阈值和死信策略。
+
+## 已授权待做：`sdk/typescript` 的 Node TCP 传输层
+
+- [ ] 在 `sdk/typescript` 增加基于 `net.Socket` 的 `DbProxyTransport` 实现：大端 u32 长度前缀 protobuf 帧、`ClientHello/ServerHello` 握手（协议版本、协议指纹、租户令牌）、连接池、超时与失效连接回收；重试必须复用原 `requestId/operationId`。
+- 用途：苟道三国的 GM 后台（Node + React）直连 DBProxy 写入区服目录记录（登录全局租户），供 Login 读取下发；将来任何 Node 工具也可复用。
+- 2026-09-23 由需求方授权，安排在 GM 后台开发那一轮实现，不阻塞登录改造。记录格式契约见 `GouDaoSanGuo_Server/GouDaoSanGuo/docs/features/login/implementation-plan.md` 0.8。

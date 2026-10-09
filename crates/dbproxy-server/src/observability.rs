@@ -48,7 +48,7 @@ pub(crate) enum RpcOperation {
 }
 
 impl RpcOperation {
-    const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::LoadSnapshot,
         Self::LoadMultiSnapshot,
         Self::SaveSnapshot,
@@ -245,6 +245,10 @@ pub struct DbProxyMetrics {
     handshake_rejections: [AtomicU64; 3],
     requests_in_flight: AtomicU64,
     operations: [OperationMetrics; RpcOperation::ALL.len()],
+    pub(crate) request_timings: crate::request_timing::RequestTimings,
+    receipt_cleanup_batches: AtomicU64,
+    receipt_cleanup_deleted: AtomicU64,
+    receipt_cleanup_failures: AtomicU64,
     backlog_committed: AtomicU64,
     backlog_empty_polls: AtomicU64,
     backlog_failures: AtomicU64,
@@ -284,12 +288,15 @@ pub struct DbProxyMetrics {
     outbox_oldest_age_ms: AtomicU64,
     pub outbox_relay: std::sync::Mutex<Option<Arc<crate::relay_metrics::RelayMetrics>>>,
     storage_latencies: std::sync::Mutex<Vec<StorageStageSnapshot>>,
+    postgres_read_pool_capacity: AtomicU64,
+    postgres_read_pool_in_use: AtomicU64,
 }
 
 impl Default for DbProxyMetrics {
     fn default() -> Self {
         Self {
             started_at: Instant::now(),
+            request_timings: Default::default(),
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
             dependency_readiness_required: AtomicBool::new(false),
@@ -303,6 +310,9 @@ impl Default for DbProxyMetrics {
             handshake_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             requests_in_flight: AtomicU64::new(0),
             operations: std::array::from_fn(|_| OperationMetrics::default()),
+            receipt_cleanup_batches: AtomicU64::new(0),
+            receipt_cleanup_deleted: AtomicU64::new(0),
+            receipt_cleanup_failures: AtomicU64::new(0),
             backlog_committed: AtomicU64::new(0),
             backlog_empty_polls: AtomicU64::new(0),
             backlog_failures: AtomicU64::new(0),
@@ -342,11 +352,32 @@ impl Default for DbProxyMetrics {
             outbox_oldest_age_ms: AtomicU64::new(0),
             outbox_relay: std::sync::Mutex::new(None),
             storage_latencies: std::sync::Mutex::new(Vec::new()),
+            postgres_read_pool_capacity: AtomicU64::new(0),
+            postgres_read_pool_in_use: AtomicU64::new(0),
         }
     }
 }
 
 impl DbProxyMetrics {
+    /// Completed scheduler, ordering and handler scopes, without request identifiers.
+    pub fn request_stage_snapshot(&self) -> Vec<crate::request_timing::RequestStageSnapshot> {
+        self.request_timings.snapshot()
+    }
+
+    pub fn receipt_cleanup_completed(&self, deleted: Option<u64>) {
+        self.receipt_cleanup_batches.fetch_add(1, Ordering::Relaxed);
+        match deleted {
+            Some(count) => {
+                self.receipt_cleanup_deleted
+                    .fetch_add(count, Ordering::Relaxed);
+            }
+            None => {
+                self.receipt_cleanup_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// 标记业务监听和存储后端已经就绪。 / Mark the business listener and storage backend ready.
     pub fn mark_ready(&self) {
         self.ready.store(true, Ordering::Release);
@@ -505,6 +536,70 @@ impl DbProxyMetrics {
             .unwrap_or_else(|error| error.into_inner()) = snapshot;
     }
 
+    /// Sampled at the storage poll; `None` (no pool) exports capacity 0.
+    pub(crate) fn read_pool_usage_updated(
+        &self,
+        usage: Option<tiangz_dbproxy_storage::ReadPoolUsage>,
+    ) {
+        let usage = usage.unwrap_or(tiangz_dbproxy_storage::ReadPoolUsage {
+            capacity: 0,
+            in_use: 0,
+        });
+        self.postgres_read_pool_capacity
+            .store(usage.capacity, Ordering::Relaxed);
+        self.postgres_read_pool_in_use
+            .store(usage.in_use, Ordering::Relaxed);
+    }
+
+    fn append_read_pool_usage(&self, output: &mut String) {
+        write_atomic_metric(
+            output,
+            "dbproxy_postgres_read_pool_capacity",
+            "Configured primary read pool connections per tenant; 0 means reads share write connections",
+            "gauge",
+            &self.postgres_read_pool_capacity,
+        );
+        write_atomic_metric(
+            output,
+            "dbproxy_postgres_read_pool_in_use",
+            "Leased read pool connections at the last storage poll, including holders still reconnecting; waiters are not counted",
+            "gauge",
+            &self.postgres_read_pool_in_use,
+        );
+    }
+
+    /// Completed request stages per operation: task scheduling, same-record ordering wait and
+    /// handler execution. Cumulative since process start; buckets are fixed and hold no keys.
+    fn append_request_stages(&self, output: &mut String) {
+        writeln!(output, "# HELP dbproxy_request_stage_seconds Completed request stages: task_schedule (parse to task start), record_order_wait (same-connection same-record predecessors) and handler (backend call); excludes socket receive and response send").unwrap();
+        writeln!(output, "# TYPE dbproxy_request_stage_seconds histogram").unwrap();
+        writeln!(output, "# HELP dbproxy_request_stage_max_seconds Slowest completed request stage since process start; never resets").unwrap();
+        writeln!(output, "# TYPE dbproxy_request_stage_max_seconds gauge").unwrap();
+        for sample in self.request_timings.snapshot() {
+            let (operation, stage) = (sample.operation, sample.stage);
+            let mut cumulative = 0_u64;
+            for (bound, count) in sample.bounds_us.iter().zip(sample.buckets) {
+                cumulative += count;
+                writeln!(output, "dbproxy_request_stage_seconds_bucket{{operation=\"{operation}\",stage=\"{stage}\",le=\"{}\"}} {cumulative}", *bound as f64 / 1_000_000.0).unwrap();
+            }
+            let count = sample.buckets.iter().sum::<u64>();
+            writeln!(output, "dbproxy_request_stage_seconds_bucket{{operation=\"{operation}\",stage=\"{stage}\",le=\"+Inf\"}} {count}").unwrap();
+            writeln!(output, "dbproxy_request_stage_seconds_count{{operation=\"{operation}\",stage=\"{stage}\"}} {count}").unwrap();
+            writeln!(
+                output,
+                "dbproxy_request_stage_seconds_sum{{operation=\"{operation}\",stage=\"{stage}\"}} {:.6}",
+                sample.sum_us as f64 / 1_000_000.0
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "dbproxy_request_stage_max_seconds{{operation=\"{operation}\",stage=\"{stage}\"}} {:.6}",
+                sample.max_us as f64 / 1_000_000.0
+            )
+            .unwrap();
+        }
+    }
+
     fn append_storage_latencies(&self, output: &mut String) {
         writeln!(output, "# HELP dbproxy_storage_stage_seconds Elapsed storage scopes including errors and cancellation, not successful SQL execution").unwrap();
         writeln!(output, "# TYPE dbproxy_storage_stage_seconds histogram").unwrap();
@@ -657,6 +752,8 @@ impl DbProxyMetrics {
     pub(crate) fn prometheus(&self, storage_backend: &str) -> String {
         let mut output = String::with_capacity(16 * 1024);
         self.append_storage_latencies(&mut output);
+        self.append_read_pool_usage(&mut output);
+        self.append_request_stages(&mut output);
         metric_header(
             &mut output,
             "dbproxy_live",
@@ -1008,6 +1105,27 @@ impl DbProxyMetrics {
                 .unwrap();
             }
         }
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_receipt_cleanup_batches_total",
+            "Ordinary receipt cleanup batches",
+            "counter",
+            &self.receipt_cleanup_batches,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_receipt_cleanup_deleted_total",
+            "Ordinary receipt cleanup deleted",
+            "counter",
+            &self.receipt_cleanup_deleted,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_receipt_cleanup_failures_total",
+            "Ordinary receipt cleanup failures",
+            "counter",
+            &self.receipt_cleanup_failures,
+        );
         metric_header(
             &mut output,
             "dbproxy_backlog_polls_total",
@@ -1575,6 +1693,71 @@ mod tests {
     }
 
     #[test]
+    fn read_pool_usage_and_request_stages_export_with_fixed_labels() {
+        use crate::request_timing::RequestStage;
+        use std::time::Duration;
+        let metrics = DbProxyMetrics::default();
+        let output = metrics.prometheus("memory");
+        assert!(output.contains("dbproxy_postgres_read_pool_capacity 0\n"));
+        assert!(output.contains("dbproxy_postgres_read_pool_in_use 0\n"));
+        metrics.read_pool_usage_updated(Some(tiangz_dbproxy_storage::ReadPoolUsage {
+            capacity: 2,
+            in_use: 1,
+        }));
+        metrics.request_timings.record(
+            RpcOperation::LoadSnapshot,
+            RequestStage::Order,
+            Duration::from_millis(80),
+        );
+        metrics.request_timings.record(
+            RpcOperation::LoadSnapshot,
+            RequestStage::Handler,
+            Duration::from_millis(3),
+        );
+        let output = metrics.prometheus("memory");
+        assert!(output.contains("dbproxy_postgres_read_pool_capacity 2\n"));
+        assert!(output.contains("dbproxy_postgres_read_pool_in_use 1\n"));
+        assert!(output.contains(
+            "dbproxy_request_stage_seconds_bucket{operation=\"load_snapshot\",stage=\"record_order_wait\",le=\"0.05\"} 0"
+        ));
+        assert!(output.contains(
+            "dbproxy_request_stage_seconds_bucket{operation=\"load_snapshot\",stage=\"record_order_wait\",le=\"0.1\"} 1"
+        ));
+        assert!(output.contains(
+            "dbproxy_request_stage_seconds_bucket{operation=\"load_snapshot\",stage=\"record_order_wait\",le=\"+Inf\"} 1"
+        ));
+        assert!(output.contains(
+            "dbproxy_request_stage_seconds_count{operation=\"load_snapshot\",stage=\"record_order_wait\"} 1"
+        ));
+        assert!(output.contains(
+            "dbproxy_request_stage_seconds_sum{operation=\"load_snapshot\",stage=\"handler\"} 0.003000"
+        ));
+        assert!(output.contains(
+            "dbproxy_request_stage_max_seconds{operation=\"load_snapshot\",stage=\"record_order_wait\"} 0.080000"
+        ));
+        assert!(output.contains(
+            "dbproxy_request_stage_seconds_count{operation=\"save_snapshot\",stage=\"handler\"} 0"
+        ));
+        // Fixed cardinality: every operation and stage is present, with no business keys.
+        assert_eq!(
+            output
+                .matches("dbproxy_request_stage_seconds_count{")
+                .count(),
+            RpcOperation::ALL.len() * 3
+        );
+        assert_eq!(
+            output.matches("dbproxy_request_stage_max_seconds{").count(),
+            RpcOperation::ALL.len() * 3
+        );
+        metrics.read_pool_usage_updated(None);
+        assert!(
+            metrics
+                .prometheus("memory")
+                .contains("dbproxy_postgres_read_pool_capacity 0\n")
+        );
+    }
+
+    #[test]
     fn storage_latency_poll_replaces_cumulative_samples_and_exports_overflow() {
         let metrics = DbProxyMetrics::default();
         let mut sample = StorageStageSnapshot {
@@ -1683,4 +1866,16 @@ mod tests {
         shutdown.send(true).unwrap();
         server.stop().await;
     }
+}
+#[cfg(test)]
+#[test]
+fn receipt_cleanup_metrics_distinguish_deleted_empty_and_failed_batches() {
+    let metrics = DbProxyMetrics::default();
+    metrics.receipt_cleanup_completed(Some(500));
+    metrics.receipt_cleanup_completed(Some(0));
+    metrics.receipt_cleanup_completed(None);
+    let text = metrics.prometheus("postgres");
+    assert!(text.contains("dbproxy_receipt_cleanup_batches_total 3"));
+    assert!(text.contains("dbproxy_receipt_cleanup_deleted_total 500"));
+    assert!(text.contains("dbproxy_receipt_cleanup_failures_total 1"));
 }

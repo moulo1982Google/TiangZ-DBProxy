@@ -92,6 +92,7 @@ impl DbProxyBackend for GatedBackend {
 }
 
 struct TestServer {
+    metrics: Arc<tiangz_dbproxy_server::DbProxyMetrics>,
     endpoint: String,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
@@ -100,11 +101,13 @@ struct TestServer {
 async fn start(backend: Arc<GatedBackend>, max_in_flight: usize) -> TestServer {
     let mut config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), TOKEN);
     config.max_in_flight_per_connection = max_in_flight;
+    let metrics = config.metrics.clone();
     let server = DbProxyServer::bind(config, backend).await.unwrap();
     let endpoint = server.local_addr().unwrap().to_string();
     let (shutdown, receiver) = watch::channel(false);
     let task = tokio::spawn(async move { server.serve(receiver).await.unwrap() });
     TestServer {
+        metrics,
         endpoint,
         shutdown,
         task,
@@ -222,6 +225,26 @@ async fn other_records_overtake_a_slow_request_but_one_record_keeps_arrival_orde
     let log = backend.log();
     let position = |entry: &str| log.iter().position(|item| item == entry).unwrap();
     assert!(position("end hold-a1") < position("start a2"), "{log:?}");
+    let stages = serde_json::to_value(server.metrics.request_stage_snapshot()).unwrap();
+    let order = stages
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["operation"] == "enqueue_snapshot" && s["stage"] == "record_order_wait")
+        .unwrap();
+    assert!(
+        order["max_us"].as_u64().unwrap() >= 50_000,
+        "ordering delay must be measured separately: {order}"
+    );
+    assert_eq!(
+        order["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_u64().unwrap())
+            .sum::<u64>(),
+        3
+    );
 
     drop(stream);
     server.shutdown.send(true).unwrap();
