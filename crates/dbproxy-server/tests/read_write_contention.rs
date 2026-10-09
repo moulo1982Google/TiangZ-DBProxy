@@ -340,9 +340,25 @@ async fn start_lost_response_forwarder(target: std::net::SocketAddr) -> LostResp
                     if read == 0 {
                         return;
                     }
-                    let dropping = drops
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                        .is_ok();
+                    // CAS 循环，新旧工具链都可编译（fetch_update 在新版已改名 try_update）。
+                    // CAS loop that builds on old and new toolchains (fetch_update became try_update).
+                    let dropping = {
+                        let mut current = drops.load(Ordering::SeqCst);
+                        loop {
+                            if current == 0 {
+                                break false;
+                            }
+                            match drops.compare_exchange_weak(
+                                current,
+                                current - 1,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            ) {
+                                Ok(_) => break true,
+                                Err(actual) => current = actual,
+                            }
+                        }
+                    };
                     if dropping {
                         // Count whole frames in the swallowed bytes: 4-byte big-endian length prefix.
                         let (mut offset, mut frames) = (0_usize, 0_u64);

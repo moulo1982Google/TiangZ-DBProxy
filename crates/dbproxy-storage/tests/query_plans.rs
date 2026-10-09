@@ -150,7 +150,17 @@ async fn outbox_claim_plans() {
             ("after", OUTBOX.to_string()),
         ] {
             tx.batch_execute("SAVEPOINT probe").await.unwrap();
-            let params: &[&(dyn ToSql + Sync)] = &[&"query-worker", &30000_i64, &None::<String>];
+            // 正式 SQL 多一个批量上限参数 $4；旧版对照保持 3 个参数。
+            // The production query takes the batch maximum as $4; the old baseline keeps 3 parameters.
+            let batch_params: &[&(dyn ToSql + Sync)] =
+                &[&"query-worker", &30000_i64, &None::<String>, &1_i64];
+            let single_params: &[&(dyn ToSql + Sync)] =
+                &[&"query-worker", &30000_i64, &None::<String>];
+            let params = if label == "after" {
+                batch_params
+            } else {
+                single_params
+            };
             let plan = explain(&tx, &format!("outbox-{mode}-{label}"), &query, params).await;
             assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(1.0));
             if mode == "backoff" && label == "after" {
@@ -176,7 +186,10 @@ async fn outbox_claim_plans() {
                 .unwrap();
         }
         let scoped = tx
-            .query_one(OUTBOX, &[&"query-worker", &30000_i64, &Some("legacy")])
+            .query_one(
+                OUTBOX,
+                &[&"query-worker", &30000_i64, &Some("legacy"), &1_i64],
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -190,7 +203,12 @@ async fn outbox_claim_plans() {
         assert!(
             tx.query_opt(
                 OUTBOX,
-                &[&"query-worker", &30000_i64, &Some("unknown-publisher")]
+                &[
+                    &"query-worker",
+                    &30000_i64,
+                    &Some("unknown-publisher"),
+                    &1_i64
+                ]
             )
             .await
             .unwrap()
@@ -234,15 +252,21 @@ async fn claim_uses_statement_time_inside_an_older_transaction() {
             .is_none()
     );
     let event = tx
-        .query_one(OUTBOX, &[&"time-worker", &30000_i64, &None::<String>])
+        .query_one(
+            OUTBOX,
+            &[&"time-worker", &30000_i64, &None::<String>, &1_i64],
+        )
         .await
         .unwrap();
     assert_eq!(event.get::<_, String>(0), "query-time-ready");
     assert!(
-        tx.query_opt(OUTBOX, &[&"time-worker", &30000_i64, &None::<String>])
-            .await
-            .unwrap()
-            .is_none()
+        tx.query_opt(
+            OUTBOX,
+            &[&"time-worker", &30000_i64, &None::<String>, &1_i64]
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
     tx.rollback().await.unwrap();
 }

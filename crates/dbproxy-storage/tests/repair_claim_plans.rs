@@ -282,6 +282,21 @@ async fn half_locked_claim_and_hot_merge_costs() {
             .get::<_, i64>(0),
         0
     );
+    // 领取 SQL 不按命名空间过滤；留下的 2 万行会让同一测试库里后跑的顺序断言领到它们。
+    // The claim query is not namespace-scoped, so leftover rows would be claimed by later tests in this database.
+    observer
+        .execute(
+            "DELETE FROM dbproxy_cache_repairs WHERE namespace='repair-half'",
+            &[],
+        )
+        .await
+        .unwrap();
+    // 删除留下的死元组与本测试数据处在同一时间区间，会让后续计划回归多读页面；清理后立即回收。
+    // Dead tuples share the next tests' time range and would inflate their page-read assertions.
+    observer
+        .batch_execute("VACUUM (ANALYZE) dbproxy_cache_repairs")
+        .await
+        .unwrap();
     timings.sort_by(f64::total_cmp);
     println!(
         "P06_HALF_HOT_RESULT {}",
