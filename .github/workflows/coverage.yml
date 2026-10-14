@@ -1,0 +1,56 @@
+name: coverage
+
+# 代码覆盖率：Rust 工作区的默认测试（不含需要真实 PostgreSQL/Redis 的 #[ignore] 用例）加 TypeScript SDK 测试，上传 Codecov（仓库密钥 CODECOV_TOKEN）。
+# Code coverage: default Rust workspace tests (the #[ignore] cases that need real PostgreSQL/Redis are not included) plus the TypeScript SDK tests, uploaded to Codecov.
+permissions:
+  contents: read
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust 覆盖率
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: 工作区默认测试覆盖率
+        run: cargo llvm-cov --workspace --locked --lcov --output-path rust-lcov.info
+      - name: 上传到 Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: rust-lcov.info
+          flags: rust
+          fail_ci_if_error: true
+
+  typescript:
+    name: TypeScript SDK 覆盖率
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build:typescript
+      - name: SDK 测试覆盖率（经 source map 映射回 TypeScript 源文件）
+        run: node --enable-source-maps --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=sdk-lcov.info sdk/typescript/test/*.test.mjs
+      - name: 上传到 Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: sdk-lcov.info
+          flags: typescript
+          fail_ci_if_error: true

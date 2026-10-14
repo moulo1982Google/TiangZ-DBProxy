@@ -1,0 +1,25 @@
+# Codecov 配置。刚接入时检查只提示、不拦合并，看清基线后再决定是否收紧。
+# Codecov settings: status checks are informational for now and never block a merge.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# 两份报告分别标记 rust 与 typescript，各自统计。
+# The two reports carry the rust and typescript flags and are tracked separately.
+flags:
+  rust:
+    paths:
+      - src/
+      - crates/
+  typescript:
+    paths:
+      - sdk/typescript/src/
+
+comment:
+  layout: "condensed_header, diff, flags, files"
+  require_changes: true

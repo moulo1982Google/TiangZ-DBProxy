@@ -1,6 +1,13 @@
-> 本轮发布：`v0.7.1`（套件 TiangZ 0.7.1）。合入 2026-09-23 至 10-08 的评审与验收分支（回执保留期、PG 读池、查询索引、验收宿主与故障测试等）；协议、Rust client/core 与 TS SDK 不变。**升级会执行迁移 013–015**，见 [RELEASE-v0.7.1.md](RELEASE-v0.7.1.md)。
+> 本轮发布：`v0.7.2`（套件 TiangZ 0.7.4）。相对 0.7.1 **没有运行时改动**：协议、Rust client/core、TS SDK 与数据库迁移都不变，升级不会执行新迁移；新增 Codecov 代码覆盖率（Rust 与 TS SDK），README 徽章移到标题下。见 [RELEASE-v0.7.2.md](RELEASE-v0.7.2.md)。
 
 # TiangZ DBProxy
+
+[![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)
+[![nightly acceptance](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml?query=event%3Aschedule)
+[![security](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/security.yml)
+[![codecov](https://codecov.io/gh/moulo1982Google/TiangZ-DBProxy/branch/main/graph/badge.svg)](https://codecov.io/gh/moulo1982Google/TiangZ-DBProxy)
+[![tag](https://img.shields.io/github/v/tag/moulo1982Google/TiangZ-DBProxy?label=tag&sort=semver)](https://github.com/moulo1982Google/TiangZ-DBProxy/tags)
+[![license](https://img.shields.io/github/license/moulo1982Google/TiangZ-DBProxy?label=license)](LICENSE)
 
 2026-10-07 11:12 R7新完整30/960/1440m全部通过，24h已于11:11:59完成120故障、300s空载、全量SQL/Redis及内存/容量独审；281179唯一事件/170一致重复，14954正常区间零错误。实际512MiB控制预算无OOM/swap，原回收压力保留；本轮进程/容器、guard及probe已停止，保护业务正常。详见[24h终验](docs/cloud-fault-soak-acceptance-2026-10-07.md)，旧失败/旧套件不自动补资格，未push/发布，下文为历史记录。
 
@@ -26,7 +33,7 @@
 
 0.7 PostgreSQL 排队与长稳错误观测见 [连接诊断](docs/postgres-queue-diagnostics.md)：分片/持有者/实际 backend PID、完整持有时长、修正排队超时计数及固定容量的晚期错误记录。
 
-当前版本为 `0.7.1`（正式版），服务与 Rust/TypeScript SDK 使用相同版本；相对 0.7.0 协议与 SDK 不变，服务端新增迁移 013–015。此前候选（0.7.0-rc.2、v0.7.0-rc1、v0.7.0-rc2）的标签与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题。
+当前版本为 `0.7.2`（正式版），服务与 Rust/TypeScript SDK 使用相同版本；相对 0.7.1 没有运行时改动，相对 0.7.0 协议与 SDK 不变，服务端新增迁移 013–015（0.7.1 引入）。此前候选（0.7.0-rc.2、v0.7.0-rc1、v0.7.0-rc2）的标签与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题。
 
 0.7 开发中的 Rust SDK 已补齐排队、重连和重试共享的[请求总预算](docs/client-request-budget.md)；新增“确定未发送”超时分类，默认值仍为 5 秒。TS SDK 的 [WithRequestBudget 作用域](docs/typescript-sdk.md)让 Repository 读取/重试共用期限，旧 Transport 不会被默默当作支持超时。宿主候选与发布验证状态见上述记录。
 
@@ -43,12 +50,6 @@
 0.7 增加独立[只读容量命令](docs/capacity-observation.md)，观察分区表/回执/事实/Outbox 的估算行数和物理字节，可显式开启有期限的服务器时间扫描；不执行迁移或自动清理。真实恢复契约与本轮隔离验证见[恢复验收记录](docs/v0.7-recovery-acceptance.md)。
 
 > 验收进度请先读[当前剩余清单（2026-09-29）](docs/acceptance-remaining-20260929.md)，历史证据见[索引与验收交接](docs/handoff-index-acceptance-20260922.md)。两小时测试及多项补测已完成；综合验收仍有缺口，不能把历史交接的未完成状态当作当前结论。
-
-[![Rust CI](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml)
-[![nightly acceptance](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml/badge.svg?event=schedule)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/ci.yml?query=event%3Aschedule)
-[![security](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/moulo1982Google/TiangZ-DBProxy/actions/workflows/security.yml)
-[![tag](https://img.shields.io/github/v/tag/moulo1982Google/TiangZ-DBProxy?label=tag&sort=semver)](https://github.com/moulo1982Google/TiangZ-DBProxy/tags)
-[![license](https://img.shields.io/github/license/moulo1982Google/TiangZ-DBProxy?label=license)](LICENSE)
 
 本地新增多租户入口 `--tenants`：凭据绑定独立后端，可共用 PostgreSQL/Redis 实例但分别使用独立 database/逻辑 DB；连接配额与观测按租户区分。原 --config 不变。用法、约束及真实存储未验收范围见 [多租户 v1](docs/multitenancy.md)。
 
