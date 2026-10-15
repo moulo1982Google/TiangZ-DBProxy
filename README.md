@@ -1,4 +1,4 @@
-> 本轮发布：`v0.7.2`（套件 TiangZ 0.7.4）。相对 0.7.1 **没有运行时改动**：协议、Rust client/core、TS SDK 与数据库迁移都不变，升级不会执行新迁移；新增 Codecov 代码覆盖率（Rust 与 TS SDK），README 徽章移到标题下。见 [RELEASE-v0.7.2.md](RELEASE-v0.7.2.md)。
+> 本轮发布：`v0.7.3`（DBProxy 单独发布）。新增多记录事务回执退休：`storage.operationReceiptRetentionDays`（默认 30 天）到期后删除回执、只留操作号标记，迟到查询或重提返回新错误码 `OPERATION_EXPIRED`（2007）；新增迁移 016；协议指纹改变但服务端仍接受旧客户端。所有实例需一起升级，退休执行后不能回滚。覆盖率统计改为包含真实库回归。见 [RELEASE-v0.7.3.md](RELEASE-v0.7.3.md)。
 
 # TiangZ DBProxy
 
@@ -9,7 +9,7 @@
 [![tag](https://img.shields.io/github/v/tag/moulo1982Google/TiangZ-DBProxy?label=tag&sort=semver)](https://github.com/moulo1982Google/TiangZ-DBProxy/tags)
 [![license](https://img.shields.io/github/license/moulo1982Google/TiangZ-DBProxy?label=license)](LICENSE)
 
-当前版本为 `0.7.2`（正式版），服务与 Rust/TypeScript SDK 使用相同版本；相对 0.7.1 没有运行时改动，相对 0.7.0 协议与 SDK 不变，服务端新增迁移 013–015（0.7.1 引入）。此前候选（0.7.0-rc.2、v0.7.0-rc1、v0.7.0-rc2）的标签与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题。
+当前版本为 `0.7.3`（正式版），服务与 Rust/TypeScript SDK 使用相同版本；相对 0.7.2 新增多记录事务回执退休、迁移 016 与错误码 `OPERATION_EXPIRED`（协议指纹改变，服务端仍接受 0.7.0–0.7.2 客户端）；0.7.1 引入迁移 013–015。此前候选（0.7.0-rc.2、v0.7.0-rc1、v0.7.0-rc2）的标签与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题。
 
 > 验收进度请先读[当前剩余清单（2026-09-29）](docs/acceptance-remaining-20260929.md)，历史证据见[索引与验收交接](docs/handoff-index-acceptance-20260922.md)。两小时测试及多项补测已完成；综合验收仍有缺口，不能把历史交接的未完成状态当作当前结论。
 
