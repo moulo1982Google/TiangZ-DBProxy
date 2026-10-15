@@ -6,11 +6,16 @@
 #        [--client shared4|shared8|split2|split4] [--pacing tokio|std] [--retention-hours 24]
 #        [--reconcile-budget 180] [--trickle N --trickle-span S [--trickle-lead 60]] [--background cleanup|all] [--fixture-expired 100000]
 #        [--fixture-recent 100000] [--drop-new-indexes 0|1]
+#        [--write-kind save|commit] [--retirement 0|1] [--fixture-ops-expired 0] [--fixture-ops-recent 0]
+# --retirement 1 runs multi-record receipt retirement in the cleanup-on rounds only (B2), so
+# --cleanup both alternates retirement off/on; --fixture-ops-* seed three-record receipts aged
+# 31 days (due) or fresh (must survive).
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 RUN_ID=""; RATE=200; SECONDS_=30; WARMUP=10; ROUNDS=3; PAYLOAD=1024; CONCURRENCY=32
 HOST_WORKERS=4; LOAD_WORKERS=32; CLEANUP=both; SQL_LOG_MS=-1; READ=shared; CLIENT=shared4; PACING=tokio
 RECONCILE_BUDGET=180; TRICKLE=0; TRICKLE_SPAN=0; TRICKLE_LEAD=60; RETENTION_HOURS=24; BACKGROUND=cleanup; FIXTURE_EXPIRED=100000; FIXTURE_RECENT=100000; DROP_NEW_INDEXES=0
+WRITE_KIND=save; RETIREMENT=0; FIXTURE_OPS_EXPIRED=0; FIXTURE_OPS_RECENT=0
 while [[ $# -gt 0 ]]; do
     case $1 in
         --run-id) RUN_ID=$2;; --rate) RATE=$2;; --seconds) SECONDS_=$2;; --warmup) WARMUP=$2;;
@@ -18,6 +23,7 @@ while [[ $# -gt 0 ]]; do
         --host-workers) HOST_WORKERS=$2;; --load-workers) LOAD_WORKERS=$2;; --cleanup) CLEANUP=$2;;
         --sql-log-ms) SQL_LOG_MS=$2;; --read) READ=$2;; --client) CLIENT=$2;; --pacing) PACING=$2;;
         --reconcile-budget) RECONCILE_BUDGET=$2;; --trickle) TRICKLE=$2;; --trickle-span) TRICKLE_SPAN=$2;; --trickle-lead) TRICKLE_LEAD=$2;; --retention-hours) RETENTION_HOURS=$2;; --background) BACKGROUND=$2;; --fixture-expired) FIXTURE_EXPIRED=$2;; --fixture-recent) FIXTURE_RECENT=$2;; --drop-new-indexes) DROP_NEW_INDEXES=$2;;
+        --write-kind) WRITE_KIND=$2;; --retirement) RETIREMENT=$2;; --fixture-ops-expired) FIXTURE_OPS_EXPIRED=$2;; --fixture-ops-recent) FIXTURE_OPS_RECENT=$2;;
         *) echo "unknown argument $1" >&2; exit 2;;
     esac
     shift 2
@@ -40,6 +46,8 @@ export ACCEPT_RECEIPT_RETENTION_HOURS=$RETENTION_HOURS
 # cleanup: receipt cleanup only (historical host); all: also backlog, cache repair and outbox workers.
 [[ $BACKGROUND =~ ^(cleanup|all)$ ]] || { echo "invalid --background" >&2; exit 2; }
 export ACCEPT_BACKGROUND=$BACKGROUND
+[[ $WRITE_KIND =~ ^(save|commit)$ && $RETIREMENT =~ ^[01]$ ]] || { echo "invalid --write-kind/--retirement" >&2; exit 2; }
+export ACCEPT_WRITE_KIND=$WRITE_KIND ACCEPT_RETIREMENT=$RETIREMENT
 
 TEMPLATE="${RUN_ID}_base"
 pg_createdb "$TEMPLATE"
@@ -63,8 +71,23 @@ FROM generate_series(1,$TRICKLE) n;
 ANALYZE dbproxy_idempotency;
 SQL
 fi
+# Multi-record receipt fixture: about 290-byte results and three 350-byte records per operation,
+# the sizes measured in a game's development database (2026-10-14).
+if (( FIXTURE_OPS_EXPIRED + FIXTURE_OPS_RECENT > 0 )); then
+    pg_db_sql "$TEMPLATE" >>"$ARTIFACTS/seed.log" <<SQL
+INSERT INTO dbproxy_operation_claims(operation_id,operation_kind,claimed_at)
+SELECT 'fx-op-'||n,'multi',CASE WHEN n<=$FIXTURE_OPS_EXPIRED THEN statement_timestamp()-interval '31 days' ELSE statement_timestamp() END
+FROM generate_series(1,$FIXTURE_OPS_EXPIRED+$FIXTURE_OPS_RECENT) n;
+INSERT INTO dbproxy_multi_transactions(operation_id,result,record_count,updated_at_unix_ms)
+SELECT 'fx-op-'||n,convert_to(repeat(md5(n::text),9),'UTF8'),3,1 FROM generate_series(1,$FIXTURE_OPS_EXPIRED+$FIXTURE_OPS_RECENT) n;
+INSERT INTO dbproxy_multi_transaction_records(operation_id,namespace,record_key,schema_name,schema_version,expected_revision,payload,updated_at_unix_ms,new_revision)
+SELECT 'fx-op-'||n,'fx-ops',n||'-'||k,'test',1,0,convert_to(repeat(md5(n::text||k),11),'UTF8'),1,1
+FROM generate_series(1,$FIXTURE_OPS_EXPIRED+$FIXTURE_OPS_RECENT) n, generate_series(1,3) k;
+ANALYZE dbproxy_operation_claims; ANALYZE dbproxy_multi_transactions; ANALYZE dbproxy_multi_transaction_records;
+SQL
+fi
 cat >"$ARTIFACTS/manifest.json" <<EOF
-{"RunId":"$RUN_ID","Rate":$RATE,"Seconds":$SECONDS_,"WarmupSeconds":$WARMUP,"Rounds":$ROUNDS,"PayloadBytes":$PAYLOAD,"Concurrency":$CONCURRENCY,"HostWorkers":$HOST_WORKERS,"LoadWorkers":$LOAD_WORKERS,"CleanupMode":"$CLEANUP","SqlLogThresholdMs":$SQL_LOG_MS,"ReadConnection":"$READ","ClientConnections":"$CLIENT","PacingTimer":"$PACING","FixtureRecent":$FIXTURE_RECENT,"FixtureExpired":$FIXTURE_EXPIRED,"DropNewIndexesAfterStartup":$DROP_NEW_INDEXES,"FixtureTrickle":$TRICKLE,"FixtureTrickleSpanSeconds":$TRICKLE_SPAN,"FixtureTrickleLeadSeconds":$TRICKLE_LEAD,"ReconcileBudgetSeconds":$RECONCILE_BUDGET,"ReceiptRetentionHours":$RETENTION_HOURS,"BackgroundWorkers":"$BACKGROUND","FullAcceptance":false,"Environment":"container-only workbench on $(hostname), cpuset $(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || echo unknown)"}
+{"RunId":"$RUN_ID","Rate":$RATE,"Seconds":$SECONDS_,"WarmupSeconds":$WARMUP,"Rounds":$ROUNDS,"PayloadBytes":$PAYLOAD,"Concurrency":$CONCURRENCY,"HostWorkers":$HOST_WORKERS,"LoadWorkers":$LOAD_WORKERS,"CleanupMode":"$CLEANUP","SqlLogThresholdMs":$SQL_LOG_MS,"ReadConnection":"$READ","ClientConnections":"$CLIENT","PacingTimer":"$PACING","FixtureRecent":$FIXTURE_RECENT,"FixtureExpired":$FIXTURE_EXPIRED,"DropNewIndexesAfterStartup":$DROP_NEW_INDEXES,"FixtureTrickle":$TRICKLE,"FixtureTrickleSpanSeconds":$TRICKLE_SPAN,"FixtureTrickleLeadSeconds":$TRICKLE_LEAD,"ReconcileBudgetSeconds":$RECONCILE_BUDGET,"ReceiptRetentionHours":$RETENTION_HOURS,"BackgroundWorkers":"$BACKGROUND","WriteKind":"$WRITE_KIND","Retirement":$RETIREMENT,"FixtureOpsExpired":$FIXTURE_OPS_EXPIRED,"FixtureOpsRecent":$FIXTURE_OPS_RECENT,"FullAcceptance":false,"Environment":"container-only workbench on $(hostname), cpuset $(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || echo unknown)"}
 EOF
 json_sha256 "$HOST_EXE" "$LOAD_EXE" >"$ARTIFACTS/binaries.json"
 
@@ -101,6 +124,8 @@ for ((round = 1; round <= ROUNDS; round++)); do
         if [[ $status -eq 0 ]]; then
             pg_db_sql "$name" -At -c "SELECT count(*) FILTER (WHERE recorded_at < statement_timestamp()-make_interval(hours => $RETENTION_HOURS)),count(*) FILTER (WHERE recorded_at >= statement_timestamp()-make_interval(hours => $RETENTION_HOURS)) FROM dbproxy_idempotency WHERE namespace='probe-fixture'" >"$folder/remaining.txt"
             pg_db_sql "$name" -At -c "SELECT count(*) FILTER (WHERE recorded_at < statement_timestamp()-make_interval(hours => $RETENTION_HOURS)),count(*) FILTER (WHERE recorded_at >= statement_timestamp()-make_interval(hours => $RETENTION_HOURS)) FROM dbproxy_idempotency WHERE namespace='probe-trickle'" >"$folder/remaining-trickle.txt"
+            # Due / retired fixture operations, untouched fresh ones, and receipts written by the load.
+            pg_db_sql "$name" -At -c "SELECT count(*) FILTER (WHERE c.operation_id LIKE 'fx-op-%' AND c.retired_at IS NOT NULL), count(*) FILTER (WHERE c.operation_id LIKE 'fx-op-%' AND c.retired_at IS NULL AND c.claimed_at < statement_timestamp()-interval '30 days'), (SELECT count(*) FROM dbproxy_multi_transactions h WHERE h.operation_id LIKE 'fx-op-%'), count(*) FILTER (WHERE c.operation_id NOT LIKE 'fx-op-%' AND c.retired_at IS NOT NULL) FROM dbproxy_operation_claims c" >"$folder/remaining-ops.txt"
             echo "PASS round=$round cleanup=$mode"
             cat "$folder/summary.json"
         fi

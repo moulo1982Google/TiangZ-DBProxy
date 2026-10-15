@@ -7,7 +7,8 @@ use tiangz_dbproxy_core::{
 use tiangz_dbproxy_server::{
     BackendError, DbProxyBackend, DbProxyMetrics, DbProxyServer, RetryWorkerPolicy, ServerConfig,
     StorageBackend, StorageBackendConfig, run_backlog_worker_observed,
-    run_cache_repair_worker_observed, run_outbox_worker_observed, run_receipt_cleanup_worker,
+    run_cache_repair_worker_observed, run_operation_retirement_worker, run_outbox_worker_observed,
+    run_receipt_cleanup_worker,
 };
 use tokio::sync::watch;
 
@@ -123,6 +124,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             shutdown.clone(),
         ))
     });
+    // ACCEPT_RETIREMENT=1 adds multi-record receipt retirement to the cleanup-on rounds only, so a
+    // paired run compares retirement off (B1) with on (B2). ACCEPT_OPERATION_RETENTION_DAYS
+    // defaults to the server default (30 days).
+    let operation_retention = match std::env::var("ACCEPT_OPERATION_RETENTION_DAYS") {
+        Ok(days) => Duration::from_secs(days.parse::<u64>()? * 86_400),
+        Err(_) => tiangz_dbproxy_storage::DEFAULT_OPERATION_RECEIPT_RETENTION,
+    };
+    tiangz_dbproxy_storage::validate_operation_receipt_retention(operation_retention)?;
+    let retirement = (mode == "on" && std::env::var("ACCEPT_RETIREMENT").as_deref() == Ok("1"))
+        .then(|| {
+            tokio::spawn(run_operation_retirement_worker(
+                backend.clone(),
+                "acceptance".into(),
+                operation_retention,
+                Arc::new(DbProxyMetrics::default()),
+                shutdown.clone(),
+            ))
+        });
     // ACCEPT_BACKGROUND=all also runs the production background workers (one each, with the
     // server config defaults); `cleanup` (default) keeps the historical receipt-cleanup-only host
     // so older runs stay comparable. Without the cache repair worker, dbproxy_cache_repairs only
@@ -167,7 +186,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )));
     }
     println!(
-        "READY cleanup={mode} reads={read_mode} shards={shard_count} background={background} workers={} endpoint={}",
+        "READY cleanup={mode} retirement={} reads={read_mode} shards={shard_count} background={background} workers={} endpoint={}",
+        retirement.is_some(),
         tokio::runtime::Handle::current().metrics().num_workers(),
         server.local_addr()?
     );
@@ -211,6 +231,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::timeout(Duration::from_secs(15), serving).await???;
     if let Some(cleanup) = cleanup {
         tokio::time::timeout(Duration::from_secs(5), cleanup).await??;
+    }
+    if let Some(retirement) = retirement {
+        tokio::time::timeout(Duration::from_secs(10), retirement).await??;
     }
     for worker in background_workers {
         tokio::time::timeout(Duration::from_secs(35), worker).await??;

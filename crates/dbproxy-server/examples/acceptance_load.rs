@@ -1,5 +1,7 @@
 //! Fixed-rate ordinary read/write probe with bounded in-flight requests and durable evidence.
-//! Deliberately not the full six-operation acceptance workload.
+//! Deliberately not the full six-operation acceptance workload. ACCEPT_WRITE_KIND=commit turns
+//! every write into one CommitRecords of two distinct records (no effects), so multi-record
+//! receipts and their claim locking are on the measured path.
 #[path = "support/client_timing.rs"]
 mod client_timing;
 use serde_json::json;
@@ -10,7 +12,10 @@ use std::{
     time::Duration,
 };
 use tiangz_dbproxy_client::{ClientConfig, DbProxyClientPool};
-use tiangz_dbproxy_core::{RecordKey, Revision, SnapshotWrite, SnapshotWriteOutcome};
+use tiangz_dbproxy_core::{
+    CommitEffects, MultiRecordTransactionalWrite, MultiRecordTransactionalWriteOutcome, RecordKey,
+    Revision, SnapshotWrite, SnapshotWriteOutcome, TransactionalRecordWrite,
+};
 use tokio::{sync::Semaphore, task::JoinSet, time::Instant};
 
 fn number(name: &str) -> u64 {
@@ -25,6 +30,25 @@ fn request(run: &str, n: u64, bytes: usize) -> SnapshotWrite {
         payload: vec![(n % 251) as u8; bytes],
         expected_revision: Some(Revision::ZERO),
         updated_at_unix_ms: 1,
+    }
+}
+/// The two records of commit write `n`; both carry the same payload as the plain write would.
+fn commit(run: &str, n: u64, bytes: usize) -> MultiRecordTransactionalWrite {
+    let plain = request(run, n, bytes);
+    MultiRecordTransactionalWrite {
+        operation_id: format!("{run}-op-{n}"),
+        writes: ["a", "b"]
+            .into_iter()
+            .map(|side| TransactionalRecordWrite {
+                record: RecordKey::new("accept-commit", format!("{run}-{n}-{side}")).unwrap(),
+                schema: plain.schema.clone(),
+                schema_version: plain.schema_version,
+                expected_revision: Revision::ZERO,
+                payload: plain.payload.clone(),
+                updated_at_unix_ms: plain.updated_at_unix_ms,
+            })
+            .collect(),
+        result: format!("result-{n}").into_bytes(),
     }
 }
 fn percentile(values: &mut [u64], percent: usize) -> u64 {
@@ -58,6 +82,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Fault mode only moves the error/not-sent verdict to the per-phase analysis of the fault
     // run; data mismatches and lost diagnostics still fail here. Normal runs are unchanged.
     let fault_mode = std::env::var("ACCEPT_FAULT_MODE").as_deref() == Ok("1");
+    let write_kind = std::env::var("ACCEPT_WRITE_KIND").unwrap_or_else(|_| "save".into());
+    if write_kind != "save" && write_kind != "commit" {
+        return Err("ACCEPT_WRITE_KIND must be save or commit".into());
+    }
+    let commit_writes = write_kind == "commit";
     assert!(rate > 0 && seconds > 0 && concurrency > 0 && (1..=16384).contains(&bytes));
     let mut config = ClientConfig::new(
         std::env::var("ACCEPT_LISTEN")?,
@@ -93,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     writeln!(
         ledger,
         "{}",
-        json!({"kind":"manifest","run":run,"client_connections":client_connections,"pacing_timer":pacing,"rate":rate,"warmup_seconds":warmup,"sample_seconds":seconds,"payload_bytes":bytes,"concurrency":concurrency,"mix":"50% immutable reads, 50% distinct-key CAS writes","payload_rule":"n modulo 251 repeated payload_bytes","expected_revision":0})
+        json!({"kind":"manifest","run":run,"client_connections":client_connections,"pacing_timer":pacing,"rate":rate,"warmup_seconds":warmup,"sample_seconds":seconds,"payload_bytes":bytes,"concurrency":concurrency,"mix":if commit_writes {"50% immutable reads, 50% two-record CommitRecords on distinct keys"} else {"50% immutable reads, 50% distinct-key CAS writes"},"write_kind":write_kind,"payload_rule":"n modulo 251 repeated payload_bytes","expected_revision":0})
     )?;
     ledger.flush()?;
     let slots = Arc::new(Semaphore::new(concurrency));
@@ -145,7 +174,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tasks.spawn(async move {
             let _permit = permit;
             let sent = Instant::now();
-            let outcome: Result<bool, String> = if n.is_multiple_of(2) {
+            let outcome: Result<bool, String> = if n.is_multiple_of(2) && commit_writes {
+                pool.commit_records(commit(&run, n, bytes), CommitEffects::default())
+                    .await
+                    .map(|x| match x {
+                        MultiRecordTransactionalWriteOutcome::Applied { records, result } => {
+                            result == format!("result-{n}").into_bytes()
+                                && records.len() == 2
+                                && records.iter().all(|r| r.new_revision == Revision(1))
+                        }
+                        MultiRecordTransactionalWriteOutcome::Duplicate { .. } => false,
+                    })
+                    .map_err(|e| e.to_string())
+            } else if n.is_multiple_of(2) {
                 pool.save(request(&run, n, bytes))
                     .await
                     .map(|x| {
@@ -245,17 +286,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some((n, ok)) = pending.next() else { break };
             let pool = pool.clone();
             let expected = request(&run, n, bytes);
+            let commit = commit_writes.then(|| commit(&run, n, bytes));
             checking.spawn(async move {
-                let saved = pool.load(&expected.record).await;
-                (n, ok, expected, saved)
+                let Some(commit) = commit else {
+                    let saved = pool.load(&expected.record).await;
+                    return (n, ok, expected, saved, None);
+                };
+                // The pair must agree: neither record (rolled back) or both exactly the intended
+                // revision-1 write. Record "a" then goes through the ordinary check below.
+                let a = pool.load(&commit.writes[0].record).await;
+                let b = pool.load(&commit.writes[1].record).await;
+                match (a, b) {
+                    (Ok(a), Ok(b)) => {
+                        let pair = a.is_some() == b.is_some()
+                            && b.is_none_or(|b| {
+                                b.revision == Revision(1) && b.payload == expected.payload
+                            });
+                        (n, ok, expected, Ok(a), Some(pair))
+                    }
+                    (Err(e), _) | (_, Err(e)) => (n, ok, expected, Err(e), None),
+                }
             });
         }
         let Some(result) = checking.join_next().await else {
             break;
         };
-        let (n, ok, expected, saved) = result?;
+        let (n, ok, expected, saved, atomic) = result?;
         let saved = saved?;
         let committed = saved.is_some();
+        if atomic == Some(false) {
+            mismatches += 1;
+            checked += 1;
+            writeln!(
+                checks,
+                "{}",
+                json!({"n":n,"matches":false,"outcome_ok":ok,"committed":committed,"pair_mismatch":true})
+            )?;
+            continue;
+        }
         // Whatever exists must be exactly the intended write; a confirmed write must exist.
         // An errored or unknown write may be absent (rolled back) or committed, never half-written.
         let consistent =
@@ -285,7 +353,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "client timing drain did not stop within 30 s")?;
     let drain_stats = drain??;
     let timing_stop_us = stop_started.elapsed().as_micros() as u64;
-    let summary = json!({"run":run,"target_rate":rate,"sample_seconds":seconds,"actual_elapsed_seconds_including_warmup_and_drain":actual_elapsed_seconds,"sample_responses":latencies.len(),"sample_not_sent":sample_dropped,"all_not_sent":dropped,"all_response_errors_or_wrong_data":errors,"writes_checked":checked,"mismatches":mismatches,"p50_us":percentile(&mut latencies,50),"p95_us":percentile(&mut latencies,95),"p99_us":percentile(&mut latencies,99),"dispatch_p99_us":percentile(&mut delays,99),"full_acceptance":false,"pacing_timer":pacing,"start_unix_us":start_unix_us,"client_timing_dropped":timing_dropped,"client_timing_channel_capacity":client_timing::CHANNEL_CAPACITY,"client_timing_drain":drain_stats,"client_timing_stop_us":timing_stop_us,"fault_mode":fault_mode,"reconcile_seconds":reconcile_seconds,"reconcile_concurrency":reconcile_concurrency});
+    let summary = json!({"run":run,"target_rate":rate,"sample_seconds":seconds,"actual_elapsed_seconds_including_warmup_and_drain":actual_elapsed_seconds,"sample_responses":latencies.len(),"sample_not_sent":sample_dropped,"all_not_sent":dropped,"all_response_errors_or_wrong_data":errors,"writes_checked":checked,"mismatches":mismatches,"p50_us":percentile(&mut latencies,50),"p95_us":percentile(&mut latencies,95),"p99_us":percentile(&mut latencies,99),"dispatch_p99_us":percentile(&mut delays,99),"full_acceptance":false,"pacing_timer":pacing,"start_unix_us":start_unix_us,"client_timing_dropped":timing_dropped,"client_timing_channel_capacity":client_timing::CHANNEL_CAPACITY,"client_timing_drain":drain_stats,"client_timing_stop_us":timing_stop_us,"fault_mode":fault_mode,"reconcile_seconds":reconcile_seconds,"reconcile_concurrency":reconcile_concurrency,"write_kind":write_kind});
     std::fs::write(
         dir.join("summary.json"),
         serde_json::to_vec_pretty(&summary)?,
