@@ -119,6 +119,12 @@ pub enum StoreError {
     IdempotencyConflict { request_id: String },
     #[error("transaction operation {operation_id} was already used for another request")]
     OperationIdConflict { operation_id: String },
+    /// 操作号用过，但回执已过保留期被回收：结果无法再查询或重放，不代表没执行。
+    /// The operation id was used and its receipt retired; the outcome is unknown, not absent.
+    #[error(
+        "transaction operation {operation_id} receipt has expired; its outcome can no longer be read or replayed"
+    )]
+    OperationExpired { operation_id: String },
     #[error("queued snapshot {record:?} must not carry an expected revision")]
     QueuedSnapshotRequiresUnconditionalWrite { record: RecordKey },
     #[error("revision conflict for {record:?}: expected {expected:?}, actual {actual:?}")]

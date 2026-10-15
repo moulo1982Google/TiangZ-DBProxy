@@ -42,6 +42,8 @@ export enum DbProxyErrorCode {
   TradeConflict = 2004,
   LedgerConflict = 2005,
   OutboxConflict = 2006,
+  /** 操作号用过，但回执已过保留期被回收：结果未知，不能当成“没执行过”。 / Receipt retired; outcome unknown, not "never executed". */
+  OperationExpired = 2007,
   StorageUnavailable = 3001,
   Internal = 9000,
 }

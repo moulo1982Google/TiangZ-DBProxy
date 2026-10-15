@@ -13,6 +13,9 @@ enum ErrorCode {
   ERROR_CODE_TRADE_CONFLICT = 2004;
   ERROR_CODE_LEDGER_CONFLICT = 2005;
   ERROR_CODE_OUTBOX_CONFLICT = 2006;
+  // The operation id was used, but its multi-record receipt has been retired. The outcome can no
+  // longer be read or replayed; it is not "never executed".
+  ERROR_CODE_OPERATION_EXPIRED = 2007;
   ERROR_CODE_STORAGE_UNAVAILABLE = 3001;
   ERROR_CODE_INTERNAL = 9000;
 }

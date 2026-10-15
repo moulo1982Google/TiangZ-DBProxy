@@ -2719,6 +2719,11 @@ impl RpcFailure {
                     actual_revision: None,
                 }
             }
+            StoreError::OperationExpired { .. } => Self {
+                code: wire::ErrorCode::OperationExpired,
+                public_message: error.to_string(),
+                actual_revision: None,
+            },
             StoreError::RevisionConflict { actual, .. } => Self {
                 code: wire::ErrorCode::RevisionConflict,
                 public_message: error.to_string(),
@@ -2841,6 +2846,55 @@ pub async fn run_receipt_cleanup_worker(
             Err(error) => {
                 metrics.receipt_cleanup_completed(None);
                 tracing::warn!(%tenant, %error, "ordinary receipt cleanup failed; retry in 60 seconds");
+                Duration::from_secs(60)
+            }
+        };
+        tokio::select! {
+            _ = sleep(delay) => {},
+            _ = shutdown.changed() => { if *shutdown.borrow() || shutdown.has_changed().is_err() { return; } }
+        }
+    }
+}
+
+/// 多记录事务回执退休：每租户一个任务，与普通回执清理共用维护连接（互斥串行）。满批停 1 秒，空闲或失败停 1 分钟。
+/// Multi-record receipt retirement, one task per tenant, sharing the receipt-cleanup maintenance
+/// connection (serialized by its lock). Full batches pause one second, idle/failing ones a minute.
+pub async fn run_operation_retirement_worker(
+    backend: Arc<StorageBackend>,
+    tenant: String,
+    retention: Duration,
+    metrics: Arc<DbProxyMetrics>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tracing::info!(
+        %tenant,
+        retention_days = retention.as_secs_f64() / 86_400.0,
+        "multi-record receipt retirement started"
+    );
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let delay = match backend
+            .receipt_cleanup
+            .retire_expired_operations(retention)
+            .await
+        {
+            Ok(retired) => {
+                metrics.operation_retirement_completed(Some(retired));
+                if retired > 0 {
+                    tracing::info!(%tenant, retired, elapsed_ms = started.elapsed().as_millis() as u64, "multi-record receipts retired");
+                }
+                if retired == tiangz_dbproxy_storage::OPERATION_RETIREMENT_BATCH_SIZE {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_secs(60)
+                }
+            }
+            Err(error) => {
+                metrics.operation_retirement_completed(None);
+                tracing::warn!(%tenant, %error, "multi-record receipt retirement failed; retry in 60 seconds");
                 Duration::from_secs(60)
             }
         };
