@@ -62,7 +62,7 @@ jobs:
           cargo llvm-cov --no-report --locked -p tiangz-dbproxy-storage --test postgres_redis -- --ignored --test-threads=1
           cargo llvm-cov --no-report --locked -p tiangz-dbproxy-server --test postgres_redis_network -- --ignored --test-threads=1
       - name: 生成合并报告
-        run: cargo llvm-cov report --lcov --output-path rust-lcov.info
+        run: cargo llvm-cov report --workspace --lcov --output-path rust-lcov.info
       - name: 上传到 Codecov
         uses: codecov/codecov-action@v5
         with:
