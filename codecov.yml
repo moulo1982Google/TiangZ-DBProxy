@@ -20,6 +20,12 @@ flags:
     paths:
       - sdk/typescript/src/
 
+# 根包 src/bin 下是压测、浸泡与探针工具，不随服务发布，不计入覆盖率；示例程序同理。
+# The src/bin load, soak and probe tools and the examples are test harnesses, not shipped service code.
+ignore:
+  - "src/bin/**"
+  - "crates/*/examples/**"
+
 comment:
   layout: "condensed_header, diff, flags, files"
   require_changes: true

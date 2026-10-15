@@ -1,7 +1,10 @@
 name: coverage
 
-# 代码覆盖率：Rust 工作区的默认测试（不含需要真实 PostgreSQL/Redis 的 #[ignore] 用例）加 TypeScript SDK 测试，上传 Codecov（仓库密钥 CODECOV_TOKEN）。
-# Code coverage: default Rust workspace tests (the #[ignore] cases that need real PostgreSQL/Redis are not included) plus the TypeScript SDK tests, uploaded to Codecov.
+# 代码覆盖率：Rust 工作区默认测试，加上 CI 已经在真实 PostgreSQL/Redis 上跑的 #[ignore] 回归（每组用新库），合并成一份报告；
+# 再加 TypeScript SDK 测试。上传 Codecov（仓库密钥 CODECOV_TOKEN）。
+# Code coverage: default Rust workspace tests plus the #[ignore] real PostgreSQL/Redis regressions that CI already runs
+# (a fresh database per suite), merged into one report; plus the TypeScript SDK tests. Uploaded to Codecov.
+# Docker fault matrices, scale/cost probes and process acceptance stay out: they kill containers or need release binaries.
 permissions:
   contents: read
 
@@ -13,7 +16,12 @@ jobs:
   rust:
     name: Rust 覆盖率
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION: "1"
+      DBPROXY_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz
+      DBPROXY_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6379/0
+      DBPROXY_CACHE_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6379/0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -23,8 +31,36 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      - name: 工作区默认测试覆盖率
-        run: cargo llvm-cov --workspace --locked --lcov --output-path rust-lcov.info
+      - name: 启动 PostgreSQL 与 Redis
+        run: |
+          cp deploy/local/.env.example deploy/local/.env
+          docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml up -d --wait postgres redis
+      - name: 工作区默认测试
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --no-report --workspace --locked
+      - name: 真实 PostgreSQL 回归（每组新库）
+        run: |
+          set -euo pipefail
+          suite() {
+            local db=$1; shift
+            docker exec tiangz-dbproxy-postgres createdb -U tiangz "$db"
+            DBPROXY_TEST_POSTGRES_URL="postgres://tiangz:tiangz_dev@127.0.0.1:5432/$db" \
+              cargo llvm-cov --no-report --locked "$@" -- --ignored --test-threads=1
+          }
+          suite cov_indexes -p tiangz-dbproxy-storage --test schema_indexes
+          suite cov_plans -p tiangz-dbproxy-storage --test query_plans --test repair_claim_plans --test outbox_hybrid_plans
+          suite cov_outbox -p tiangz-dbproxy-storage --test outbox_concurrency
+          suite cov_receipts -p tiangz-dbproxy-storage --test receipt_retention
+          suite cov_retirement -p tiangz-dbproxy-storage --test operation_retirement
+          suite cov_repair -p tiangz-dbproxy-storage --test cache_repair_concurrency
+          suite cov_worker -p tiangz-dbproxy-server --test receipt_cleanup_worker
+      - name: 真实 PostgreSQL + Redis 存储与网络闭环
+        run: |
+          cargo llvm-cov --no-report --locked -p tiangz-dbproxy-storage --test postgres_redis -- --ignored --test-threads=1
+          cargo llvm-cov --no-report --locked -p tiangz-dbproxy-server --test postgres_redis_network -- --ignored --test-threads=1
+      - name: 生成合并报告
+        run: cargo llvm-cov report --lcov --output-path rust-lcov.info
       - name: 上传到 Codecov
         uses: codecov/codecov-action@v5
         with:
@@ -32,6 +68,9 @@ jobs:
           files: rust-lcov.info
           flags: rust
           fail_ci_if_error: true
+      - name: 清理测试容器
+        if: always()
+        run: docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml down -v --remove-orphans
 
   typescript:
     name: TypeScript SDK 覆盖率
@@ -45,12 +84,23 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build:typescript
-      - name: SDK 测试覆盖率（经 source map 映射回 TypeScript 源文件）
-        run: node --enable-source-maps --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=sdk-lcov.info sdk/typescript/test/*.test.mjs
+      # Node 一次跑多个测试文件时，合并各子进程的覆盖率会丢掉大量已执行的行（实测把约 90% 报成 43%）。
+      # 每个文件单独出一份报告，由 Codecov 取并集。
+      # Node mis-merges coverage across test-file subprocesses (about 90% was reported as 43%);
+      # emit one report per file and let Codecov take the union.
+      - name: SDK 测试覆盖率（经 source map 映射回 TypeScript 源文件，逐文件）
+        run: |
+          set -euo pipefail
+          for file in sdk/typescript/test/*.test.mjs; do
+            name=$(basename "$file" .test.mjs)
+            node --enable-source-maps --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout \
+              --test-reporter=lcov --test-reporter-destination="sdk-lcov-$name.info" "$file"
+          done
+          ls sdk-lcov-*.info
       - name: 上传到 Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: sdk-lcov.info
+          files: ./sdk-lcov-*.info
           flags: typescript
           fail_ci_if_error: true
