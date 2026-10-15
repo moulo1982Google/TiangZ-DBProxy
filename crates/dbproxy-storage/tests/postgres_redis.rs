@@ -407,6 +407,7 @@ async fn postgres_snapshot_table_uses_32_hash_partitions() {
             (13, "query-indexes".to_string()),
             (14, "cache-repair-claim-indexes".to_string()),
             (15, "receipt-retention".to_string()),
+            (16, "operation-retirement".to_string()),
         ]
     );
 

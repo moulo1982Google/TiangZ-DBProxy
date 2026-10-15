@@ -20,6 +20,8 @@ jobs:
     env:
       DBPROXY_TEST_ALLOW_SCHEMA_MIGRATION: "1"
       DBPROXY_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz
+      # Same as the release acceptance job: the storage suite's request-shard tests need it too.
+      DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/tiangz
       DBPROXY_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6379/0
       DBPROXY_CACHE_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6379/0
     steps:
