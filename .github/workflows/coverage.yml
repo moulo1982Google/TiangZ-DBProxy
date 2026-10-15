@@ -44,11 +44,16 @@ jobs:
       - name: 真实 PostgreSQL 回归（每组新库）
         run: |
           set -euo pipefail
+          # suite <db> <cargo selection...> [:: <test filter>]; cargo llvm-cov reads a bare test
+          # name as a subcommand, so a filter goes to the test binary after "--".
           suite() {
             local db=$1; shift
+            local selection=() filter=()
+            while [ $# -gt 0 ] && [ "$1" != "::" ]; do selection+=("$1"); shift; done
+            if [ "${1:-}" = "::" ]; then shift; filter=("$@"); fi
             docker exec tiangz-dbproxy-postgres createdb -U tiangz "$db"
             DBPROXY_TEST_POSTGRES_URL="postgres://tiangz:tiangz_dev@127.0.0.1:5432/$db" \
-              cargo llvm-cov --no-report --locked "$@" -- --ignored --test-threads=1
+              cargo llvm-cov --no-report --locked "${selection[@]}" -- --ignored --test-threads=1 "${filter[@]}"
           }
           suite cov_indexes -p tiangz-dbproxy-storage --test schema_indexes
           suite cov_plans -p tiangz-dbproxy-storage --test query_plans --test repair_claim_plans --test outbox_hybrid_plans
@@ -58,11 +63,12 @@ jobs:
           suite cov_repair -p tiangz-dbproxy-storage --test cache_repair_concurrency
           suite cov_worker -p tiangz-dbproxy-server --test receipt_cleanup_worker
           # Library-internal real-database tests (read pool, connection diagnostics); exact names.
-          suite cov_read_pool -p tiangz-dbproxy-storage --lib postgres_read_pool::tests::real_read_pool_paths_capacity_cancellation_and_reconnect
-          suite cov_diagnostics -p tiangz-dbproxy-storage --lib postgres_diagnostics::tests::real_postgres_identity_reconnect_and_contention
+          suite cov_read_pool -p tiangz-dbproxy-storage --lib :: postgres_read_pool::tests::real_read_pool_paths_capacity_cancellation_and_reconnect
+          suite cov_diagnostics -p tiangz-dbproxy-storage --lib :: postgres_diagnostics::tests::real_postgres_identity_reconnect_and_contention
           # Capacity sampling refuses any database not named v07_capacity.
           docker exec tiangz-dbproxy-postgres createdb -U tiangz v07_capacity
-          DBPROXY_CAPACITY_TEST_URL=postgres://tiangz:tiangz_dev@127.0.0.1:5432/v07_capacity             cargo llvm-cov --no-report --locked -p tiangz-dbproxy-storage --lib capacity::tests::postgres -- --ignored --test-threads=1
+          DBPROXY_CAPACITY_TEST_URL=postgres://tiangz:tiangz_dev@127.0.0.1:5432/v07_capacity \
+            cargo llvm-cov --no-report --locked -p tiangz-dbproxy-storage --lib -- --ignored --test-threads=1 capacity::tests::postgres
       - name: 真实 PostgreSQL + Redis 存储与网络闭环
         run: |
           cargo llvm-cov --no-report --locked -p tiangz-dbproxy-storage --test postgres_redis -- --ignored --test-threads=1
