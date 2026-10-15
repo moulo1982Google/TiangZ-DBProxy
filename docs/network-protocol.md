@@ -10,6 +10,8 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 
 PostgreSQL 普通快照 `request_id` 回执至少保留配置的时长（`storage.receiptRetentionHours`，默认 24 小时，下限 1 小时），后台之后分批清理。回执删除后不再保证返回旧结果：带版本检查的请求仍检查版本，无版本检查的请求可能再次执行。事务 `operation_id` 回执不参与这次清理。详见[回执保留规则](record-deletion-and-receipt-retention.md)。
 
+多记录事务回执（`ApplyMultiTransaction` / 不带效果的 `CommitRecords`）保留 `storage.operationReceiptRetentionDays`（默认 30 天，1–3650）。之后删除事务头和回执记录，操作号只留“已退休”标记；再查询或原样重提这个操作号，返回 `OPERATION_EXPIRED`（2007），**不会返回“查无回执”，也不会重新执行**。带追加记录或 Outbox 事件的操作不退休。单记录事务和交易回执不受影响。详见[回执保留规则](record-deletion-and-receipt-retention.md)附录二。
+
 ## 帧、大小与握手
 
 ```text
@@ -22,7 +24,7 @@ PostgreSQL 普通快照 `request_id` 回执至少保留配置的时长（`storag
 - 交易 Posting 最多 512 条，Outbox 事件最多 64 条；
 - 所有 ID、Schema、topic 等文本都有 UTF-8 字节上限，topic 仅允许字母、数字、`.`、`_`、`-`。
 
-第一帧必须是 `ClientHello(protocol_version, protocol_fingerprint, auth_token, client_name)`。当前握手版本是 2，fingerprint 是权威 proto 先统一为 LF 后的 SHA-256。server 精确接受当前指纹及 `LEGACY_PROTOCOL_FINGERPRINT_V2`、`PRE_COMMIT_PROTOCOL_FINGERPRINT_V2`、`PRE_RELAY_PROTOCOL_FINGERPRINT_V2` 及 `PRE_AUTHORITATIVE_PROTOCOL_FINGERPRINT_V2` 四个已知旧指纹，并向连接回显客户端原值；具体清单以 `dbproxy-protocol/src/lib.rs` 为准。未列出的指纹或不匹配的版本不进入 RPC 调度。proto 的 package 名保留 `tiangz.dbproxy.v1` 只是生成代码命名空间；兼容性由握手版本和指纹共同决定。
+第一帧必须是 `ClientHello(protocol_version, protocol_fingerprint, auth_token, client_name)`。当前握手版本是 2，fingerprint 是权威 proto 先统一为 LF 后的 SHA-256。server 精确接受当前指纹及 `PRE_OPERATION_EXPIRED_PROTOCOL_FINGERPRINT_V2`、`LEGACY_PROTOCOL_FINGERPRINT_V2`、`PRE_COMMIT_PROTOCOL_FINGERPRINT_V2`、`PRE_RELAY_PROTOCOL_FINGERPRINT_V2` 及 `PRE_AUTHORITATIVE_PROTOCOL_FINGERPRINT_V2` 五个已知旧指纹，并向连接回显客户端原值；具体清单以 `dbproxy-protocol/src/lib.rs` 为准。未列出的指纹或不匹配的版本不进入 RPC 调度。proto 的 package 名保留 `tiangz.dbproxy.v1` 只是生成代码命名空间；兼容性由握手版本和指纹共同决定。
 
 升级方向是服务端先行：先完成服务端及其数据库迁移的受控切换，再更新客户端。新客户端要求精确的版本/指纹和 `supports_outbox_relay`，不会主动降级到旧服务端。A3 的候选跳过只保证继续寻找兼容服务端，不代表旧服务端可以处理新请求，也不保证混版本的存储/队列语义。所有候选均不兼容时应保留明确拒绝原因并修正部署版本，不能放宽握手检查来掩盖问题。
 
@@ -76,6 +78,7 @@ PostgreSQL 普通快照 `request_id` 回执至少保留配置的时长（`storag
 | `TRADE_CONFLICT` (2004) | 交易版本或状态冲突 | 重新加载交易并由业务决策 |
 | `LEDGER_CONFLICT` (2005) | Posting ID 已被其他已提交操作占用 | 修交易计划；非法/不平衡请求返回 `INVALID_REQUEST` |
 | `OUTBOX_CONFLICT` (2006) | Event ID 已被其他已提交操作占用 | 修事件计划；非法事件返回 `INVALID_REQUEST` |
+| `OPERATION_EXPIRED` (2007) | 多记录事务的操作号用过，但回执已过保留期被回收 | 结果未知，**不能当成没执行过**；不要换新操作号重做，按当前权威数据重新判断。旧客户端不认识这个码，会当成 `INTERNAL`，同样按结果未知处理 |
 | `STORAGE_UNAVAILABLE` (3001) | PostgreSQL/Redis/AOF 当前无法完成路径 | 保留原幂等 ID，退避重试 |
 | `INTERNAL` (9000) | 服务端持久化不变量损坏 | 告警并人工排查 |
 

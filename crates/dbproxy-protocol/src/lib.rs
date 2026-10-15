@@ -50,8 +50,16 @@ pub const PRE_RELAY_PROTOCOL_FINGERPRINT_V2: &str =
 pub const PRE_AUTHORITATIVE_PROTOCOL_FINGERPRINT_V2: &str =
     "affd104ec61b48af713241daf11b2b7ba08577673054ee9aea0ef3653dab8c68";
 
+/// 新增“回执已退休”错误码之前的协议。旧客户端收到未知错误码时按内部错误处理，也就是结果未知，
+/// 不会被当成“没执行过”。
+/// Pre-OperationExpired schema. Older clients decode the unknown code as Internal (outcome
+/// unknown), never as "not executed", so they stay safe against retired receipts.
+pub const PRE_OPERATION_EXPIRED_PROTOCOL_FINGERPRINT_V2: &str =
+    "f02678836c752cdda8a083aed7cf9320797618c620e6a3b23247e6131604021a";
+
 pub fn is_compatible_protocol_fingerprint(candidate: &str) -> bool {
     candidate == PROTOCOL_FINGERPRINT
+        || candidate == PRE_OPERATION_EXPIRED_PROTOCOL_FINGERPRINT_V2
         || candidate == LEGACY_PROTOCOL_FINGERPRINT_V2
         || candidate == PRE_COMMIT_PROTOCOL_FINGERPRINT_V2
         || candidate == PRE_RELAY_PROTOCOL_FINGERPRINT_V2

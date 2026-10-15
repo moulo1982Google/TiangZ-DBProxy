@@ -88,6 +88,8 @@ pub struct ServerSection {
     pub shutdown_grace_ms: u64,
 }
 
+// 配置只在启动时解析一次，变体大小差异不影响性能。 / Parsed once at startup; variant size is irrelevant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "backend", rename_all = "camelCase", deny_unknown_fields)]
 pub enum StorageSection {
@@ -113,6 +115,13 @@ pub enum StorageSection {
             default = "default_receipt_retention_hours"
         )]
         receipt_retention_hours: u16,
+        /// 多记录事务回执保留天数，1..=3650，默认 30；过期后只留操作号退休标记。
+        /// Multi-record transaction receipt retention days, 1..=3650, default 30.
+        #[serde(
+            rename = "operationReceiptRetentionDays",
+            default = "default_operation_receipt_retention_days"
+        )]
+        operation_receipt_retention_days: u16,
         #[serde(
             rename = "cacheFallbackConcurrency",
             default = "default_cache_fallback_concurrency"
@@ -374,6 +383,8 @@ pub struct ResolvedRetryQueue {
     pub max_attempts: u32,
 }
 
+// 启动时生成一次，变体大小差异不影响性能。 / Built once at startup; variant size is irrelevant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum ResolvedStorage {
     PostgresRedis {
@@ -384,6 +395,7 @@ pub enum ResolvedStorage {
         shards: usize,
         postgres_read_connections: u8,
         receipt_retention_hours: u16,
+        operation_receipt_retention_days: u16,
         cache_fallback_concurrency: usize,
         cache_fallback_timeout_ms: u64,
         cache_operation_timeout_ms: u64,
@@ -413,6 +425,19 @@ impl ResolvedStorage {
                 ..
             } => Some(std::time::Duration::from_secs(
                 u64::from(*receipt_retention_hours) * 3600,
+            )),
+            Self::Memory { .. } => None,
+        }
+    }
+
+    /// 多记录事务回执保留时长；内存后端没有回执。 / Multi-record receipt retention; none for memory.
+    pub fn operation_receipt_retention(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::PostgresRedis {
+                operation_receipt_retention_days,
+                ..
+            } => Some(std::time::Duration::from_secs(
+                u64::from(*operation_receipt_retention_days) * 86_400,
             )),
             Self::Memory { .. } => None,
         }
@@ -597,6 +622,7 @@ impl DbProxyConfig {
                 shards,
                 postgres_read_connections,
                 receipt_retention_hours,
+                operation_receipt_retention_days,
                 cache_fallback_concurrency,
                 cache_fallback_timeout_ms,
                 cache_operation_timeout_ms,
@@ -621,6 +647,17 @@ impl DbProxyConfig {
                 {
                     return Err(ConfigError(format!(
                         "storage.receiptRetentionHours must be between {retention_hours_min} and {retention_hours_max}"
+                    )));
+                }
+                let operation_days_max =
+                    tiangz_dbproxy_storage::MAX_OPERATION_RECEIPT_RETENTION.as_secs() / 86_400;
+                let operation_days_min =
+                    tiangz_dbproxy_storage::MIN_OPERATION_RECEIPT_RETENTION.as_secs() / 86_400;
+                if !(operation_days_min..=operation_days_max)
+                    .contains(&u64::from(operation_receipt_retention_days))
+                {
+                    return Err(ConfigError(format!(
+                        "storage.operationReceiptRetentionDays must be between {operation_days_min} and {operation_days_max}"
                     )));
                 }
                 if authoritative_read_namespaces.len() > 64
@@ -687,6 +724,7 @@ impl DbProxyConfig {
                     shards,
                     postgres_read_connections,
                     receipt_retention_hours,
+                    operation_receipt_retention_days,
                     cache_fallback_concurrency,
                     cache_fallback_timeout_ms,
                     cache_operation_timeout_ms,
@@ -815,6 +853,9 @@ const fn default_postgres_read_connections() -> u8 {
 }
 const fn default_receipt_retention_hours() -> u16 {
     (tiangz_dbproxy_storage::DEFAULT_RECEIPT_RETENTION.as_secs() / 3600) as u16
+}
+const fn default_operation_receipt_retention_days() -> u16 {
+    (tiangz_dbproxy_storage::DEFAULT_OPERATION_RECEIPT_RETENTION.as_secs() / 86_400) as u16
 }
 
 const fn default_storage_shards() -> usize {
@@ -1706,6 +1747,45 @@ mod tests {
         let result = load_config_with(&memory, |_| Some("0123456789abcdef".into()));
         fs::remove_file(memory).unwrap();
         assert_eq!(result.unwrap().storage.receipt_retention(), None);
+    }
+
+    #[test]
+    fn operation_receipt_retention_default_override_and_bounds() {
+        for (extra, expected) in [
+            ("", Some(30)),
+            (",\"operationReceiptRetentionDays\":1", Some(1)),
+            (",\"operationReceiptRetentionDays\":90", Some(90)),
+            (",\"operationReceiptRetentionDays\":3650", Some(3650)),
+            (",\"operationReceiptRetentionDays\":0", None),
+            (",\"operationReceiptRetentionDays\":3651", None),
+        ] {
+            let path = write_config(&format!(
+                r#"{{"configVersion":1,"server":{{"listenAddr":"127.0.0.1:7800","authTokenEnv":"AUTH"}},"storage":{{"backend":"postgresRedis","postgresUrlEnv":"PG","redisUrlEnv":"REDIS"{extra}}}}}"#
+            ));
+            let result = load_config_with(&path, |_| Some("0123456789abcdef".into()));
+            fs::remove_file(path).unwrap();
+            if let Some(expected) = expected {
+                let storage = result.unwrap().storage;
+                assert_eq!(
+                    storage.operation_receipt_retention(),
+                    Some(std::time::Duration::from_secs(expected * 86_400))
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains(
+                        "storage.operationReceiptRetentionDays must be between 1 and 3650"
+                    ),
+                    "{error}"
+                );
+            }
+        }
+        let memory = write_config(
+            r#"{"configVersion":1,"server":{"listenAddr":"127.0.0.1:7800","authTokenEnv":"AUTH"},"storage":{"backend":"memory","shards":1}}"#,
+        );
+        let result = load_config_with(&memory, |_| Some("0123456789abcdef".into()));
+        fs::remove_file(memory).unwrap();
+        assert_eq!(result.unwrap().storage.operation_receipt_retention(), None);
     }
 
     #[test]

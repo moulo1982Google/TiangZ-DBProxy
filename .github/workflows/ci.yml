@@ -64,6 +64,13 @@ jobs:
           docker exec "${{ job.services.postgres.id }}" createdb -U tiangz receipt_regression
           cargo test -p tiangz-dbproxy-storage --test receipt_retention --locked -- --ignored --nocapture --test-threads=1
 
+      - name: 多记录事务回执退休回归
+        env:
+          DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/retirement_regression
+        run: |
+          docker exec "${{ job.services.postgres.id }}" createdb -U tiangz retirement_regression
+          cargo test -p tiangz-dbproxy-storage --test operation_retirement --locked -- --ignored --nocapture --test-threads=1
+
   check:
     name: 格式、测试与 Clippy
     runs-on: ubuntu-latest

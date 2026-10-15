@@ -19,6 +19,7 @@
     "shards": 4,
     "postgresReadConnections": 2,
     "receiptRetentionHours": 24,
+    "operationReceiptRetentionDays": 30,
     "cacheFallbackConcurrency": 16,
     "cacheFallbackTimeoutMs": 2000,
     "cacheOperationTimeoutMs": 200,

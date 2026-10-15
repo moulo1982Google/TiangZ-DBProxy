@@ -131,6 +131,7 @@ async fn prepare_backend(config: &ResolvedDbProxyConfig) -> Result<BackendPair, 
             shards,
             postgres_read_connections,
             receipt_retention_hours: _,
+            operation_receipt_retention_days: _,
             cache_fallback_concurrency,
             cache_fallback_timeout_ms,
             cache_operation_timeout_ms,
@@ -314,6 +315,19 @@ async fn run_servers(
                         config
                             .storage
                             .receipt_retention()
+                            .expect("a durable backend always comes from postgresRedis storage"),
+                        Arc::clone(metrics),
+                        shutdown_rx.clone(),
+                    )
+                    .instrument(span.clone()),
+                );
+                workers.spawn(
+                    tiangz_dbproxy_server::run_operation_retirement_worker(
+                        Arc::clone(&backend),
+                        id.clone().unwrap_or_else(|| "legacy".to_string()),
+                        config
+                            .storage
+                            .operation_receipt_retention()
                             .expect("a durable backend always comes from postgresRedis storage"),
                         Arc::clone(metrics),
                         shutdown_rx.clone(),

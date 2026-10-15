@@ -150,6 +150,12 @@ const SECONDARY: &[RequiredIndex] = &[
         &["operation_id"],
         "",
     ),
+    index(
+        "dbproxy_operation_claims",
+        "dbproxy_operation_claims_multi_retention",
+        &["claimed_at", "operation_id"],
+        "retired_at IS NULL AND operation_kind = 'multi'::text",
+    ),
     RequiredIndex {
         table: "dbproxy_outbox_routes",
         name: Some("dbproxy_outbox_routes_producer_route_version_key"),

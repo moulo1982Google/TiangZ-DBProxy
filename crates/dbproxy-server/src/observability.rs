@@ -225,7 +225,7 @@ struct OperationMetrics {
     payload_bytes: AtomicU64,
     duration_micros: AtomicU64,
     duration_buckets: [AtomicU64; DURATION_BUCKETS_SECONDS.len()],
-    error_codes: [AtomicU64; 11],
+    error_codes: [AtomicU64; 12],
 }
 
 /// 指标只按固定操作名、错误码和实例维度聚合，禁止加入 RecordKey 或业务幂等ID。
@@ -249,6 +249,9 @@ pub struct DbProxyMetrics {
     receipt_cleanup_batches: AtomicU64,
     receipt_cleanup_deleted: AtomicU64,
     receipt_cleanup_failures: AtomicU64,
+    operation_retirement_batches: AtomicU64,
+    operation_retirement_retired: AtomicU64,
+    operation_retirement_failures: AtomicU64,
     backlog_committed: AtomicU64,
     backlog_empty_polls: AtomicU64,
     backlog_failures: AtomicU64,
@@ -313,6 +316,9 @@ impl Default for DbProxyMetrics {
             receipt_cleanup_batches: AtomicU64::new(0),
             receipt_cleanup_deleted: AtomicU64::new(0),
             receipt_cleanup_failures: AtomicU64::new(0),
+            operation_retirement_batches: AtomicU64::new(0),
+            operation_retirement_retired: AtomicU64::new(0),
+            operation_retirement_failures: AtomicU64::new(0),
             backlog_committed: AtomicU64::new(0),
             backlog_empty_polls: AtomicU64::new(0),
             backlog_failures: AtomicU64::new(0),
@@ -373,6 +379,22 @@ impl DbProxyMetrics {
             }
             None => {
                 self.receipt_cleanup_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// 多记录事务回执退休一批的结果；None 表示失败。 / One retirement batch; None means it failed.
+    pub fn operation_retirement_completed(&self, retired: Option<u64>) {
+        self.operation_retirement_batches
+            .fetch_add(1, Ordering::Relaxed);
+        match retired {
+            Some(count) => {
+                self.operation_retirement_retired
+                    .fetch_add(count, Ordering::Relaxed);
+            }
+            None => {
+                self.operation_retirement_failures
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1126,6 +1148,27 @@ impl DbProxyMetrics {
             "counter",
             &self.receipt_cleanup_failures,
         );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_operation_retirement_batches_total",
+            "Multi-record transaction receipt retirement batches",
+            "counter",
+            &self.operation_retirement_batches,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_operation_retirement_retired_total",
+            "Multi-record transaction receipts retired",
+            "counter",
+            &self.operation_retirement_retired,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_operation_retirement_failures_total",
+            "Multi-record transaction receipt retirement failures",
+            "counter",
+            &self.operation_retirement_failures,
+        );
         metric_header(
             &mut output,
             "dbproxy_backlog_polls_total",
@@ -1242,7 +1285,7 @@ pub(crate) enum HandshakeRejection {
     InvalidClient,
 }
 
-const ERROR_CODE_NAMES: [&str; 11] = [
+const ERROR_CODE_NAMES: [&str; 12] = [
     "invalid_request",
     "unauthorized",
     "protocol_mismatch",
@@ -1254,6 +1297,7 @@ const ERROR_CODE_NAMES: [&str; 11] = [
     "outbox_conflict",
     "storage_unavailable",
     "internal",
+    "operation_expired",
 ];
 
 const DURABLE_QUEUE_RESULT_NAMES: [&str; 6] = [
@@ -1337,6 +1381,7 @@ fn error_code_index(code: wire::ErrorCode) -> usize {
         wire::ErrorCode::OutboxConflict => 8,
         wire::ErrorCode::StorageUnavailable => 9,
         wire::ErrorCode::Internal | wire::ErrorCode::Unspecified => 10,
+        wire::ErrorCode::OperationExpired => 11,
     }
 }
 
@@ -1878,4 +1923,16 @@ fn receipt_cleanup_metrics_distinguish_deleted_empty_and_failed_batches() {
     assert!(text.contains("dbproxy_receipt_cleanup_batches_total 3"));
     assert!(text.contains("dbproxy_receipt_cleanup_deleted_total 500"));
     assert!(text.contains("dbproxy_receipt_cleanup_failures_total 1"));
+}
+
+#[test]
+fn operation_retirement_metrics_distinguish_retired_empty_and_failed_batches() {
+    let metrics = DbProxyMetrics::default();
+    metrics.operation_retirement_completed(Some(500));
+    metrics.operation_retirement_completed(Some(0));
+    metrics.operation_retirement_completed(None);
+    let text = metrics.prometheus("postgresRedis");
+    assert!(text.contains("dbproxy_operation_retirement_batches_total 3"));
+    assert!(text.contains("dbproxy_operation_retirement_retired_total 500"));
+    assert!(text.contains("dbproxy_operation_retirement_failures_total 1"));
 }

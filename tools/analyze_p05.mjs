@@ -1,4 +1,5 @@
-// P05: receipt cleanup off (B1) vs on (B2) at the same fixed rate, alternating rounds.
+// P05: receipt cleanup off (B1) vs on (B2) at the same fixed rate, alternating rounds. Also used
+// for multi-record receipt retirement off/on (run_retire_ab.sh), where B2 also runs retirement.
 // Usage: node tools/analyze_p05.mjs <artifact folder from run_receipt_probe --cleanup both> [...more]
 // Per round: successful responses, errors, missed sends, read/write p50/p95/p99/max over the
 // sample window, receipts deleted. Per mode: medians across rounds. Verdict against the plan's
@@ -29,6 +30,9 @@ async function round(dir) {
     successful_per_second: ok / summary.sample_seconds, errors, not_sent: notSent,
     reads: stats(reads), writes: stats(writes), all_p99_ms: summary.p99_us / 1000,
     fixture_remaining_expired_recent: remaining,
+    // Retirement runs (run_receipt_probe --retirement 1): fixture ops retired | still due |
+    // fixture headers left | load-written ops retired (must be 0).
+    fixture_ops_retired_due_headers_loadretired: existsSync(join(dir, "remaining-ops.txt")) ? readFileSync(join(dir, "remaining-ops.txt"), "utf8").trim() : null,
   };
 }
 
@@ -69,6 +73,7 @@ for (const folder of process.argv.slice(2)) {
   const result = {
     folder, fixture_expired: manifest.FixtureExpired, rate: manifest.Rate, sample_seconds: manifest.Seconds,
     warmup_seconds: manifest.WarmupSeconds, background: manifest.BackgroundWorkers, retention_hours: manifest.ReceiptRetentionHours,
+    write_kind: manifest.WriteKind ?? "save", retirement: manifest.Retirement ?? 0, fixture_ops_expired: manifest.FixtureOpsExpired ?? 0,
     B1_cleanup_off: b1, B2_cleanup_on: b2, comparison, violations, verdict: violations.length ? "FAIL" : "PASS", rounds,
   };
   writeFileSync(join(folder, "p05.json"), JSON.stringify(result, null, 1) + "\n");
@@ -77,5 +82,5 @@ for (const folder of process.argv.slice(2)) {
 for (const r of combined) {
   const { rounds, ...head } = r;
   console.log(JSON.stringify(head, null, 1));
-  for (const x of rounds) console.log(`  ${x.round}: ok/s=${x.successful_per_second?.toFixed?.(2)} err=${x.errors} not_sent=${x.not_sent} read p50/p99/max=${x.reads?.p50_ms}/${x.reads?.p99_ms}/${x.reads?.max_ms} write p50/p99/max=${x.writes?.p50_ms}/${x.writes?.p99_ms}/${x.writes?.max_ms} remaining=${x.fixture_remaining_expired_recent}`);
+  for (const x of rounds) console.log(`  ${x.round}: ok/s=${x.successful_per_second?.toFixed?.(2)} err=${x.errors} not_sent=${x.not_sent} read p50/p99/max=${x.reads?.p50_ms}/${x.reads?.p99_ms}/${x.reads?.max_ms} write p50/p99/max=${x.writes?.p50_ms}/${x.writes?.p99_ms}/${x.writes?.max_ms} remaining=${x.fixture_remaining_expired_recent} ops=${x.fixture_ops_retired_due_headers_loadretired}`);
 }

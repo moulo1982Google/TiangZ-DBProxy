@@ -387,3 +387,50 @@ cargo test -p tiangz-dbproxy-server --test receipt_cleanup_worker --locked -- --
 **存储代价**：两小时实测（`acceptance-p08-2h-20260923.md`）每条普通回执约 1.5 KB（含一份完整写入内容和索引）。按每秒 100 次普通写估算：7 天约 90 GB，24 小时约 13 GB，1 小时约 0.5 GB。
 
 **调整方法**：在配置 `storage` 段设置 `receiptRetentionHours`，重启生效；越界时启动前报错。多个实例连接同一租户库时应配置相同值，否则较短者决定实际删除时间。缩短保留期不会删除事务回执或业务数据，但会让“回执过期后同号重发按新请求处理”的窗口提前，调用方最晚重发时间必须短于配置值。
+
+## 附录二：多记录事务回执退休（2026-10-14，分支 `feat/operation-receipt-retirement`）
+
+### 为什么做
+
+`dbproxy_multi_transactions` 和 `dbproxy_multi_transaction_records` 原本只增不减。按本地开发库实测，一个操作长期占约 2.5–3 KB（平均 2.7 条记录；payload 约 350 字节，只占三分之一）。日活 5 万、每人每天 200 次提交时，一年约 10 TB。只把 payload 换成摘要只能省约三分之一，所以改为真正删除，只留操作号标记。
+
+### 规则
+
+- 范围：只处理 `operation_kind='multi'` 且**没有提交效果**的操作，也就是 `ApplyMultiTransaction` 和 `appends`、`outboxEvents` 都为空的 `CommitRecords`。
+  - 带效果的操作，其追加记录、效果和 Outbox 行引用事务头，而且是不可变的业务事实，所以永远保留。
+  - 单记录事务 `dbproxy_transactions` 和交易表不在本次范围。
+- 保留期：`storage.operationReceiptRetentionDays`，默认 30 天，取值 1–3650。按服务端认领时间 `dbproxy_operation_claims.claimed_at` 计算，从不使用客户端填的 `updated_at_unix_ms`。
+- 退休：删除事务头，回执记录随外键级联删除；在 `dbproxy_operation_claims.retired_at` 写上退休时间。操作号这一行保留，是“这个号用过”的证据（约 175 字节/操作，含索引）。业务快照不受影响。
+- 退休以后：
+  - `LoadMultiTransaction` 返回 `OPERATION_EXPIRED`，不返回“查无回执”；
+  - 用这个操作号提交（原字节重提，或者内容不同），一律返回 `OPERATION_EXPIRED`，不会重新执行，也不会落到 CAS 冲突；
+  - 从没用过的操作号，查询仍然返回“没有”。
+- 后台任务：每个租户一个，和普通回执清理共用维护连接，互斥串行。
+  - 每批最多 500 个操作，`FOR UPDATE SKIP LOCKED`，语句超时 5 秒、锁超时 100 ms；满批停 1 秒，否则停 60 秒。
+  - 迁移 016 增加的部分索引 `dbproxy_operation_claims_multi_retention` 负责找到待退休的操作号；删除事务头和更新标记都按主键数组定位，避免整表哈希连接。
+  - 实测：30 万个事务头、30 万个操作号时，一批 500 个约 15 ms，全部走索引。
+- 指标：`dbproxy_operation_retirement_batches_total`、`_retired_total`、`_failures_total`。
+
+### 并发顺序
+
+提交路径在认领操作号后，用 `FOR SHARE` 锁住这一行，再检查是否已退休；退休任务对同一行用 `FOR UPDATE SKIP LOCKED`。因此只有两种结果：
+
+- 正在重提的操作号会被这一批跳过，下一批再退休；
+- 或者退休先完成，重提看到已退休，返回 `OPERATION_EXPIRED`。
+
+不会出现“事务头刚删、重提当成新操作执行”的情况。测试 `batches_are_bounded_and_skip_a_claim_held_by_a_replay` 覆盖了这一点。
+
+### 对调用方的要求
+
+- 保留期必须长于调用方未决操作的最长存活时间。超过保留期还没处理完的操作，以后只能得到 `OPERATION_EXPIRED`，也就是结果未知。
+- 旧客户端（升级前的指纹）不认识 2007，会解成 `INTERNAL`。调用方如果把 `INTERNAL` 当结果未知，就是安全的：不会重复执行，但也得不到明确结论。新客户端可以单独识别这个码。
+
+### 升级与回滚
+
+- **所有连接同一数据库的 DBProxy 实例必须一起升级**：先停旧实例，再启动新实例。新实例一启动就会开始退休；旧实例不认识退休标记，查不到事务头时会回答“查无回执”，调用方可能把它当成没执行过。
+- 退休一旦执行过，就**不能回滚**到旧版本，原因同上。回滚前必须确认没有任何已退休的操作号（`SELECT count(*) FROM dbproxy_operation_claims WHERE retired_at IS NOT NULL` 为 0）。
+- 从旧版本升级时，已经超过 30 天的回执会在启动后分批退休。量大时会持续一段时间，每批之间停 1 秒。
+
+### 没有解决的
+
+操作号标记仍然随操作数线性增长，只是每个操作从约 2.5–3 KB 降到约 175 字节。要让它也有上限，需要调用方提供按主公或序号的退休水位，或者约定操作号格式，属于调用方的改动，没有做。

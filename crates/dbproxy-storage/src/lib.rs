@@ -46,11 +46,17 @@ mod postgres_read_pool;
 mod postgres_request;
 pub use postgres_diagnostics::fingerprint as postgres_operation_fingerprint;
 pub use postgres_read_pool::{PostgresReadPool, ReadPoolUsage};
+mod operation_retirement;
 mod receipt_retention;
 mod redis_durability;
 #[cfg(test)]
 mod redis_durability_fixture;
 mod schema_indexes;
+pub use operation_retirement::{
+    DEFAULT_OPERATION_RECEIPT_RETENTION, MAX_OPERATION_RECEIPT_RETENTION,
+    MIN_OPERATION_RECEIPT_RETENTION, OPERATION_RETIREMENT_BATCH_SIZE,
+    validate_operation_receipt_retention,
+};
 pub use postgres_request::{
     DEFAULT_POSTGRES_CONNECTION_WAIT_TIMEOUT_MS, DEFAULT_POSTGRES_RECONNECT_COOLDOWN_MS,
     PostgresRequestConfig,
@@ -451,6 +457,10 @@ pub enum StorageError {
     InvalidPostgresReadConnections,
     #[error("ordinary receipt retention must be between 1 and 8760 hours; got {seconds} seconds")]
     InvalidReceiptRetention { seconds: u64 },
+    #[error(
+        "multi-record receipt retention must be between 1 and 3650 days; got {seconds} seconds"
+    )]
+    InvalidOperationReceiptRetention { seconds: u64 },
     #[error("PostgreSQL reconnect cooldown must be representable and at least one millisecond")]
     InvalidPostgresReconnectCooldown,
     #[error(
@@ -957,15 +967,24 @@ pub(crate) async fn claim_operation(
             &[&operation_id, &operation_kind],
         )
         .await?;
-    let claimed_kind: String = transaction
+    // FOR SHARE orders this commit against receipt retirement (which takes FOR UPDATE SKIP
+    // LOCKED on the claim): either retirement waits for this commit, or this commit sees the
+    // claim already retired and answers "expired" instead of re-applying the operation.
+    let claim = transaction
         .query_one(
-            "SELECT operation_kind FROM dbproxy_operation_claims WHERE operation_id = $1",
+            "SELECT operation_kind, retired_at IS NOT NULL FROM dbproxy_operation_claims WHERE operation_id = $1 FOR SHARE",
             &[&operation_id],
         )
-        .await?
-        .get(0);
+        .await?;
+    let claimed_kind: String = claim.get(0);
     if claimed_kind != operation_kind {
         return Err(StoreError::OperationIdConflict {
+            operation_id: operation_id.to_string(),
+        }
+        .into());
+    }
+    if claim.get::<_, bool>(1) {
+        return Err(StoreError::OperationExpired {
             operation_id: operation_id.to_string(),
         }
         .into());
@@ -1688,6 +1707,13 @@ impl PostgresSnapshotStore {
             include_str!("../migrations/015_receipt_retention.sql"),
         )
         .await?;
+        apply_schema_migration(
+            &transaction,
+            16,
+            "operation-retirement",
+            include_str!("../migrations/016_operation_retirement.sql"),
+        )
+        .await?;
         schema_indexes::validate(&transaction).await?;
         transaction.commit().await?;
         Ok(())
@@ -2403,6 +2429,20 @@ impl AsyncMultiRecordTransactionStore for PostgresSnapshotStore {
             )
             .await?;
         let Some(header) = header else {
+            // A retired receipt is "expired", never "not executed": the caller must not run the
+            // operation again because its receipt is gone.
+            let retired = client
+                .query_opt(
+                    "SELECT 1 FROM dbproxy_operation_claims WHERE operation_id = $1 AND operation_kind = 'multi' AND retired_at IS NOT NULL",
+                    &[&operation_id],
+                )
+                .await?;
+            if retired.is_some() {
+                return Err(StoreError::OperationExpired {
+                    operation_id: operation_id.to_string(),
+                }
+                .into());
+            }
             return Ok(None);
         };
         let rows = client
