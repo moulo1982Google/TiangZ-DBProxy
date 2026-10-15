@@ -164,6 +164,13 @@ jobs:
         run: |
           docker exec tiangz-dbproxy-postgres createdb -U tiangz receipt_worker_regression
           cargo test -p tiangz-dbproxy-server --test receipt_cleanup_worker --locked -- --ignored --nocapture --test-threads=1
+      - name: Outbox 发布任务回归
+        env:
+          DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/outbox_worker_regression
+          DBPROXY_TEST_NO_AOF_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6380/0
+        run: |
+          docker exec tiangz-dbproxy-postgres createdb -U tiangz outbox_worker_regression
+          cargo test -p tiangz-dbproxy-server --test outbox_worker --locked -- --ignored --nocapture --test-threads=1
       - name: Redis 与 PostgreSQL 故障矩阵
         env:
           DBPROXY_CACHE_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6380/0

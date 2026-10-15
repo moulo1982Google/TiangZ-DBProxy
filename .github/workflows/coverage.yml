@@ -33,10 +33,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      - name: 启动 PostgreSQL 与 Redis
+      - name: 启动 PostgreSQL、可靠 Redis 与无 AOF 的缓存 Redis
         run: |
           cp deploy/local/.env.example deploy/local/.env
-          docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml up -d --wait postgres redis
+          docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.validation.yml up -d --wait postgres redis cache
       - name: 工作区默认测试
         run: |
           cargo llvm-cov clean --workspace
@@ -44,11 +44,16 @@ jobs:
       - name: 真实 PostgreSQL 回归（每组新库）
         run: |
           set -euo pipefail
+          # suite <db> <cargo selection...> [:: <test filter>]; cargo llvm-cov reads a bare test
+          # name as a subcommand, so a filter goes to the test binary after "--".
           suite() {
             local db=$1; shift
+            local selection=() filter=()
+            while [ $# -gt 0 ] && [ "$1" != "::" ]; do selection+=("$1"); shift; done
+            if [ "${1:-}" = "::" ]; then shift; filter=("$@"); fi
             docker exec tiangz-dbproxy-postgres createdb -U tiangz "$db"
             DBPROXY_TEST_POSTGRES_URL="postgres://tiangz:tiangz_dev@127.0.0.1:5432/$db" \
-              cargo llvm-cov --no-report --locked "$@" -- --ignored --test-threads=1
+              cargo llvm-cov --no-report --locked "${selection[@]}" -- --ignored --test-threads=1 "${filter[@]}"
           }
           suite cov_indexes -p tiangz-dbproxy-storage --test schema_indexes
           suite cov_plans -p tiangz-dbproxy-storage --test query_plans --test repair_claim_plans --test outbox_hybrid_plans
@@ -57,10 +62,37 @@ jobs:
           suite cov_retirement -p tiangz-dbproxy-storage --test operation_retirement
           suite cov_repair -p tiangz-dbproxy-storage --test cache_repair_concurrency
           suite cov_worker -p tiangz-dbproxy-server --test receipt_cleanup_worker
+          # Library-internal real-database tests (read pool, connection diagnostics); exact names.
+          suite cov_read_pool -p tiangz-dbproxy-storage --lib :: postgres_read_pool::tests::real_read_pool_paths_capacity_cancellation_and_reconnect
+          suite cov_diagnostics -p tiangz-dbproxy-storage --lib :: postgres_diagnostics::tests::real_postgres_identity_reconnect_and_contention
+          # Capacity sampling refuses any database not named v07_capacity.
+          docker exec tiangz-dbproxy-postgres createdb -U tiangz v07_capacity
+          DBPROXY_CAPACITY_TEST_URL=postgres://tiangz:tiangz_dev@127.0.0.1:5432/v07_capacity \
+            cargo llvm-cov --no-report --locked -p tiangz-dbproxy-storage --lib -- --ignored --test-threads=1 capacity::tests::postgres
       - name: 真实 PostgreSQL + Redis 存储与网络闭环
         run: |
           cargo llvm-cov --no-report --locked -p tiangz-dbproxy-storage --test postgres_redis -- --ignored --test-threads=1
           cargo llvm-cov --no-report --locked -p tiangz-dbproxy-server --test postgres_redis_network -- --ignored --test-threads=1
+      - name: Outbox 发布任务（可靠 Redis 成功，无 AOF Redis 重试与死信）
+        env:
+          DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/cov_outbox_worker
+          DBPROXY_TEST_NO_AOF_REDIS_URL: redis://:tiangz_dev@127.0.0.1:6380/0
+        run: |
+          docker exec tiangz-dbproxy-postgres createdb -U tiangz cov_outbox_worker
+          cargo llvm-cov --no-report --locked -p tiangz-dbproxy-server --test outbox_worker -- --ignored --test-threads=1
+      - name: 真实服务进程（双进程同库、双租户强杀重启）
+        # The tests spawn the cargo-built server binary, which is instrumented too.
+        env:
+          ACCEPT_PG_A: postgres://tiangz:tiangz_dev@127.0.0.1:5432/cov_process_a
+          ACCEPT_PG_B: postgres://tiangz:tiangz_dev@127.0.0.1:5432/cov_process_b
+          ACCEPT_REDIS_A: redis://:tiangz_dev@127.0.0.1:6379/2
+          ACCEPT_REDIS_B: redis://:tiangz_dev@127.0.0.1:6379/3
+          ACCEPT_CACHE_A: redis://:tiangz_dev@127.0.0.1:6380/2
+          ACCEPT_CACHE_B: redis://:tiangz_dev@127.0.0.1:6380/3
+        run: |
+          docker exec tiangz-dbproxy-postgres createdb -U tiangz cov_process_a
+          docker exec tiangz-dbproxy-postgres createdb -U tiangz cov_process_b
+          DBPROXY_ACCEPTANCE_ARTIFACTS="$RUNNER_TEMP/process-acceptance"             cargo llvm-cov --no-report --locked -p tiangz-dbproxy-server --test acceptance_process -- --ignored --test-threads=1
       - name: 生成合并报告
         run: cargo llvm-cov report --workspace --lcov --output-path rust-lcov.info
       - name: 上传到 Codecov
@@ -72,7 +104,7 @@ jobs:
           fail_ci_if_error: true
       - name: 清理测试容器
         if: always()
-        run: docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml down -v --remove-orphans
+        run: docker compose --env-file deploy/local/.env -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.validation.yml down -v --remove-orphans
 
   typescript:
     name: TypeScript SDK 覆盖率
