@@ -134,6 +134,8 @@ pub struct PanicDetails<'a> {
     pub message: &'a str,
     pub location: Option<String>,
     pub backtrace: &'a str,
+    /// 上一份报告之后因限流跳过的 panic 个数。 / Panics skipped by the rate limit since the previous report.
+    pub suppressed_since_last: u64,
 }
 
 pub struct NativeDetails<'a> {
@@ -198,6 +200,11 @@ pub fn render_panic_report(
         text,
         "location: {}",
         details.location.as_deref().unwrap_or("unknown")
+    );
+    let _ = writeln!(
+        text,
+        "suppressed_since_last: {}",
+        details.suppressed_since_last
     );
     let _ = writeln!(text);
     let _ = writeln!(text, "backtrace:");
@@ -277,11 +284,13 @@ pub fn create_new_file(
             format!("{stem}-{attempt}.{extension}")
         };
         let path = directory.join(name);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Unix 上报告与转储只给属主读写；Windows 继承目录 ACL。
+        // On Unix reports and dumps are owner-only; on Windows they inherit the directory ACL.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => last_error = Some(error),
             Err(error) => return Err(error),
@@ -307,6 +316,30 @@ pub fn write_new_text_file(
 /// Keep the newest `keep` files of one kind by modification time and delete older ones; only
 /// `crash-dbproxy-*.<extension>` is touched. Returns how many were deleted; one failed removal does not stop the rest.
 pub fn prune_oldest(directory: &Path, extension: &str, keep: usize) -> io::Result<usize> {
+    let mut files = list_crash_files(directory, extension)?;
+    if files.len() <= keep {
+        return Ok(0);
+    }
+    files.sort();
+    let excess = files.len() - keep;
+    let mut deleted = 0;
+    for (_, _, path) in files.into_iter().take(excess) {
+        if fs::remove_file(path).is_ok() {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+/// `crash-dbproxy-*.<extension>` 的个数。 / Number of `crash-dbproxy-*.<extension>` files.
+pub fn count_crash_files(directory: &Path, extension: &str) -> io::Result<usize> {
+    Ok(list_crash_files(directory, extension)?.len())
+}
+
+fn list_crash_files(
+    directory: &Path,
+    extension: &str,
+) -> io::Result<Vec<(SystemTime, String, PathBuf)>> {
     let suffix = format!(".{extension}");
     let mut files = Vec::new();
     for entry in fs::read_dir(directory)? {
@@ -325,18 +358,69 @@ pub fn prune_oldest(directory: &Path, extension: &str, keep: usize) -> io::Resul
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
         files.push((modified, name.to_owned(), entry.path()));
     }
-    if files.len() <= keep {
-        return Ok(0);
-    }
-    files.sort();
-    let excess = files.len() - keep;
-    let mut deleted = 0;
-    for (_, _, path) in files.into_iter().take(excess) {
-        if fs::remove_file(path).is_ok() {
-            deleted += 1;
+    Ok(files)
+}
+
+/// 创建崩溃目录（含上级）。Unix 上新建的目录权限为 0700（再受 umask 影响）；已存在的目录不改权限。
+/// Windows 继承上级 ACL。
+/// Create the crash directory and its parents. On Unix newly created directories get 0700 (subject to umask);
+/// existing directories keep their permissions. Windows inherits the parent ACL.
+pub fn create_private_dir_all(directory: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(directory)
+}
+
+/// 两份 panic 报告之间的最小间隔。可存活的 panic（Tokio 任务、请求隔离）可能连续发生，
+/// 每份报告都要符号化回溯、建文件、fsync，不限流会拖慢工作线程。
+/// Minimum interval between two panic reports. Survivable panics (Tokio tasks, request isolation) can repeat, and
+/// each report symbolises a backtrace, creates a file and fsyncs; without a limit that would stall worker threads.
+pub const PANIC_REPORT_MIN_INTERVAL_MS: u64 = 10_000;
+
+/// panic 报告限流：间隔内的 panic 只计数，下一份报告写出被跳过的个数。
+/// Panic-report rate limit: panics inside the interval are only counted; the next report states how many.
+#[derive(Debug)]
+pub struct ReportLimiter {
+    interval_ms: u64,
+    last_ms: std::sync::atomic::AtomicU64,
+    suppressed: std::sync::atomic::AtomicU64,
+}
+
+impl ReportLimiter {
+    const NEVER: u64 = u64::MAX;
+
+    pub const fn new(interval_ms: u64) -> Self {
+        Self {
+            interval_ms,
+            last_ms: std::sync::atomic::AtomicU64::new(Self::NEVER),
+            suppressed: std::sync::atomic::AtomicU64::new(0),
         }
     }
-    Ok(deleted)
+
+    /// `now_ms` 为单调时钟毫秒。允许写报告时返回此前被跳过的个数（并清零），否则返回 None 并计数。
+    /// `now_ms` is a monotonic clock in milliseconds. Returns the number skipped so far (and resets it) when a
+    /// report may be written; otherwise counts this panic and returns None.
+    pub fn admit(&self, now_ms: u64) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        let mut last = self.last_ms.load(Ordering::Acquire);
+        loop {
+            if last != Self::NEVER && now_ms.saturating_sub(last) < self.interval_ms {
+                self.suppressed.fetch_add(1, Ordering::AcqRel);
+                return None;
+            }
+            match self.last_ms.compare_exchange_weak(
+                last,
+                now_ms,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(self.suppressed.swap(0, Ordering::AcqRel)),
+                Err(current) => last = current,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +466,7 @@ mod tests {
                 message: "boom\nsecond line",
                 location: Some("src/main.rs:3:5".into()),
                 backtrace: "   0: frame_one\n   1: frame_two\n",
+                suppressed_since_last: 3,
             },
             &RecentLogSection::Lines {
                 capacity: 200,
@@ -391,7 +476,7 @@ mod tests {
         let expected = format!(
             "TiangZ crash report\nformat_version: 1\nprocess: dbproxy\nversion: {}\npid: 77\nplatform: {}-{}\n\
              time_utc: 2026-10-16T03:15:00.123Z\nkind: panic\nthread: main\nmessage: boom\n  second line\n\
-             location: src/main.rs:3:5\n\nbacktrace:\n   0: frame_one\n   1: frame_two\n\n\
+             location: src/main.rs:3:5\nsuppressed_since_last: 3\n\nbacktrace:\n   0: frame_one\n   1: frame_two\n\n\
              recent_logs: 2 of 200\nINFO first\nWARN second\n",
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
@@ -491,6 +576,54 @@ mod tests {
             ]
         );
         assert_eq!(prune_oldest(&directory, "txt", 2).unwrap(), 0);
+        assert_eq!(count_crash_files(&directory, "txt").unwrap(), 2);
+        assert_eq!(count_crash_files(&directory, "dmp").unwrap(), 1);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn limiter_admits_one_report_per_interval_and_counts_the_rest() {
+        let limiter = ReportLimiter::new(10_000);
+        assert_eq!(limiter.admit(5), Some(0));
+        assert_eq!(limiter.admit(6), None);
+        assert_eq!(limiter.admit(10_004), None);
+        assert_eq!(limiter.admit(10_005), Some(2));
+        assert_eq!(limiter.admit(20_004), None);
+        assert_eq!(limiter.admit(40_000), Some(1));
+        // 时钟回退不会把间隔算成负数而放行。 / A clock that goes backwards never opens the gate early.
+        assert_eq!(limiter.admit(39_000), None);
+    }
+
+    #[test]
+    fn concurrent_panics_inside_one_interval_admit_exactly_one_report() {
+        let limiter = std::sync::Arc::new(ReportLimiter::new(10_000));
+        let admitted = (0..8)
+            .map(|_| {
+                let limiter = std::sync::Arc::clone(&limiter);
+                std::thread::spawn(move || {
+                    (0..100).filter(|_| limiter.admit(1_000).is_some()).count()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .sum::<usize>();
+        assert_eq!(admitted, 1);
+        assert_eq!(limiter.admit(11_000), Some(799));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_reports_and_new_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_directory("modes");
+        let directory = root.join("nested").join("crash");
+        create_private_dir_all(&directory).unwrap();
+        let dir_mode = fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode & 0o077, 0, "directory mode {dir_mode:o}");
+        let path = write_new_text_file(&directory, "crash-dbproxy-1-x", "txt", "r").unwrap();
+        let file_mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600);
+        fs::remove_dir_all(root).unwrap();
     }
 }

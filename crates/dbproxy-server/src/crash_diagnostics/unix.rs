@@ -7,12 +7,12 @@ use std::io;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreLimit {
     Unlimited,
-    /// 硬上限不允许无限，只能把软上限提到硬上限（字节）。
-    /// The hard limit forbids unlimited; the soft limit was raised to the hard limit (bytes).
-    CappedAtHardLimit(libc::rlim_t),
+    /// 硬上限不允许无限，软上限只提到了这个值（字节）。
+    /// The hard limit forbids unlimited; the soft limit only reached this value (bytes).
+    Capped(libc::rlim_t),
 }
 
-pub fn raise_core_limit() -> io::Result<CoreLimit> {
+fn current_core_limit() -> io::Result<libc::rlimit> {
     let mut current = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -21,26 +21,33 @@ pub fn raise_core_limit() -> io::Result<CoreLimit> {
     if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut current) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(current)
+}
+
+/// 先尝试设为无限；不行再把软上限提到硬上限。结果以调整后重新读到的软上限为准。
+/// Try unlimited first, then raise the soft limit to the hard limit. The result is the soft limit read back afterwards.
+pub fn raise_core_limit() -> io::Result<CoreLimit> {
+    let before = current_core_limit()?;
     let unlimited = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
     };
     // SAFETY: 传入有效的 rlimit 指针。 / A valid rlimit pointer is passed.
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &unlimited) } == 0 {
-        return Ok(CoreLimit::Unlimited);
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &unlimited) } != 0 {
+        let capped = libc::rlimit {
+            rlim_cur: before.rlim_max,
+            rlim_max: before.rlim_max,
+        };
+        // SAFETY: 传入有效的 rlimit 指针。 / A valid rlimit pointer is passed.
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &capped) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
-    let capped = libc::rlimit {
-        rlim_cur: current.rlim_max,
-        rlim_max: current.rlim_max,
-    };
-    // SAFETY: 传入有效的 rlimit 指针。 / A valid rlimit pointer is passed.
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &capped) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if current.rlim_max == libc::RLIM_INFINITY {
+    let after = current_core_limit()?;
+    if after.rlim_cur == libc::RLIM_INFINITY {
         Ok(CoreLimit::Unlimited)
     } else {
-        Ok(CoreLimit::CappedAtHardLimit(current.rlim_max))
+        Ok(CoreLimit::Capped(after.rlim_cur))
     }
 }
 

@@ -170,6 +170,14 @@ unsafe extern "system" fn filter(pointers: *const EXCEPTION_POINTERS) -> i32 {
         while PHASE.load(Ordering::Acquire) != DONE && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
+        if PHASE.load(Ordering::Acquire) != DONE {
+            // 只写固定文本，不分配内存。转储线程可能仍在写，文件可能不完整。
+            // Fixed text only, no allocation. The dump thread may still be writing; files may be incomplete.
+            let _ = io::Write::write_all(
+                &mut io::stderr(),
+                b"TiangZ DBProxy crash dump timed out after 120 s; the minidump and native record may be missing or incomplete\n",
+            );
+        }
     }
     match PREVIOUS.get().copied().flatten() {
         // SAFETY: 原过滤器由系统返回，按原约定调用。 / The previous filter came from the system; call it as intended.

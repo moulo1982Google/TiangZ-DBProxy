@@ -15,20 +15,25 @@ pub use recent_logs::{
     TeeWriter,
 };
 pub use report::{
-    DUMP_EXTENSION, FILE_PREFIX, NativeDetails, PROCESS_NAME, PanicDetails, REPORT_EXTENSION,
-    REPORT_FORMAT_VERSION, RecentLogSection, ReportHeader, UtcTimestamp, access_operation,
-    create_new_file, exception_name, file_stem, prune_oldest, render_native_report,
+    DUMP_EXTENSION, FILE_PREFIX, NativeDetails, PANIC_REPORT_MIN_INTERVAL_MS, PROCESS_NAME,
+    PanicDetails, REPORT_EXTENSION, REPORT_FORMAT_VERSION, RecentLogSection, ReportHeader,
+    ReportLimiter, UtcTimestamp, access_operation, count_crash_files, create_new_file,
+    create_private_dir_all, exception_name, file_stem, prune_oldest, render_native_report,
     render_panic_report, write_new_text_file,
 };
 
 use std::{
     backtrace::Backtrace,
     error::Error,
-    fmt, fs,
+    fmt,
     io::{self, Write},
     panic::PanicHookInfo,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
 };
 
 use serde::Deserialize;
@@ -38,8 +43,10 @@ use crate::config::ConfigError;
 /// 覆盖 `diagnostics.crash.enabled` 的环境变量，取值 `on` 或 `off`（不区分大小写，空值等于未设置）。
 /// Environment variable overriding `diagnostics.crash.enabled`: `on` or `off` (case-insensitive; empty = unset).
 pub const CRASH_DIAGNOSTICS_ENV: &str = "TIANGZ_DBPROXY_CRASH_DIAGNOSTICS";
-/// 仅用于验证：`panic`、`abort` 或 `access-violation`，启用崩溃诊断时启动完成后主动触发。
-/// Verification only: `panic`, `abort` or `access-violation`, triggered after startup when crash diagnostics are on.
+/// 仅用于验证：`panic`、`thread-panic`、`abort`、`access-violation` 或 `stack-overflow`。启用崩溃诊断且
+/// 存储为内存后端时，启动完成后主动触发；其他后端拒绝启动。
+/// Verification only: `panic`, `thread-panic`, `abort`, `access-violation` or `stack-overflow`. Triggered after
+/// startup when crash diagnostics are on and the storage backend is memory; other backends refuse to start.
 pub const CRASH_SELF_TEST_ENV: &str = "TIANGZ_DBPROXY_CRASH_SELF_TEST";
 
 pub const DEFAULT_CRASH_DIRECTORY: &str = "logs/crash";
@@ -189,20 +196,30 @@ impl ResolvedCrashDiagnostics {
 /// 自测方式。 / Self-test mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelfTest {
+    /// 主线程 panic，进程退出。 / Main-thread panic; the process exits.
     Panic,
+    /// 后台线程连续 panic 三次，进程继续服务；验证可存活 panic 与限流。
+    /// Three panics on background threads while the process keeps serving; checks survivable panics and the limit.
+    ThreadPanic,
     Abort,
     AccessViolation,
+    StackOverflow,
 }
+
+/// `thread-panic` 自测连续 panic 的次数。 / Number of panics the `thread-panic` self-test raises.
+pub const THREAD_PANIC_SELF_TEST_COUNT: usize = 3;
 
 impl SelfTest {
     pub fn parse(value: Option<&str>) -> Result<Option<Self>, CrashDiagnosticsError> {
         match value.map(str::trim) {
             None | Some("") => Ok(None),
             Some("panic") => Ok(Some(Self::Panic)),
+            Some("thread-panic") => Ok(Some(Self::ThreadPanic)),
             Some("abort") => Ok(Some(Self::Abort)),
             Some("access-violation") => Ok(Some(Self::AccessViolation)),
+            Some("stack-overflow") => Ok(Some(Self::StackOverflow)),
             Some(_) => Err(CrashDiagnosticsError(format!(
-                "{CRASH_SELF_TEST_ENV} must be panic, abort or access-violation"
+                "{CRASH_SELF_TEST_ENV} must be panic, thread-panic, abort, access-violation or stack-overflow"
             ))),
         }
     }
@@ -210,8 +227,10 @@ impl SelfTest {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Panic => "panic",
+            Self::ThreadPanic => "thread-panic",
             Self::Abort => "abort",
             Self::AccessViolation => "access-violation",
+            Self::StackOverflow => "stack-overflow",
         }
     }
 }
@@ -236,6 +255,30 @@ struct InstalledState {
     #[cfg_attr(not(windows), allow(dead_code))]
     mini_dump: bool,
     self_test: Option<SelfTest>,
+    /// 单调时钟起点，供限流使用。 / Monotonic origin for the rate limit.
+    started: Instant,
+    limiter: ReportLimiter,
+    /// 目录里 `.txt` 报告的个数：启动时数一次，之后只在超过上限时才扫描目录。
+    /// Number of `.txt` reports: counted once at startup; the directory is scanned again only when over the limit.
+    report_count: AtomicUsize,
+}
+
+impl InstalledState {
+    /// 记一份新报告；超过上限时才扫描目录删除最旧的。 / Count a new report; scan and prune only when over the limit.
+    fn note_new_report(&self) {
+        let count = self.report_count.fetch_add(1, Ordering::AcqRel) + 1;
+        if count > self.max_reports {
+            let remaining = count_after_prune(&self.directory, REPORT_EXTENSION, self.max_reports);
+            self.report_count.store(remaining, Ordering::Release);
+        }
+    }
+}
+
+/// 清理后重新数一次；数不了时按上限计，下次仍会触发清理。
+/// Prune, then recount; if counting fails assume the limit so the next report prunes again.
+fn count_after_prune(directory: &Path, extension: &str, keep: usize) -> usize {
+    let _ = prune_oldest(directory, extension, keep);
+    count_crash_files(directory, extension).unwrap_or(keep)
 }
 
 static INSTALLED: OnceLock<InstalledState> = OnceLock::new();
@@ -255,9 +298,16 @@ pub fn recent_log_buffer(settings: &ResolvedCrashDiagnostics) -> Option<Arc<Rece
 /// When enabled: create the directory, prune old files, install the panic hook (report first, then the previous hook),
 /// install the Windows exception filter, raise the Unix core limit when `coreDump` is set. Fails if the directory
 /// cannot be created, so the process does not start.
+///
+/// `memory_backend_only`：所有租户都是内存后端时为 true。自测只允许在这种进程里运行，
+/// 其他后端设置了自测变量直接启动失败（报错退出，不崩溃），防止生产环境残留变量导致每次启动必崩。
+/// `memory_backend_only` is true when every tenant uses the memory backend. Self-tests are only allowed there; with any
+/// other backend a set self-test variable fails startup (an error exit, not a crash), so a leftover variable in
+/// production cannot crash every start.
 pub fn install(
     settings: &ResolvedCrashDiagnostics,
     recent: Option<Arc<RecentLogs>>,
+    memory_backend_only: bool,
 ) -> Result<(), CrashDiagnosticsError> {
     let self_test_value = std::env::var(CRASH_SELF_TEST_ENV).ok();
     if !settings.enabled {
@@ -273,13 +323,19 @@ pub fn install(
         return Ok(());
     }
     let self_test = SelfTest::parse(self_test_value.as_deref())?;
-    fs::create_dir_all(&settings.directory).map_err(|error| {
+    if self_test.is_some() && !memory_backend_only {
+        return Err(CrashDiagnosticsError(format!(
+            "{CRASH_SELF_TEST_ENV} is only allowed with the memory storage backend; unset it on real instances"
+        )));
+    }
+    create_private_dir_all(&settings.directory).map_err(|error| {
         CrashDiagnosticsError(format!(
             "cannot create crash diagnostics directory {}: {error}",
             settings.directory.display()
         ))
     })?;
-    let _ = prune_oldest(&settings.directory, REPORT_EXTENSION, settings.max_reports);
+    let report_count =
+        count_after_prune(&settings.directory, REPORT_EXTENSION, settings.max_reports);
     let _ = prune_oldest(&settings.directory, DUMP_EXTENSION, settings.max_dumps);
     let state = InstalledState {
         directory: settings.directory.clone(),
@@ -288,6 +344,9 @@ pub fn install(
         max_dumps: settings.max_dumps,
         mini_dump: settings.mini_dump,
         self_test,
+        started: Instant::now(),
+        limiter: ReportLimiter::new(PANIC_REPORT_MIN_INTERVAL_MS),
+        report_count: AtomicUsize::new(report_count),
     };
     if INSTALLED.set(state).is_err() {
         return Err(CrashDiagnosticsError(
@@ -315,20 +374,31 @@ fn install_panic_hook() {
         if let Some(state) = INSTALLED.get() {
             // 钩子里不能再 panic：所有写入错误都只报告到 stderr，并且不用会 panic 的 eprintln。
             // The hook must not panic: write errors only go to stderr, without the panicking eprintln.
-            match write_panic_report(state, info) {
-                Ok(path) => {
+            let elapsed_ms =
+                u64::try_from(state.started.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+            match state.limiter.admit(elapsed_ms) {
+                None => {
                     let _ = writeln!(
                         io::stderr(),
-                        "TiangZ DBProxy crash report written to {}",
-                        path.display()
+                        "TiangZ DBProxy crash report suppressed by the rate limit (one per {} ms)",
+                        PANIC_REPORT_MIN_INTERVAL_MS
                     );
                 }
-                Err(error) => {
-                    let _ = writeln!(
-                        io::stderr(),
-                        "TiangZ DBProxy could not write a crash report: {error}"
-                    );
-                }
+                Some(suppressed) => match write_panic_report(state, info, suppressed) {
+                    Ok(path) => {
+                        let _ = writeln!(
+                            io::stderr(),
+                            "TiangZ DBProxy crash report written to {}",
+                            path.display()
+                        );
+                    }
+                    Err(error) => {
+                        let _ = writeln!(
+                            io::stderr(),
+                            "TiangZ DBProxy could not write a crash report: {error}"
+                        );
+                    }
+                },
             }
         }
         previous(info);
@@ -359,7 +429,11 @@ fn panic_message<'a>(info: &'a PanicHookInfo<'_>) -> &'a str {
     }
 }
 
-fn write_panic_report(state: &InstalledState, info: &PanicHookInfo<'_>) -> io::Result<PathBuf> {
+fn write_panic_report(
+    state: &InstalledState,
+    info: &PanicHookInfo<'_>,
+    suppressed_since_last: u64,
+) -> io::Result<PathBuf> {
     let time = UtcTimestamp::now();
     let pid = std::process::id();
     let thread = std::thread::current();
@@ -379,6 +453,7 @@ fn write_panic_report(state: &InstalledState, info: &PanicHookInfo<'_>) -> io::R
             message: panic_message(info),
             location,
             backtrace: &backtrace,
+            suppressed_since_last,
         },
         &recent_section(state),
     );
@@ -388,7 +463,7 @@ fn write_panic_report(state: &InstalledState, info: &PanicHookInfo<'_>) -> io::R
         REPORT_EXTENSION,
         &text,
     )?;
-    let _ = prune_oldest(&state.directory, REPORT_EXTENSION, state.max_reports);
+    state.note_new_report();
     Ok(path)
 }
 
@@ -423,7 +498,7 @@ fn write_native_report(state: &InstalledState, exception: &windows::NativeExcept
                 }
                 Err(error) => {
                     drop(file);
-                    let _ = fs::remove_file(&path);
+                    let _ = std::fs::remove_file(&path);
                     format!("failed: {error}")
                 }
             },
@@ -445,6 +520,7 @@ fn write_native_report(state: &InstalledState, exception: &windows::NativeExcept
     );
     match write_new_text_file(&state.directory, &stem, REPORT_EXTENSION, &text) {
         Ok(path) => {
+            state.note_new_report();
             let _ = writeln!(
                 io::stderr(),
                 "TiangZ DBProxy native crash record written to {}",
@@ -458,7 +534,6 @@ fn write_native_report(state: &InstalledState, exception: &windows::NativeExcept
             );
         }
     }
-    let _ = prune_oldest(&state.directory, REPORT_EXTENSION, state.max_reports);
 }
 
 #[cfg(unix)]
@@ -473,8 +548,8 @@ fn install_native(settings: &ResolvedCrashDiagnostics) -> Result<(), CrashDiagno
                 core_pattern = pattern.as_deref().unwrap_or("unknown"),
                 "core dump size limit raised to unlimited"
             ),
-            Ok(unix::CoreLimit::CappedAtHardLimit(bytes)) => tracing::warn!(
-                hard_limit_bytes = bytes,
+            Ok(unix::CoreLimit::Capped(bytes)) => tracing::warn!(
+                soft_limit_bytes = bytes,
                 core_pattern = pattern.as_deref().unwrap_or("unknown"),
                 "core dump size limit raised only to the hard limit; raise it on the host or container (e.g. --ulimit core=-1)"
             ),
@@ -492,9 +567,10 @@ fn install_native(_settings: &ResolvedCrashDiagnostics) -> Result<(), CrashDiagn
     Ok(())
 }
 
-/// 自测入口：只有启用崩溃诊断且设置了 `TIANGZ_DBPROXY_CRASH_SELF_TEST` 时才会主动崩溃；只用于验证。
-/// Self-test hook: crashes deliberately only when crash diagnostics are on and `TIANGZ_DBPROXY_CRASH_SELF_TEST` is
-/// set. Verification only.
+/// 自测入口：只有启用崩溃诊断、内存后端且设置了 `TIANGZ_DBPROXY_CRASH_SELF_TEST` 时才会主动崩溃
+/// （`install` 已拒绝其他后端）；只用于验证。
+/// Self-test hook: crashes deliberately only when crash diagnostics are on, the backend is memory (`install` rejects
+/// others) and `TIANGZ_DBPROXY_CRASH_SELF_TEST` is set. Verification only.
 pub fn run_self_test_if_requested() {
     let Some(mode) = INSTALLED.get().and_then(|state| state.self_test) else {
         return;
@@ -512,7 +588,31 @@ fn trigger_self_test(mode: SelfTest) {
         SelfTest::Panic => {
             panic!("TiangZ DBProxy crash self-test ({CRASH_SELF_TEST_ENV}=panic)")
         }
+        SelfTest::ThreadPanic => {
+            for index in 1..=THREAD_PANIC_SELF_TEST_COUNT {
+                let joined = std::thread::Builder::new()
+                    .name(format!("crash-self-test-{index}"))
+                    .spawn(move || {
+                        panic!(
+                            "TiangZ DBProxy crash self-test ({CRASH_SELF_TEST_ENV}=thread-panic) #{index}"
+                        )
+                    })
+                    .map(std::thread::JoinHandle::join);
+                // 线程 panic 被 join 吸收，进程继续服务。 / The join absorbs the panic; the process keeps serving.
+                tracing::warn!(
+                    index,
+                    panicked = matches!(joined, Ok(Err(_))),
+                    "crash diagnostics self-test: background thread panicked; service continues"
+                );
+            }
+        }
         SelfTest::Abort => std::process::abort(),
+        SelfTest::StackOverflow => {
+            let depth = overflow_stack(0);
+            // 走不到这里；万一走到，也要以失败结束。 / Unreachable; abort if it ever returns.
+            tracing::error!(depth, "stack-overflow self-test returned unexpectedly");
+            std::process::abort();
+        }
         SelfTest::AccessViolation => {
             // 故意写入不可访问的低地址，制造真实的访问冲突 / SIGSEGV。
             // Deliberately write to an unmapped low address to cause a real access violation / SIGSEGV.
@@ -522,6 +622,18 @@ fn trigger_self_test(mode: SelfTest) {
             std::process::abort();
         }
     }
+}
+
+/// 无限递归，每层占 4 KiB 栈，直到栈溢出。调用后还有加法，不会被尾调用优化掉。
+/// Unbounded recursion using 4 KiB of stack per frame until it overflows; the addition after the call prevents
+/// tail-call optimisation.
+#[inline(never)]
+fn overflow_stack(depth: u64) -> u64 {
+    let frame = std::hint::black_box([depth.to_le_bytes()[0]; 4096]);
+    if std::hint::black_box(depth) == u64::MAX {
+        return 0;
+    }
+    overflow_stack(depth + 1).wrapping_add(u64::from(frame[usize::from(frame[0]) % 4096]))
 }
 
 #[cfg(test)]
@@ -646,6 +758,15 @@ mod tests {
             SelfTest::parse(Some("access-violation")).unwrap(),
             Some(SelfTest::AccessViolation)
         );
+        for mode in [
+            SelfTest::Panic,
+            SelfTest::ThreadPanic,
+            SelfTest::Abort,
+            SelfTest::AccessViolation,
+            SelfTest::StackOverflow,
+        ] {
+            assert_eq!(SelfTest::parse(Some(mode.as_str())).unwrap(), Some(mode));
+        }
         assert!(SelfTest::parse(Some("segfault")).is_err());
     }
 }

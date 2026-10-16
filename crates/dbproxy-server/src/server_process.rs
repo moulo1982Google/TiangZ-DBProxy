@@ -61,7 +61,7 @@ pub fn main_with_acceptance_worker(
         let (deployment, configs) = tiangz_dbproxy_server::tenant_config::load_deployment(path)?;
         // 崩溃诊断是进程级设置，`load_deployment` 已校验各租户一致。
         // Crash diagnostics are process-wide; `load_deployment` already checked that tenants agree.
-        init_logging_and_crash_diagnostics(&configs[0])?;
+        init_logging_and_crash_diagnostics(&configs)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(configs[0].runtime_worker_threads)
             .enable_all()
@@ -86,7 +86,7 @@ pub fn main_with_acceptance_worker(
     }
     let config_path = config_path_from_args(env::args())?;
     let config = load_config(config_path)?;
-    init_logging_and_crash_diagnostics(&config)?;
+    init_logging_and_crash_diagnostics(std::slice::from_ref(&config))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.runtime_worker_threads)
         .enable_all()
@@ -98,8 +98,13 @@ pub fn main_with_acceptance_worker(
 /// With crash diagnostics off, logging is set up exactly as before; when on, stdout output is also kept in the
 /// recent-log buffer.
 fn init_logging_and_crash_diagnostics(
-    config: &ResolvedDbProxyConfig,
+    configs: &[ResolvedDbProxyConfig],
 ) -> Result<(), Box<dyn Error>> {
+    let config = &configs[0];
+    // 自测只允许在全部是内存后端的进程里运行。 / Self-tests only run when every tenant uses the memory backend.
+    let memory_backend_only = configs
+        .iter()
+        .all(|config| matches!(config.storage, ResolvedStorage::Memory { .. }));
     let filter = EnvFilter::try_new(&config.log_filter)?;
     let recent = crash_diagnostics::recent_log_buffer(&config.crash_diagnostics);
     match recent.clone() {
@@ -113,7 +118,7 @@ fn init_logging_and_crash_diagnostics(
             .with_ansi(false)
             .init(),
     }
-    crash_diagnostics::install(&config.crash_diagnostics, recent)?;
+    crash_diagnostics::install(&config.crash_diagnostics, recent, memory_backend_only)?;
     Ok(())
 }
 

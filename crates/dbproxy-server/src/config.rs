@@ -530,15 +530,16 @@ pub fn config_path_from_args(
 /// 加载严格 JSON 并解析密钥引用。未知字段、空环境变量和危险的零值都会在联网前失败。
 /// Load strict JSON and resolve secret references. Unknown fields, empty variables, and unsafe zeroes fail before networking.
 pub fn load_config(path: impl AsRef<Path>) -> Result<ResolvedDbProxyConfig, ConfigError> {
-    let mut config = load_config_with(path, |name| env::var(name).ok())?;
-    config.crash_diagnostics = config
-        .crash_diagnostics
-        .with_environment_override(crash_diagnostics_override().as_deref())?;
-    Ok(config)
+    load_config_with_crash_override(
+        path,
+        |name| env::var(name).ok(),
+        crash_diagnostics_override().as_deref(),
+    )
 }
 
-/// 崩溃诊断开关的环境变量不是密钥，离线预检也读取它，取值错误同样在启动前报出。
-/// The crash-diagnostics switch is not a secret; offline checks read it too so a bad value fails before startup.
+/// 崩溃诊断开关的环境变量不是密钥，离线预检也读取它；取值错误在读取任何密钥之前报出。
+/// The crash-diagnostics switch is not a secret; offline checks read it too, and a bad value fails before any
+/// secret is read.
 fn crash_diagnostics_override() -> Option<String> {
     env::var(crate::crash_diagnostics::CRASH_DIAGNOSTICS_ENV).ok()
 }
@@ -552,22 +553,33 @@ pub fn check_config(path: impl AsRef<Path>) -> Result<(), ConfigError> {
     let config: DbProxyConfig =
         serde_json::from_str(&text).map_err(|e| ConfigError(format!("invalid config: {e}")))?;
     let filter = config.logging.filter_env.clone();
-    let resolved = config.resolve(path, |name| {
-        if name == filter {
-            None
-        } else {
-            Some("redis://config-check.invalid/0".into())
-        }
-    })?;
-    resolved
-        .crash_diagnostics
-        .with_environment_override(crash_diagnostics_override().as_deref())?;
+    config.resolve(
+        path,
+        |name| {
+            if name == filter {
+                None
+            } else {
+                Some("redis://config-check.invalid/0".into())
+            }
+        },
+        crash_diagnostics_override().as_deref(),
+    )?;
     Ok(())
 }
 
+/// 测试用：不应用崩溃诊断环境变量覆盖。 / For tests: the crash-diagnostics environment override is not applied.
+#[cfg(test)]
 pub(crate) fn load_config_with(
     path: impl AsRef<Path>,
     environment: impl Fn(&str) -> Option<String>,
+) -> Result<ResolvedDbProxyConfig, ConfigError> {
+    load_config_with_crash_override(path, environment, None)
+}
+
+pub(crate) fn load_config_with_crash_override(
+    path: impl AsRef<Path>,
+    environment: impl Fn(&str) -> Option<String>,
+    crash_override: Option<&str>,
 ) -> Result<ResolvedDbProxyConfig, ConfigError> {
     let path = path.as_ref();
     let content = fs::read_to_string(path)
@@ -578,7 +590,7 @@ pub(crate) fn load_config_with(
             path.display()
         ))
     })?;
-    config.resolve(path, environment)
+    config.resolve(path, environment, crash_override)
 }
 
 impl DbProxyConfig {
@@ -586,6 +598,7 @@ impl DbProxyConfig {
         self,
         source: &Path,
         environment: impl Fn(&str) -> Option<String>,
+        crash_override: Option<&str>,
     ) -> Result<ResolvedDbProxyConfig, ConfigError> {
         if self.config_version != 1 {
             return Err(ConfigError(format!(
@@ -631,7 +644,12 @@ impl DbProxyConfig {
         let cache_repair = resolve_retry_queue("cacheRepair", self.cache_repair)?;
         let outbox = resolve_retry_queue("outbox", self.outbox)?;
         let outbox_relay = self.outbox_relay.resolve(outbox.lease_ms, &environment)?;
-        let crash_diagnostics = self.diagnostics.crash.resolve(source)?;
+        // 在读取任何密钥之前解析并应用环境变量覆盖。 / Resolved, override included, before any secret is read.
+        let crash_diagnostics = self
+            .diagnostics
+            .crash
+            .resolve(source)?
+            .with_environment_override(crash_override)?;
 
         let auth_token = required_environment(&environment, &self.server.auth_token_env)?;
         let storage = match self.storage {
@@ -1127,6 +1145,28 @@ mod tests {
             fs::remove_file(path).unwrap();
             assert!(result.is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn crash_diagnostics_override_applies_and_bad_values_fail_before_secrets() {
+        let base = serde_json::json!({"configVersion":1,"server":{"listenAddr":"127.0.0.1:0","authTokenEnv":"AUTH"},"storage":{"backend":"memory","shards":1}});
+        let path = write_config(&base.to_string());
+        let forced =
+            load_config_with_crash_override(&path, |_| Some("0123456789abcdef".into()), Some("on"))
+                .unwrap();
+        let rejected = load_config_with_crash_override(
+            &path,
+            |_| panic!("a bad crash override must fail before reading secrets"),
+            Some("enabled"),
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(forced.crash_diagnostics.enabled);
+        assert_eq!(forced.crash_diagnostics.environment_override, Some(true));
+        let error = rejected.unwrap_err().to_string();
+        assert!(
+            error.contains(crate::crash_diagnostics::CRASH_DIAGNOSTICS_ENV),
+            "{error}"
+        );
     }
 
     #[test]

@@ -57,6 +57,20 @@ impl Drop for Server {
 }
 
 fn spawn(scratch: &Scratch, crash: serde_json::Value, env: &[(&str, &str)]) -> Server {
+    spawn_with_storage(
+        scratch,
+        crash,
+        serde_json::json!({"backend": "memory", "shards": 1}),
+        env,
+    )
+}
+
+fn spawn_with_storage(
+    scratch: &Scratch,
+    crash: serde_json::Value,
+    storage: serde_json::Value,
+    env: &[(&str, &str)],
+) -> Server {
     let mut crash = crash;
     crash["directory"] = scratch.crash_dir().to_str().unwrap().into();
     let config = scratch.root.join("config.json");
@@ -66,7 +80,7 @@ fn spawn(scratch: &Scratch, crash: serde_json::Value, env: &[(&str, &str)]) -> S
             "configVersion": 1,
             "server": {"listenAddr": "127.0.0.1:0", "authTokenEnv": TOKEN_ENV, "shutdownGraceMs": 1000},
             "runtime": {"workerThreads": 2},
-            "storage": {"backend": "memory", "shards": 1},
+            "storage": storage,
             "logging": {"defaultFilter": "info"},
             "diagnostics": {"crash": crash}
         }))
@@ -201,6 +215,7 @@ fn panic_self_test_writes_report_with_backtrace_and_recent_logs_and_keeps_the_li
         "thread: main\n",
         "message: TiangZ DBProxy crash self-test (TIANGZ_DBPROXY_CRASH_SELF_TEST=panic)\n",
         "location: ",
+        "\nsuppressed_since_last: 0\n",
         "\nbacktrace:\n",
         "trigger_self_test",
         "\nrecent_logs: ",
@@ -269,6 +284,79 @@ fn invalid_switch_or_self_test_values_stop_startup() {
     }
 }
 
+#[test]
+fn survivable_thread_panics_write_one_report_and_the_service_keeps_running() {
+    let scratch = Scratch::new("thread-panic");
+    let mut server = spawn(
+        &scratch,
+        serde_json::json!({"enabled": true}),
+        &[("TIANGZ_DBPROXY_CRASH_SELF_TEST", "thread-panic")],
+    );
+    let pid = server.child.id();
+    wait_for_log(
+        &mut server,
+        &scratch,
+        "background thread panicked; service continues index=3 panicked=true",
+    );
+    let log = scratch.read_log();
+    // 三次 panic 都被 join 吸收；10 秒限流内只写第一份，其余两次只计数。
+    // All three panics are absorbed by join; within the 10 s limit only the first is written, the other two counted.
+    assert_eq!(log.matches("crash report written to").count(), 1, "{log}");
+    assert_eq!(
+        log.matches("crash report suppressed by the rate limit")
+            .count(),
+        2,
+        "{log}"
+    );
+    let report = fs::read_to_string(new_report(&scratch.crash_dir(), pid, "txt")).unwrap();
+    assert!(report.contains("thread: crash-self-test-1\n"), "{report}");
+    assert!(report.contains("thread-panic) #1\n"), "{report}");
+    assert!(report.contains("\nsuppressed_since_last: 0\n"), "{report}");
+
+    // 进程仍在服务：仍然存活，监听端口仍接受连接。
+    // The process keeps serving: still alive and the listener still accepts connections.
+    assert!(server.child.try_wait().unwrap().is_none(), "{log}");
+    let address = log
+        .lines()
+        .find_map(|line| line.split("actual_addr=").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("startup line with actual_addr");
+    std::net::TcpStream::connect(address).expect("listener still accepts connections");
+}
+
+#[test]
+fn self_test_is_refused_on_non_memory_backends_without_crashing_or_connecting() {
+    let scratch = Scratch::new("self-test-real-backend");
+    // 地址不可达也无妨：自测检查在任何连接之前就让启动失败。
+    // Unreachable addresses are fine: the self-test check fails startup before any connection.
+    let mut server = spawn_with_storage(
+        &scratch,
+        serde_json::json!({"enabled": true}),
+        serde_json::json!({
+            "backend": "postgresRedis",
+            "postgresUrlEnv": "CRASH_TEST_PG_URL",
+            "redisUrlEnv": "CRASH_TEST_REDIS_URL"
+        }),
+        &[
+            ("TIANGZ_DBPROXY_CRASH_SELF_TEST", "panic"),
+            (
+                "CRASH_TEST_PG_URL",
+                "postgres://unused@invalid.invalid/none",
+            ),
+            ("CRASH_TEST_REDIS_URL", "redis://invalid.invalid/0"),
+        ],
+    );
+    let status = wait_for_exit(&mut server, &scratch, Duration::from_secs(20));
+    let log = scratch.read_log();
+    assert_eq!(status.code(), Some(1), "an error exit, not a crash: {log}");
+    assert!(
+        log.contains("only allowed with the memory storage backend"),
+        "{log}"
+    );
+    assert!(!log.contains("panicked at"), "{log}");
+    assert!(!scratch.crash_dir().exists(), "{log}");
+}
+
 #[cfg(windows)]
 mod windows {
     use super::*;
@@ -328,6 +416,46 @@ mod windows {
                 dump.file_name().unwrap().to_string_lossy()
             ),
             "TiangZ DBProxy started",
+        ] {
+            assert!(
+                record.contains(expected),
+                "missing {expected:?} in:\n{record}"
+            );
+        }
+    }
+
+    #[test]
+    fn stack_overflow_writes_minidump_and_native_record_from_the_dump_thread() {
+        suppress_crash_dialogs();
+        let scratch = Scratch::new("stack-overflow");
+        let mut server = spawn(
+            &scratch,
+            serde_json::json!({"enabled": true, "miniDump": true}),
+            &[("TIANGZ_DBPROXY_CRASH_SELF_TEST", "stack-overflow")],
+        );
+        let pid = server.child.id();
+        let status = wait_for_exit(&mut server, &scratch, Duration::from_secs(120));
+        let log = scratch.read_log();
+        // Rust std 先打印栈溢出提示，再交给我们的过滤器；进程仍以 0xC00000FD 结束。
+        // Rust std prints its overflow message first, then our filter runs; the process still ends with 0xC00000FD.
+        assert_eq!(
+            status.code(),
+            Some(0xC000_00FD_u32 as i32),
+            "{status}: {log}"
+        );
+        assert!(log.contains("has overflowed its stack"), "{log}");
+        assert!(log.contains("native crash record written to"), "{log}");
+        let dump = new_report(&scratch.crash_dir(), pid, "dmp");
+        assert!(fs::read(&dump).unwrap().starts_with(b"MDMP"));
+        let record = fs::read_to_string(new_report(&scratch.crash_dir(), pid, "txt")).unwrap();
+        for expected in [
+            "kind: native-exception\n",
+            "exception_code: 0xC00000FD (EXCEPTION_STACK_OVERFLOW)\n",
+            &format!(
+                "minidump: {}\n",
+                dump.file_name().unwrap().to_string_lossy()
+            ),
+            "mode=\"stack-overflow\"",
         ] {
             assert!(
                 record.contains(expected),

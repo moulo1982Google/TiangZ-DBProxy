@@ -63,9 +63,11 @@ panic 钩子同步写报告，写完再调用原来的钩子，所以 panic 语�
 
 - 原钩子照常往 stderr 打印 `thread '…' panicked at …`；
 - 主线程 panic 仍以退出码 101 结束；
-- Tokio 任务里的 panic 仍由 Tokio 捕获、按原有逻辑处理（进程继续运行；后台 worker 的 `JoinSet` 在停机汇总时记录 `DBProxy worker stopped unexpectedly`）。这种情况也会写一份报告，进程不退出。
+- Tokio 任务里的 panic、请求隔离（`catch_unwind`）吸收的 panic 仍按原有逻辑处理（进程继续运行；后台 worker 的 `JoinSet` 在停机汇总时记录 `DBProxy worker stopped unexpectedly`）。这类可存活的 panic 也会写报告，进程不退出。
 
-写报告失败（目录被删、磁盘满等）只往 stderr 打一行 `could not write a crash report`，不会二次 panic。每次 panic 都写一份报告并强制采集回溯，连续 panic 时旧报告按 `maxReports` 删除。
+**限流**：写一份报告要在发生 panic 的线程上同步采集并符号化回溯、建文件、fsync，可存活的 panic 连续发生时会拖慢工作线程。因此**每 10 秒最多写一份 panic 报告**（常量 `PANIC_REPORT_MIN_INTERVAL_MS = 10000`，不可配置）。间隔内的 panic 不写报告，只计数，并往 stderr 打一行 `crash report suppressed by the rate limit`；下一份报告的 `suppressed_since_last:` 一栏写出此前被跳过的个数。代价是：如果一次可存活的 panic 之后 10 秒内又发生了让进程退出的 panic，后者不会单独写报告（前一份报告和 stderr 仍在）。限流只管 panic 报告；Windows 原生异常本来就只处理一次，不受限流影响。
+
+写报告失败（目录被删、磁盘满等）只往 stderr 打一行 `could not write a crash report`，不会二次 panic。
 
 ### 最近日志
 
@@ -77,7 +79,7 @@ panic 钩子同步写报告，写完再调用原来的钩子，所以 panic 语�
 
 ### Windows 原生异常与小型转储
 
-启用时安装未处理异常过滤器（`SetUnhandledExceptionFilter`）。崩溃线程只登记请求并等待，转储与文本记录由启动时预先创建的 `crash-dump` 线程完成，所以栈溢出这类栈空间不够的情况也能写出来（最多等 120 秒）。写完后交回原过滤器或系统默认处理，进程照常以原异常码结束（例如访问冲突为 `0xC0000005`），Windows 错误报告（WER）照常工作。只处理第一次未处理异常。
+启用时安装未处理异常过滤器（`SetUnhandledExceptionFilter`）。崩溃线程只登记请求并等待，转储与文本记录由启动时预先创建的 `crash-dump` 线程完成，所以栈溢出这类栈空间不够的情况也能写出来（2026-10-16 已用 `stack-overflow` 自测验证：Rust std 先打印 `has overflowed its stack`、再交给过滤器，退出码 `0xC00000FD`，`.dmp` 与文本记录都写出）。崩溃线程最多等 120 秒；超时时往 stderr 打一行 `crash dump timed out`，此时转储和文本记录可能缺失或不完整。写完后交回原过滤器或系统默认处理，进程照常以原异常码结束（例如访问冲突为 `0xC0000005`），Windows 错误报告（WER）照常工作。只处理第一次未处理异常。
 
 `miniDump` 开时用 `MiniDumpWriteDump` 写 `.dmp`，类型为 Normal + ThreadInfo + IndirectlyReferencedMemory + UnloadedModules + HandleData：包含所有线程的栈、栈上指针间接引用到的内存、句柄与模块列表，**不含完整堆**，通常几百 KB 到几 MB。分析时用 WinDbg 或 Visual Studio 打开，需要同一版本的 `tiangz-dbproxy-server.exe` 与 `.pdb`。
 
@@ -85,7 +87,7 @@ panic 钩子同步写报告，写完再调用原来的钩子，所以 panic 语�
 
 ### Linux core dump
 
-`coreDump` 开时启动阶段执行 `setrlimit(RLIMIT_CORE, 无限)`；硬上限不允许时退一步把软上限提到硬上限，并记一条 warn。启动日志会带上读到的 `/proc/sys/kernel/core_pattern`。
+`coreDump` 开时启动阶段执行 `setrlimit(RLIMIT_CORE, 无限)`；硬上限不允许时退一步把软上限提到硬上限，并记一条 warn。日志里的结果以调整后重新读到的软上限为准。启动日志会带上读到的 `/proc/sys/kernel/core_pattern`。
 
 **core 写到哪里不由 DBProxy 决定**，而由宿主机内核参数 `kernel.core_pattern` 决定，它在容器里是只读的、所有容器共用：
 
@@ -98,20 +100,34 @@ Linux 上原生崩溃不写文本记录：信号处理函数里能安全做的�
 
 ### 保留上限
 
-启动时和每次写入后，按文件修改时间只保留最新的 `maxReports` 个 `.txt` 和 `maxDumps` 个 `.dmp`。只处理 `crash-dbproxy-` 开头的文件，目录里其他文件不动。Linux core 文件不在这个目录里，由宿主机的收集程序或运维清理。
+按文件修改时间只保留最新的 `maxReports` 个 `.txt` 和 `maxDumps` 个 `.dmp`。只处理 `crash-dbproxy-` 开头的文件，目录里其他文件不动。Linux core 文件不在这个目录里，由宿主机的收集程序或运维清理。
+
+- 启动时扫描目录清理一次并记下报告个数；之后每写一份报告只在内存里加一，超过上限时才再扫描目录删除最旧的。转储在写出后清理。
+- **上限按目录计，不按进程。** 多个 DBProxy 实例共用一个目录时，它们会互相删除对方的旧文件，而且各自的计数互不知情、可能暂时超出上限。多实例请各用一个目录（例如每个实例一份配置，`directory` 写不同路径）。
+
+### 文件权限
+
+- Unix：新建的崩溃目录权限为 `0700`，报告与转储文件为 `0600`（再受进程 umask 影响，只会更严）；已经存在的目录不改权限。
+- Windows：目录和文件继承上级目录的 ACL，不单独设置。需要收紧时请给崩溃目录配置 ACL。
+
+### 默认目录与版本库
+
+默认目录 `logs/crash` 相对配置文件所在目录解析，直接用仓库里的 `configs/*.json` 启动时会落在 `configs/logs/crash`。仓库 `.gitignore` 已忽略 `/configs/logs/`，避免把报告或转储误提交。
 
 ## 自测（只用于验证）
 
-设置 `TIANGZ_DBPROXY_CRASH_SELF_TEST` 并且崩溃诊断已启用时，服务在打印 `TiangZ DBProxy started` 之后**主动崩溃**：
+设置 `TIANGZ_DBPROXY_CRASH_SELF_TEST`、崩溃诊断已启用、并且**存储是内存后端**（`storage.backend = "memory"`，多租户时所有租户都是）时，服务在打印 `TiangZ DBProxy started` 之后**主动崩溃**：
 
 | 取值 | 行为 | 预期结果 |
 |---|---|---|
 | `panic` | 主线程 panic | `.txt` 报告，退出码 101 |
+| `thread-panic` | 3 个后台线程依次 panic，被 join 吸收 | 进程继续服务；只写 1 份报告，另 2 次被限流计数 |
 | `abort` | `std::process::abort()` | Linux：SIGABRT，`coreDump` 开时有 core；Windows：不写报告（见局限） |
 | `access-violation` | 写地址 `0x10` | Windows：`.txt` 记录，`miniDump` 开时有 `.dmp`，退出码 `0xC0000005`；Linux：SIGSEGV，`coreDump` 开时有 core |
+| `stack-overflow` | 无限递归 | Windows：`.txt` 记录（`EXCEPTION_STACK_OVERFLOW`），`miniDump` 开时有 `.dmp`，退出码 `0xC00000FD`；Linux：Rust std 打印提示后以 SIGSEGV 结束（未在本机验证） |
 
 - 崩溃诊断关闭时设置了这个变量只记一条 warn，不崩溃；取值不在上表时启动失败。
-- **不要在生产或连着真实数据的实例上设置它。**
+- **非内存后端**（例如 `postgresRedis`）设置了这个变量时直接启动失败、以错误退出（退出码 1），不崩溃、不写转储，也不会连接数据库。这样生产环境误留的变量不会导致每次启动必崩，也不会在真实实例上产生含敏感内存的 `.dmp`。
 
 ## 局限
 
@@ -139,11 +155,13 @@ Linux 上原生崩溃不写文本记录：信号处理函数里能安全做的�
 - 配置字段：`diagnostics.crash.{enabled, directory, recentLogLines, miniDump, coreDump, maxReports, maxDumps}`，默认值与范围同上表。
 - 文件名：`crash-<进程名>-<pid>-<YYYYMMDDTHHMMSS.mmmZ>.<txt|dmp>`，DBProxy 的进程名固定为 `dbproxy`。
 - 报告格式（`format_version: 1`）：开头一行 `TiangZ crash report`，随后每行 `键: 值`，固定顺序为 `format_version`、`process`、`version`、`pid`、`platform`（`<os>-<arch>`）、`time_utc`（ISO 8601，毫秒，`Z` 结尾）、`kind`（`panic` 或 `native-exception`）；
-  - panic 再接 `thread`、`message`、`location`，空行，`backtrace:` 和回溯正文；
+  - panic 再接 `thread`、`message`、`location`、`suppressed_since_last`（上一份报告之后被限流跳过的 panic 数），空行，`backtrace:` 和回溯正文；
+  - panic 报告限流：每 10 秒最多一份；
   - 原生异常再接 `thread_id`、`exception_code`（`0x%08X` 加可选名称）、`exception_address`、可选 `access_violation`、`minidump`；
   - 最后空行加 `recent_logs: <行数> of <容量>`（或 `disabled` / `unavailable`）和日志行。
   - 值里有换行时，续行以两个空格开头。
-- 环境变量：DBProxy 用 `TIANGZ_DBPROXY_CRASH_DIAGNOSTICS`、`TIANGZ_DBPROXY_CRASH_SELF_TEST`；TiangZ 使用自己的变量名，取值约定（`on|off`；`panic|abort|access-violation`）相同。
+- 环境变量：DBProxy 用 `TIANGZ_DBPROXY_CRASH_DIAGNOSTICS`、`TIANGZ_DBPROXY_CRASH_SELF_TEST`；TiangZ 使用自己的变量名，取值约定（`on|off`；`panic|thread-panic|abort|access-violation|stack-overflow`）相同。
+- 文件权限：Unix 目录 `0700`、文件 `0600`；Windows 继承 ACL。
 
 ## 验证
 
@@ -152,7 +170,10 @@ Linux 上原生崩溃不写文本记录：信号处理函数里能安全做的�
   - panic 自测：退出码 101、原钩子输出仍在、报告含回溯（含 `trigger_self_test` 帧）与启动日志、`maxReports` 生效；
   - 环境变量 `off` 覆盖配置文件、自测被忽略；
   - 开关或自测取值错误时启动失败；
+  - `thread-panic` 自测：3 次后台线程 panic 只写 1 份报告、2 次被限流，进程仍存活且监听端口仍接受连接；
+  - 非内存后端设置自测变量：退出码 1、不崩溃、不建崩溃目录（连接串指向不可解析的地址，进程在连接前就退出）；
   - Windows：访问冲突自测，退出码 `0xC0000005`，`.dmp` 以 `MDMP` 开头，文本记录含异常码与访问地址，`maxDumps` 生效；
+  - Windows：栈溢出自测，退出码 `0xC00000FD`，`.dmp` 与 `EXCEPTION_STACK_OVERFLOW` 文本记录都写出；
   - Unix：`abort` 自测，进程死于 SIGABRT，启动日志含 core 上限调整结果（只在 CI 的 Linux 上跑）。
 - 2026-10-16 本机 Windows 结果与未验证项见发布说明草稿 `RELEASE-unreleased.md`。
 
@@ -163,10 +184,12 @@ Linux 上原生崩溃不写文本记录：信号处理函数里能安全做的�
 Crash diagnostics are **off by default**. Enable them with `diagnostics.crash.enabled` in the DBProxy config or with `TIANGZ_DBPROXY_CRASH_DIAGNOSTICS=on|off`, which takes precedence over the file. A relative `directory` (default `logs/crash`) is resolved against the config file's directory.
 
 - **Panics** (any thread): a report `crash-dbproxy-<pid>-<UTC>.txt` with version, pid, thread, message, location, a forced backtrace and the last `recentLogLines` (0–2000, default 200) log lines. The previous panic hook still runs afterwards, so exit codes and Tokio task handling are unchanged. Report-writing failures never panic.
+- **Rate limit**: at most one panic report every 10 s (constant). Panics inside the interval are only counted; the next report shows `suppressed_since_last: N`. A fatal panic within 10 s of a survivable one is not reported separately.
 - **Recent logs**: stdout output is copied line by line into a bounded ring buffer (≤ 2000 lines × 4 KiB). Nothing is added when disabled.
 - **Windows native crashes**: an unhandled-exception filter hands the work to a pre-spawned `crash-dump` thread, which writes a text record (exception code, address, access details) and, with `miniDump`, a `.dmp` (threads, stacks, indirectly referenced memory, handles; no full heap). The previous filter or the system default then runs, so the exit code is unchanged. `abort()` uses `__fastfail` and cannot be caught; use WER LocalDumps.
 - **Linux**: with `coreDump`, `RLIMIT_CORE` is raised at startup. Where cores go is set by the host's `kernel.core_pattern`; Docker needs `--ulimit core=-1` and a mounted directory when the pattern is a path; systemd units need `LimitCORE=infinity`. No text record is written for native crashes on Linux.
-- **Retention**: only the newest `maxReports` (default 50) `.txt` and `maxDumps` (default 5) `.dmp` files are kept, at startup and after each write; other files are untouched.
-- **Self-test** (verification only): `TIANGZ_DBPROXY_CRASH_SELF_TEST=panic|abort|access-violation` crashes the process right after startup when crash diagnostics are on.
+- **Retention**: only the newest `maxReports` (default 50) `.txt` and `maxDumps` (default 5) `.dmp` files are kept; the directory is scanned at startup and again only when the in-memory count exceeds the limit. Other files are untouched. Limits are per directory, not per process: give each instance its own directory.
+- **Permissions**: on Unix new crash directories are `0700` and files `0600`; on Windows they inherit the parent ACL. `/configs/logs/` is git-ignored.
+- **Self-test** (verification only): `TIANGZ_DBPROXY_CRASH_SELF_TEST=panic|thread-panic|abort|access-violation|stack-overflow` crashes the process right after startup when crash diagnostics are on **and the storage backend is memory**; with any other backend startup fails with an error instead.
 - **Release builds**: the release profile is unchanged. Linux backtraces keep function names but no line numbers; Windows needs the matching `.pdb` (check that the release artifacts include it; not verified here). Set `debug = "line-tables-only"` if line numbers are needed.
 - **Security**: dumps and cores contain process memory, including tokens and connection strings; restrict access to the directory.
