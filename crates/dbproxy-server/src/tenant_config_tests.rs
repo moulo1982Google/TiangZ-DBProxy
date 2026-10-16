@@ -103,6 +103,16 @@ fn reject_credentials_monitoring_and_runtime_ambiguity() {
     }
 }
 #[test]
+fn reject_crash_diagnostics_that_differ_between_tenants() {
+    let mut configs = configs();
+    configs[1].crash_diagnostics.enabled = !configs[0].crash_diagnostics.enabled;
+    let error = validate_isolation(&configs).unwrap_err().to_string();
+    assert!(error.contains("diagnostics.crash"), "{error}");
+    let mut configs = self::configs();
+    configs[1].crash_diagnostics.directory = configs[0].crash_diagnostics.directory.join("other");
+    assert!(validate_isolation(&configs).is_err());
+}
+#[test]
 fn invalid_connection_strings_do_not_leak_credentials() {
     let mut configs = configs();
     if let ResolvedStorage::PostgresRedis { postgres_url, .. } = &mut configs[0].storage {

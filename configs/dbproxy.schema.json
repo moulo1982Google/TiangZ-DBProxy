@@ -164,6 +164,26 @@
         "listenAddr": { "type": "string", "description": "Prometheus与健康探针HTTP监听地址；默认仅允许 loopback，必须仅暴露在本机或运维内网。" },
         "allowNonLoopback": { "type": "boolean", "default": false, "description": "显式允许私网或通配绑定；须通过防火墙/容器网络限制运维访问，不允许直接公网地址。" }
       }
+    },
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "crash": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "崩溃诊断，默认关闭；环境变量 TIANGZ_DBPROXY_CRASH_DIAGNOSTICS=on|off 覆盖 enabled。见 docs/crash-diagnostics.md。",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false, "description": "panic 时写崩溃报告（版本、线程、消息、位置、回溯、最近日志）。" },
+            "directory": { "type": "string", "minLength": 1, "default": "logs/crash", "description": "报告与转储目录；相对路径以本配置文件所在目录为基准。" },
+            "recentLogLines": { "type": "integer", "minimum": 0, "maximum": 2000, "default": 200, "description": "报告里附带的最近日志行数；0 表示不保留。" },
+            "miniDump": { "type": "boolean", "default": false, "description": "仅 Windows：未处理异常时写 .dmp 小型转储。" },
+            "coreDump": { "type": "boolean", "default": false, "description": "仅 Linux：启动时把 core 文件大小上限放开；core 写到哪里由宿主机 core_pattern 决定。" },
+            "maxReports": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 50, "description": "最多保留的文本报告数，超出删最旧的。" },
+            "maxDumps": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 5, "description": "最多保留的 .dmp 数，超出删最旧的。" }
+          }
+        }
+      }
     }
   }
 }

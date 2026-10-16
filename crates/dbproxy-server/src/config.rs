@@ -50,6 +50,9 @@ pub struct DbProxyConfig {
     pub logging: LoggingSection,
     #[serde(default)]
     pub observability: ObservabilitySection,
+    /// 崩溃诊断，默认关闭；见 `docs/crash-diagnostics.md`。 / Crash diagnostics, off by default.
+    #[serde(default)]
+    pub diagnostics: crate::crash_diagnostics::DiagnosticsSection,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -371,6 +374,9 @@ pub struct ResolvedDbProxyConfig {
     pub log_filter: String,
     pub observability_listen_addr: Option<SocketAddr>,
     pub observability_allow_non_loopback: bool,
+    /// 已应用 `TIANGZ_DBPROXY_CRASH_DIAGNOSTICS` 覆盖（仅 `load_config`）。
+    /// With the `TIANGZ_DBPROXY_CRASH_DIAGNOSTICS` override applied (by `load_config` only).
+    pub crash_diagnostics: crate::crash_diagnostics::ResolvedCrashDiagnostics,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -482,6 +488,7 @@ impl fmt::Debug for ResolvedDbProxyConfig {
             .field("cache_repair_workers", &self.cache_repair.workers)
             .field("outbox_workers", &self.outbox.workers)
             .field("observability_listen_addr", &self.observability_listen_addr)
+            .field("crash_diagnostics", &self.crash_diagnostics)
             .finish_non_exhaustive()
     }
 }
@@ -523,7 +530,17 @@ pub fn config_path_from_args(
 /// 加载严格 JSON 并解析密钥引用。未知字段、空环境变量和危险的零值都会在联网前失败。
 /// Load strict JSON and resolve secret references. Unknown fields, empty variables, and unsafe zeroes fail before networking.
 pub fn load_config(path: impl AsRef<Path>) -> Result<ResolvedDbProxyConfig, ConfigError> {
-    load_config_with(path, |name| env::var(name).ok())
+    let mut config = load_config_with(path, |name| env::var(name).ok())?;
+    config.crash_diagnostics = config
+        .crash_diagnostics
+        .with_environment_override(crash_diagnostics_override().as_deref())?;
+    Ok(config)
+}
+
+/// 崩溃诊断开关的环境变量不是密钥，离线预检也读取它，取值错误同样在启动前报出。
+/// The crash-diagnostics switch is not a secret; offline checks read it too so a bad value fails before startup.
+fn crash_diagnostics_override() -> Option<String> {
+    env::var(crate::crash_diagnostics::CRASH_DIAGNOSTICS_ENV).ok()
 }
 
 /// 离线预检不读取环境密钥或联网；实际密钥可用性仍由正式启动检查。
@@ -535,13 +552,16 @@ pub fn check_config(path: impl AsRef<Path>) -> Result<(), ConfigError> {
     let config: DbProxyConfig =
         serde_json::from_str(&text).map_err(|e| ConfigError(format!("invalid config: {e}")))?;
     let filter = config.logging.filter_env.clone();
-    config.resolve(path, |name| {
+    let resolved = config.resolve(path, |name| {
         if name == filter {
             None
         } else {
             Some("redis://config-check.invalid/0".into())
         }
     })?;
+    resolved
+        .crash_diagnostics
+        .with_environment_override(crash_diagnostics_override().as_deref())?;
     Ok(())
 }
 
@@ -611,6 +631,7 @@ impl DbProxyConfig {
         let cache_repair = resolve_retry_queue("cacheRepair", self.cache_repair)?;
         let outbox = resolve_retry_queue("outbox", self.outbox)?;
         let outbox_relay = self.outbox_relay.resolve(outbox.lease_ms, &environment)?;
+        let crash_diagnostics = self.diagnostics.crash.resolve(source)?;
 
         let auth_token = required_environment(&environment, &self.server.auth_token_env)?;
         let storage = match self.storage {
@@ -787,6 +808,7 @@ impl DbProxyConfig {
             log_filter,
             observability_listen_addr: self.observability.listen_addr,
             observability_allow_non_loopback: self.observability.allow_non_loopback,
+            crash_diagnostics,
         })
     }
 }
@@ -1062,6 +1084,48 @@ mod tests {
                         .contains("maxInFlightPerConnection")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn crash_diagnostics_default_off_and_resolve_relative_to_the_config_file() {
+        let base = serde_json::json!({"configVersion":1,"server":{"listenAddr":"127.0.0.1:0","authTokenEnv":"AUTH"},"storage":{"backend":"memory","shards":1}});
+        let path = write_config(&base.to_string());
+        let config = load_config_with(&path, |_| Some("0123456789abcdef".into())).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(!config.crash_diagnostics.enabled);
+        assert_eq!(
+            config.crash_diagnostics.directory,
+            path.parent().unwrap().join("logs/crash")
+        );
+
+        let mut value = base.clone();
+        value["diagnostics"] = serde_json::json!({"crash":{"enabled":true,"directory":"crash-out","recentLogLines":5,"miniDump":true,"maxReports":2,"maxDumps":1}});
+        let path = write_config(&value.to_string());
+        let config = load_config_with(&path, |_| Some("0123456789abcdef".into())).unwrap();
+        fs::remove_file(&path).unwrap();
+        let crash = &config.crash_diagnostics;
+        assert!(crash.enabled && crash.mini_dump && !crash.core_dump);
+        assert_eq!(crash.directory, path.parent().unwrap().join("crash-out"));
+        assert_eq!(
+            (crash.recent_log_lines, crash.max_reports, crash.max_dumps),
+            (5, 2, 1)
+        );
+
+        for invalid in [
+            serde_json::json!({"crash":{"recentLogLines":2001}}),
+            serde_json::json!({"crash":{"maxReports":0}}),
+            serde_json::json!({"crash":{"unknownField":true}}),
+            serde_json::json!({"unknownSection":{}}),
+        ] {
+            let mut value = base.clone();
+            value["diagnostics"] = invalid.clone();
+            let path = write_config(&value.to_string());
+            let result = load_config_with(&path, |_| {
+                panic!("invalid diagnostics must fail before reading secrets")
+            });
+            fs::remove_file(path).unwrap();
+            assert!(result.is_err(), "{invalid}");
         }
     }
 
