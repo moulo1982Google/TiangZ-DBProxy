@@ -212,7 +212,7 @@ fn panic_self_test_writes_report_with_backtrace_and_recent_logs_and_keeps_the_li
         "process: dbproxy\n",
         &format!("pid: {pid}\n"),
         "kind: panic\n",
-        "thread: main\n",
+        "thread: main (ThreadId(",
         "message: TiangZ DBProxy crash self-test (TIANGZ_DBPROXY_CRASH_SELF_TEST=panic)\n",
         "location: ",
         "\nsuppressed_since_last: 0\n",
@@ -309,7 +309,10 @@ fn survivable_thread_panics_write_one_report_and_the_service_keeps_running() {
         "{log}"
     );
     let report = fs::read_to_string(new_report(&scratch.crash_dir(), pid, "txt")).unwrap();
-    assert!(report.contains("thread: crash-self-test-1\n"), "{report}");
+    assert!(
+        report.contains("thread: crash-self-test-1 (ThreadId("),
+        "{report}"
+    );
     assert!(report.contains("thread-panic) #1\n"), "{report}");
     assert!(report.contains("\nsuppressed_since_last: 0\n"), "{report}");
 
@@ -322,6 +325,72 @@ fn survivable_thread_panics_write_one_report_and_the_service_keeps_running() {
         .and_then(|rest| rest.split_whitespace().next())
         .expect("startup line with actual_addr");
     std::net::TcpStream::connect(address).expect("listener still accepts connections");
+}
+
+#[test]
+fn fatal_main_thread_panic_bypasses_the_limit_and_flushes_the_suppressed_one() {
+    let scratch = Scratch::new("panic-after-thread-panic");
+    let mut server = spawn(
+        &scratch,
+        serde_json::json!({"enabled": true}),
+        &[("TIANGZ_DBPROXY_CRASH_SELF_TEST", "panic-after-thread-panic")],
+    );
+    let pid = server.child.id();
+    let status = wait_for_exit(&mut server, &scratch, Duration::from_secs(60));
+    let log = scratch.read_log();
+    assert_eq!(status.code(), Some(101), "{status}: {log}");
+    // 后台线程 #1 写报告、#2 被限流；主线程 panic 先补写 #2，再写自己的。
+    // Background #1 is reported, #2 is rate-limited; the main-thread panic writes #2 as deferred, then itself.
+    assert_eq!(
+        log.matches("crash report suppressed by the rate limit")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert_eq!(log.matches("crash report written to").count(), 3, "{log}");
+
+    let prefix = format!("crash-dbproxy-{pid}-");
+    let reports = files_with_extension(&scratch.crash_dir(), "txt")
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&prefix)
+        })
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(reports.len(), 3, "{reports:#?}");
+    let find = |needle: &str| {
+        let matching = reports
+            .iter()
+            .filter(|report| report.contains(needle))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{needle:?} in {reports:#?}");
+        matching[0].clone()
+    };
+    let first = find("panic-after-thread-panic) #1\n");
+    assert!(!first.contains("\ndeferred: true\n"), "{first}");
+    let deferred = find("panic-after-thread-panic) #2\n");
+    assert!(
+        deferred.contains("thread: crash-self-test-2 (ThreadId("),
+        "{deferred}"
+    );
+    assert!(
+        deferred.contains(
+            "\nsuppressed_since_last: 0\ndeferred: true\ndeferred_reason: main-thread-panic\n\nbacktrace:\n"
+        ),
+        "{deferred}"
+    );
+    let fatal = find(
+        "message: TiangZ DBProxy crash self-test (TIANGZ_DBPROXY_CRASH_SELF_TEST=panic-after-thread-panic)\n",
+    );
+    assert!(fatal.contains("thread: main (ThreadId("), "{fatal}");
+    assert!(
+        fatal.contains("\nsuppressed_since_last: 0\n\nbacktrace:\n"),
+        "{fatal}"
+    );
+    assert!(fatal.contains("trigger_self_test"), "{fatal}");
 }
 
 #[test]

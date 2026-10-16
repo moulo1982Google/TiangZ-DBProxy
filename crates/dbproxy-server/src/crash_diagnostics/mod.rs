@@ -16,24 +16,23 @@ pub use recent_logs::{
 };
 pub use report::{
     DUMP_EXTENSION, FILE_PREFIX, NativeDetails, PANIC_REPORT_MIN_INTERVAL_MS, PROCESS_NAME,
-    PanicDetails, REPORT_EXTENSION, REPORT_FORMAT_VERSION, RecentLogSection, ReportHeader,
-    ReportLimiter, UtcTimestamp, access_operation, count_crash_files, create_new_file,
-    create_private_dir_all, exception_name, file_stem, prune_oldest, render_native_report,
-    render_panic_report, write_new_text_file,
+    PanicCapture, PanicDetails, REPORT_EXTENSION, REPORT_FORMAT_VERSION, RecentLogSection,
+    ReportHeader, ReportLimiter, UtcTimestamp, access_operation, count_crash_files,
+    create_new_file, create_private_dir_all, exception_name, file_stem, prune_oldest,
+    render_native_report, render_panic_report, write_new_text_file,
 };
 
 use std::{
-    backtrace::Backtrace,
     error::Error,
     fmt,
     io::{self, Write},
     panic::PanicHookInfo,
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock, TryLockError,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
@@ -43,10 +42,11 @@ use crate::config::ConfigError;
 /// 覆盖 `diagnostics.crash.enabled` 的环境变量，取值 `on` 或 `off`（不区分大小写，空值等于未设置）。
 /// Environment variable overriding `diagnostics.crash.enabled`: `on` or `off` (case-insensitive; empty = unset).
 pub const CRASH_DIAGNOSTICS_ENV: &str = "TIANGZ_DBPROXY_CRASH_DIAGNOSTICS";
-/// 仅用于验证：`panic`、`thread-panic`、`abort`、`access-violation` 或 `stack-overflow`。启用崩溃诊断且
-/// 存储为内存后端时，启动完成后主动触发；其他后端拒绝启动。
-/// Verification only: `panic`, `thread-panic`, `abort`, `access-violation` or `stack-overflow`. Triggered after
-/// startup when crash diagnostics are on and the storage backend is memory; other backends refuse to start.
+/// 仅用于验证：`panic`、`thread-panic`、`panic-after-thread-panic`、`abort`、`access-violation` 或
+/// `stack-overflow`。启用崩溃诊断且存储为内存后端时，启动完成后主动触发；其他后端拒绝启动。
+/// Verification only: `panic`, `thread-panic`, `panic-after-thread-panic`, `abort`, `access-violation` or
+/// `stack-overflow`. Triggered after startup when crash diagnostics are on and the storage backend is memory; other
+/// backends refuse to start.
 pub const CRASH_SELF_TEST_ENV: &str = "TIANGZ_DBPROXY_CRASH_SELF_TEST";
 
 pub const DEFAULT_CRASH_DIRECTORY: &str = "logs/crash";
@@ -201,6 +201,10 @@ pub enum SelfTest {
     /// 后台线程连续 panic 三次，进程继续服务；验证可存活 panic 与限流。
     /// Three panics on background threads while the process keeps serving; checks survivable panics and the limit.
     ThreadPanic,
+    /// 后台线程先 panic 两次（第二次被限流），然后主线程 panic；验证致命 panic 不受限流并补写被限流的那一次。
+    /// Two background-thread panics (the second rate-limited), then a main-thread panic; checks that the fatal panic
+    /// bypasses the limit and the suppressed one is written as deferred.
+    PanicAfterThreadPanic,
     Abort,
     AccessViolation,
     StackOverflow,
@@ -215,11 +219,12 @@ impl SelfTest {
             None | Some("") => Ok(None),
             Some("panic") => Ok(Some(Self::Panic)),
             Some("thread-panic") => Ok(Some(Self::ThreadPanic)),
+            Some("panic-after-thread-panic") => Ok(Some(Self::PanicAfterThreadPanic)),
             Some("abort") => Ok(Some(Self::Abort)),
             Some("access-violation") => Ok(Some(Self::AccessViolation)),
             Some("stack-overflow") => Ok(Some(Self::StackOverflow)),
             Some(_) => Err(CrashDiagnosticsError(format!(
-                "{CRASH_SELF_TEST_ENV} must be panic, thread-panic, abort, access-violation or stack-overflow"
+                "{CRASH_SELF_TEST_ENV} must be panic, thread-panic, panic-after-thread-panic, abort, access-violation or stack-overflow"
             ))),
         }
     }
@@ -228,6 +233,7 @@ impl SelfTest {
         match self {
             Self::Panic => "panic",
             Self::ThreadPanic => "thread-panic",
+            Self::PanicAfterThreadPanic => "panic-after-thread-panic",
             Self::Abort => "abort",
             Self::AccessViolation => "access-violation",
             Self::StackOverflow => "stack-overflow",
@@ -372,37 +378,137 @@ fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if let Some(state) = INSTALLED.get() {
-            // 钩子里不能再 panic：所有写入错误都只报告到 stderr，并且不用会 panic 的 eprintln。
-            // The hook must not panic: write errors only go to stderr, without the panicking eprintln.
-            let elapsed_ms =
-                u64::try_from(state.started.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
-            match state.limiter.admit(elapsed_ms) {
-                None => {
-                    let _ = writeln!(
-                        io::stderr(),
-                        "TiangZ DBProxy crash report suppressed by the rate limit (one per {} ms)",
-                        PANIC_REPORT_MIN_INTERVAL_MS
-                    );
-                }
-                Some(suppressed) => match write_panic_report(state, info, suppressed) {
-                    Ok(path) => {
-                        let _ = writeln!(
-                            io::stderr(),
-                            "TiangZ DBProxy crash report written to {}",
-                            path.display()
-                        );
-                    }
-                    Err(error) => {
-                        let _ = writeln!(
-                            io::stderr(),
-                            "TiangZ DBProxy could not write a crash report: {error}"
-                        );
-                    }
-                },
-            }
+            handle_panic(state, info);
         }
         previous(info);
     }));
+}
+
+/// std 在不能展开的位置 panic 时使用的消息前缀；这类 panic 之后进程必然 abort（与 TiangZ 一致）。
+/// Message prefixes std uses for panics where unwinding is impossible; the process always aborts afterwards (same
+/// list as TiangZ).
+const NOUNWIND_PANIC_MESSAGES: [&str; 2] = [
+    "panic in a function that cannot unwind",
+    "panic in a destructor during cleanup",
+];
+
+/// 致命 panic 的原因：主线程（`block_on` 所在线程）panic 会结束进程；不能展开的 panic 之后进程 abort。
+/// Tokio 任务里的 panic 由 Tokio 兜住，不算致命。
+/// Why a panic is fatal: a main-thread panic (the `block_on` thread) ends the process; a non-unwinding panic is
+/// followed by an abort. Panics inside Tokio tasks are caught by Tokio and are not fatal.
+fn fatal_reason(thread_name: Option<&str>, message: &str) -> Option<&'static str> {
+    if NOUNWIND_PANIC_MESSAGES
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+    {
+        Some("non-unwinding-panic")
+    } else if thread_name == Some("main") {
+        Some("main-thread-panic")
+    } else {
+        None
+    }
+}
+
+/// 钩子主体。钩子里不能再 panic（std 会直接 abort）：所有错误只写 stderr，且不用会 panic 的 eprintln；
+/// 也不能阻塞：缓存槽只 try_lock 一次，拿不到就放弃缓存。
+/// 每次 panic 都廉价采集现场（未符号化的回溯）；限流只拦“符号化 + 写盘 + fsync”。被拦下的最后一次 panic 存进
+/// 只保留一份的缓存槽，之后若发生致命 panic，先把它补写成报告（`deferred: true`），再写致命那一份。
+/// Hook body. It must not panic (std would abort): errors only go to stderr without the panicking eprintln. It must
+/// not block either: the slot is try-locked once and caching is skipped if that fails.
+/// Every panic is captured cheaply (unsymbolised backtrace); the limit only gates symbolising, writing and fsync.
+/// The latest suppressed panic is kept in a single-entry slot; a later fatal panic first writes it as a deferred
+/// report, then its own.
+fn handle_panic(state: &InstalledState, info: &PanicHookInfo<'_>) {
+    let message = panic_message(info);
+    let location = info.location().map(|location| {
+        format!(
+            "{}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        )
+    });
+    let capture = PanicCapture::capture(message, location);
+    let fatal = fatal_reason(std::thread::current().name(), message);
+    let now_ms = u64::try_from(state.started.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+    if let Some(reason) = fatal {
+        flush_deferred_panic(state, reason);
+    }
+    let admitted = match fatal {
+        Some(_) => Some(state.limiter.admit_unconditionally(now_ms)),
+        None => state.limiter.admit(now_ms),
+    };
+    match admitted {
+        Some(suppressed) => {
+            report_written(write_panic_report(state, &capture, suppressed, None));
+            // 已经写出一份报告，此前缓存的被限流 panic 不再补写。 / A report was written; drop the older cached one.
+            if let Some(mut slot) = lock_deferred(false) {
+                *slot = None;
+            }
+        }
+        None => {
+            let _ = writeln!(
+                io::stderr(),
+                "TiangZ DBProxy crash report suppressed by the rate limit (one per {PANIC_REPORT_MIN_INTERVAL_MS} ms)"
+            );
+            if let Some(mut slot) = lock_deferred(false) {
+                *slot = Some(capture);
+            }
+        }
+    }
+}
+
+/// 最近一次被限流的 panic；只存一份，内存有界。 / The latest rate-limited panic; a single entry, so memory is bounded.
+static DEFERRED_PANIC: Mutex<Option<PanicCapture>> = Mutex::new(None);
+
+/// `wait` 为 false 时只试一次；为 true 时（致命路径）最多重试约 100 ms。不会无限阻塞。
+/// With `wait` false only one attempt is made; with `wait` true (fatal path) it retries for about 100 ms. Never
+/// blocks indefinitely.
+fn lock_deferred(wait: bool) -> Option<MutexGuard<'static, Option<PanicCapture>>> {
+    let attempts = if wait { 150 } else { 1 };
+    for attempt in 0..attempts {
+        match DEFERRED_PANIC.try_lock() {
+            Ok(slot) => return Some(slot),
+            Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) if attempt < 50 => std::thread::yield_now(),
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    None
+}
+
+/// 致命路径：把缓存槽里最后一次被限流的 panic 补写成报告。槽为空时什么也不做。
+/// Fatal path: write the latest rate-limited panic from the slot as a deferred report. Does nothing when empty.
+fn flush_deferred_panic(state: &InstalledState, reason: &str) {
+    let Some(capture) = lock_deferred(true).and_then(|mut slot| slot.take()) else {
+        return;
+    };
+    // 被补写的这一次本身也计在跳过数里，扣掉它。 / The deferred panic itself was counted as skipped; exclude it.
+    let suppressed = state.limiter.take_suppressed().saturating_sub(1);
+    report_written(write_panic_report(
+        state,
+        &capture,
+        suppressed,
+        Some(reason),
+    ));
+}
+
+fn report_written(result: io::Result<PathBuf>) {
+    match result {
+        Ok(path) => {
+            let _ = writeln!(
+                io::stderr(),
+                "TiangZ DBProxy crash report written to {}",
+                path.display()
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "TiangZ DBProxy could not write a crash report: {error}"
+            );
+        }
+    }
 }
 
 fn recent_section(state: &InstalledState) -> RecentLogSection {
@@ -431,29 +537,23 @@ fn panic_message<'a>(info: &'a PanicHookInfo<'_>) -> &'a str {
 
 fn write_panic_report(
     state: &InstalledState,
-    info: &PanicHookInfo<'_>,
+    capture: &PanicCapture,
     suppressed_since_last: u64,
+    deferred_reason: Option<&str>,
 ) -> io::Result<PathBuf> {
     let time = UtcTimestamp::now();
     let pid = std::process::id();
-    let thread = std::thread::current();
-    let location = info.location().map(|location| {
-        format!(
-            "{}:{}:{}",
-            location.file(),
-            location.line(),
-            location.column()
-        )
-    });
-    let backtrace = Backtrace::force_capture().to_string();
+    // 到这里才符号化。 / Symbolised only here.
+    let backtrace = capture.backtrace.to_string();
     let text = render_panic_report(
         &ReportHeader::new(pid, time, "panic"),
         &PanicDetails {
-            thread: thread.name().unwrap_or("<unnamed>"),
-            message: panic_message(info),
-            location,
+            thread: &capture.thread,
+            message: &capture.message,
+            location: capture.location.clone(),
             backtrace: &backtrace,
             suppressed_since_last,
+            deferred_reason,
         },
         &recent_section(state),
     );
@@ -588,23 +688,12 @@ fn trigger_self_test(mode: SelfTest) {
         SelfTest::Panic => {
             panic!("TiangZ DBProxy crash self-test ({CRASH_SELF_TEST_ENV}=panic)")
         }
-        SelfTest::ThreadPanic => {
-            for index in 1..=THREAD_PANIC_SELF_TEST_COUNT {
-                let joined = std::thread::Builder::new()
-                    .name(format!("crash-self-test-{index}"))
-                    .spawn(move || {
-                        panic!(
-                            "TiangZ DBProxy crash self-test ({CRASH_SELF_TEST_ENV}=thread-panic) #{index}"
-                        )
-                    })
-                    .map(std::thread::JoinHandle::join);
-                // 线程 panic 被 join 吸收，进程继续服务。 / The join absorbs the panic; the process keeps serving.
-                tracing::warn!(
-                    index,
-                    panicked = matches!(joined, Ok(Err(_))),
-                    "crash diagnostics self-test: background thread panicked; service continues"
-                );
-            }
+        SelfTest::ThreadPanic => panic_background_threads(mode, THREAD_PANIC_SELF_TEST_COUNT),
+        SelfTest::PanicAfterThreadPanic => {
+            panic_background_threads(mode, 2);
+            panic!(
+                "TiangZ DBProxy crash self-test ({CRASH_SELF_TEST_ENV}=panic-after-thread-panic)"
+            )
         }
         SelfTest::Abort => std::process::abort(),
         SelfTest::StackOverflow => {
@@ -621,6 +710,28 @@ fn trigger_self_test(mode: SelfTest) {
             unsafe { std::ptr::without_provenance_mut::<u8>(address).write_volatile(0xA5) };
             std::process::abort();
         }
+    }
+}
+
+/// 依次启动 `count` 个后台线程并让它们 panic；panic 被 join 吸收，进程继续服务。
+/// Spawn `count` background threads one after another and let each panic; join absorbs the panic and the process
+/// keeps serving.
+fn panic_background_threads(mode: SelfTest, count: usize) {
+    for index in 1..=count {
+        let joined = std::thread::Builder::new()
+            .name(format!("crash-self-test-{index}"))
+            .spawn(move || {
+                panic!(
+                    "TiangZ DBProxy crash self-test ({CRASH_SELF_TEST_ENV}={}) #{index}",
+                    mode.as_str()
+                )
+            })
+            .map(std::thread::JoinHandle::join);
+        tracing::warn!(
+            index,
+            panicked = matches!(joined, Ok(Err(_))),
+            "crash diagnostics self-test: background thread panicked; service continues"
+        );
     }
 }
 
@@ -743,6 +854,29 @@ mod tests {
     }
 
     #[test]
+    fn fatal_panics_are_main_thread_or_non_unwinding() {
+        assert_eq!(
+            fatal_reason(Some("main"), "boom"),
+            Some("main-thread-panic")
+        );
+        assert_eq!(fatal_reason(Some("tokio-runtime-worker"), "boom"), None);
+        assert_eq!(fatal_reason(None, "boom"), None);
+        for message in NOUNWIND_PANIC_MESSAGES {
+            assert_eq!(
+                fatal_reason(Some("tokio-runtime-worker"), &format!("{message} (extra)")),
+                Some("non-unwinding-panic")
+            );
+        }
+        assert_eq!(
+            fatal_reason(
+                Some("worker"),
+                "boom: panic in a function that cannot unwind"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn self_test_values_are_strict() {
         assert_eq!(SelfTest::parse(None).unwrap(), None);
         assert_eq!(SelfTest::parse(Some("")).unwrap(), None);
@@ -761,6 +895,7 @@ mod tests {
         for mode in [
             SelfTest::Panic,
             SelfTest::ThreadPanic,
+            SelfTest::PanicAfterThreadPanic,
             SelfTest::Abort,
             SelfTest::AccessViolation,
             SelfTest::StackOverflow,

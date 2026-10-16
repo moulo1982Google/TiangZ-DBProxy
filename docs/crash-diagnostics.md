@@ -65,7 +65,14 @@ panic 钩子同步写报告，写完再调用原来的钩子，所以 panic 语�
 - 主线程 panic 仍以退出码 101 结束；
 - Tokio 任务里的 panic、请求隔离（`catch_unwind`）吸收的 panic 仍按原有逻辑处理（进程继续运行；后台 worker 的 `JoinSet` 在停机汇总时记录 `DBProxy worker stopped unexpectedly`）。这类可存活的 panic 也会写报告，进程不退出。
 
-**限流**：写一份报告要在发生 panic 的线程上同步采集并符号化回溯、建文件、fsync，可存活的 panic 连续发生时会拖慢工作线程。因此**每 10 秒最多写一份 panic 报告**（常量 `PANIC_REPORT_MIN_INTERVAL_MS = 10000`，不可配置）。间隔内的 panic 不写报告，只计数，并往 stderr 打一行 `crash report suppressed by the rate limit`；下一份报告的 `suppressed_since_last:` 一栏写出此前被跳过的个数。代价是：如果一次可存活的 panic 之后 10 秒内又发生了让进程退出的 panic，后者不会单独写报告（前一份报告和 stderr 仍在）。限流只管 panic 报告；Windows 原生异常本来就只处理一次，不受限流影响。
+**限流**：符号化回溯、建文件、fsync 都在发生 panic 的线程上同步进行，可存活的 panic 连续发生时会拖慢工作线程。因此对**可存活的 panic 每 10 秒最多写一份报告**（常量 `PANIC_REPORT_MIN_INTERVAL_MS = 10000`，不可配置）。
+
+- 每次 panic 都先廉价采集现场：消息、位置、线程名与线程号，以及 `Backtrace::force_capture()` 得到的**未符号化**回溯（只遍历栈帧）。限流只拦后面的“符号化 + 写盘 + fsync”。
+- 被限流的 panic 不写报告，只计数，并往 stderr 打一行 `crash report suppressed by the rate limit`。最后一次被限流的现场存进一个**只保留一份**的缓存槽（内存有界）；钩子里只 `try_lock` 一次，拿不到就放弃缓存，不阻塞也不会 panic。下一份报告的 `suppressed_since_last:` 一栏写出此前被跳过的个数。
+- **致命 panic 不受限流**：主线程（`block_on` 所在线程，panic 后进程以 101 退出）的 panic，以及消息以 `panic in a function that cannot unwind` 或 `panic in a destructor during cleanup` 开头的 panic（之后进程必然 abort）。Tokio 任务里的 panic 被 Tokio 兜住，不算致命。
+- **补写**：致命 panic 发生时，先把缓存槽里那次被限流的 panic 补写成报告，报告在 `suppressed_since_last` 之后多两行 `deferred: true` 与 `deferred_reason: main-thread-panic`（或 `non-unwinding-panic`）；然后再写致命那一份。所以“可存活 panic 之后 10 秒内的致命 panic”不会丢报告。补写时缓存槽最多等约 100 ms，拿不到就跳过补写，致命那一份照写。
+- 正常写出一份报告后清空缓存槽；只在致命路径补写，进程正常运行时被限流的 panic 只留计数。
+- 限流只管 panic 报告；Windows 原生异常本来就只处理一次，不受限流影响。
 
 写报告失败（目录被删、磁盘满等）只往 stderr 打一行 `could not write a crash report`，不会二次 panic。
 
@@ -122,6 +129,7 @@ Linux 上原生崩溃不写文本记录：信号处理函数里能安全做的�
 |---|---|---|
 | `panic` | 主线程 panic | `.txt` 报告，退出码 101 |
 | `thread-panic` | 3 个后台线程依次 panic，被 join 吸收 | 进程继续服务；只写 1 份报告，另 2 次被限流计数 |
+| `panic-after-thread-panic` | 2 个后台线程依次 panic（第 2 次被限流），随后主线程 panic | 3 份报告：第 1 次、补写的第 2 次（`deferred: true`、`deferred_reason: main-thread-panic`）、主线程那份；退出码 101 |
 | `abort` | `std::process::abort()` | Linux：SIGABRT，`coreDump` 开时有 core；Windows：不写报告（见局限） |
 | `access-violation` | 写地址 `0x10` | Windows：`.txt` 记录，`miniDump` 开时有 `.dmp`，退出码 `0xC0000005`；Linux：SIGSEGV，`coreDump` 开时有 core |
 | `stack-overflow` | 无限递归 | Windows：`.txt` 记录（`EXCEPTION_STACK_OVERFLOW`），`miniDump` 开时有 `.dmp`，退出码 `0xC00000FD`；Linux：Rust std 命中栈守护页后打印提示并 abort，进程以 SIGABRT 结束，`coreDump` 开时有 core（未在本机验证） |
@@ -155,12 +163,12 @@ Linux 上原生崩溃不写文本记录：信号处理函数里能安全做的�
 - 配置字段：`diagnostics.crash.{enabled, directory, recentLogLines, miniDump, coreDump, maxReports, maxDumps}`，默认值与范围同上表。
 - 文件名：`crash-<进程名>-<pid>-<YYYYMMDDTHHMMSS.mmmZ>.<txt|dmp>`，DBProxy 的进程名固定为 `dbproxy`。
 - 报告格式（`format_version: 1`）：开头一行 `TiangZ crash report`，随后每行 `键: 值`，固定顺序为 `format_version`、`process`、`version`、`pid`、`platform`（`<os>-<arch>`）、`time_utc`（ISO 8601，毫秒，`Z` 结尾）、`kind`（`panic` 或 `native-exception`）；
-  - panic 再接 `thread`、`message`、`location`、`suppressed_since_last`（上一份报告之后被限流跳过的 panic 数），空行，`backtrace:` 和回溯正文；
-  - panic 报告限流：每 10 秒最多一份；
+  - panic 再接 `thread`（`<线程名> (ThreadId(n))`）、`message`、`location`、`suppressed_since_last`（上一份报告之后被限流跳过的 panic 数），**可选**的 `deferred: true` 与 `deferred_reason: <原因>`（只在补写被限流的 panic 时出现，`format_version` 仍为 1），空行，`backtrace:` 和回溯正文；
+  - panic 报告限流：可存活的 panic 每 10 秒最多一份；致命 panic（主线程、不能展开）不受限流，并先补写缓存的最后一次被限流 panic；
   - 原生异常再接 `thread_id`、`exception_code`（`0x%08X` 加可选名称）、`exception_address`、可选 `access_violation`、`minidump`；
   - 最后空行加 `recent_logs: <行数> of <容量>`（或 `disabled` / `unavailable`）和日志行。
   - 值里有换行时，续行以两个空格开头。
-- 环境变量：DBProxy 用 `TIANGZ_DBPROXY_CRASH_DIAGNOSTICS`、`TIANGZ_DBPROXY_CRASH_SELF_TEST`；TiangZ 使用自己的变量名，取值约定（`on|off`；`panic|thread-panic|abort|access-violation|stack-overflow`）相同。
+- 环境变量：DBProxy 用 `TIANGZ_DBPROXY_CRASH_DIAGNOSTICS`、`TIANGZ_DBPROXY_CRASH_SELF_TEST`；TiangZ 使用自己的变量名，取值约定（`on|off`；`panic|thread-panic|abort|access-violation|stack-overflow`）相同；DBProxy 另有 `panic-after-thread-panic` 用于验证补写。
 - 文件权限：Unix 目录 `0700`、文件 `0600`；Windows 继承 ACL。
 
 ## 验证
@@ -171,6 +179,7 @@ Linux 上原生崩溃不写文本记录：信号处理函数里能安全做的�
   - 环境变量 `off` 覆盖配置文件、自测被忽略；
   - 开关或自测取值错误时启动失败；
   - `thread-panic` 自测：3 次后台线程 panic 只写 1 份报告、2 次被限流，进程仍存活且监听端口仍接受连接；
+  - `panic-after-thread-panic` 自测：退出码 101，共 3 份报告——第 1 次后台 panic、补写的第 2 次（`deferred: true`、`deferred_reason: main-thread-panic`）、主线程致命 panic；
   - 非内存后端设置自测变量：退出码 1、不崩溃、不建崩溃目录（连接串指向不可解析的地址，进程在连接前就退出）；
   - Windows：访问冲突自测，退出码 `0xC0000005`，`.dmp` 以 `MDMP` 开头，文本记录含异常码与访问地址，`maxDumps` 生效；
   - Windows：栈溢出自测，退出码 `0xC00000FD`，`.dmp` 与 `EXCEPTION_STACK_OVERFLOW` 文本记录都写出；
@@ -184,12 +193,12 @@ Linux 上原生崩溃不写文本记录：信号处理函数里能安全做的�
 Crash diagnostics are **off by default**. Enable them with `diagnostics.crash.enabled` in the DBProxy config or with `TIANGZ_DBPROXY_CRASH_DIAGNOSTICS=on|off`, which takes precedence over the file. A relative `directory` (default `logs/crash`) is resolved against the config file's directory.
 
 - **Panics** (any thread): a report `crash-dbproxy-<pid>-<UTC>.txt` with version, pid, thread, message, location, a forced backtrace and the last `recentLogLines` (0–2000, default 200) log lines. The previous panic hook still runs afterwards, so exit codes and Tokio task handling are unchanged. Report-writing failures never panic.
-- **Rate limit**: at most one panic report every 10 s (constant). Panics inside the interval are only counted; the next report shows `suppressed_since_last: N`. A fatal panic within 10 s of a survivable one is not reported separately.
+- **Rate limit**: at most one report every 10 s for survivable panics (constant). Every panic is captured cheaply (unsymbolised backtrace); the limit only gates symbolising, writing and fsync. Suppressed panics are counted (`suppressed_since_last: N` in the next report) and the latest one is kept in a single-entry slot (try-lock only in the hook). Fatal panics (main thread, or messages starting with `panic in a function that cannot unwind` / `panic in a destructor during cleanup`) bypass the limit and first flush the cached panic as a report with the optional keys `deferred: true` and `deferred_reason: main-thread-panic|non-unwinding-panic`.
 - **Recent logs**: stdout output is copied line by line into a bounded ring buffer (≤ 2000 lines × 4 KiB). Nothing is added when disabled.
 - **Windows native crashes**: an unhandled-exception filter hands the work to a pre-spawned `crash-dump` thread, which writes a text record (exception code, address, access details) and, with `miniDump`, a `.dmp` (threads, stacks, indirectly referenced memory, handles; no full heap). The previous filter or the system default then runs, so the exit code is unchanged. `abort()` uses `__fastfail` and cannot be caught; use WER LocalDumps.
 - **Linux**: with `coreDump`, `RLIMIT_CORE` is raised at startup. Where cores go is set by the host's `kernel.core_pattern`; Docker needs `--ulimit core=-1` and a mounted directory when the pattern is a path; systemd units need `LimitCORE=infinity`. No text record is written for native crashes on Linux.
 - **Retention**: only the newest `maxReports` (default 50) `.txt` and `maxDumps` (default 5) `.dmp` files are kept; the directory is scanned at startup and again only when the in-memory count exceeds the limit. Other files are untouched. Limits are per directory, not per process: give each instance its own directory.
 - **Permissions**: on Unix new crash directories are `0700` and files `0600`; on Windows they inherit the parent ACL. `/configs/logs/` is git-ignored.
-- **Self-test** (verification only): `TIANGZ_DBPROXY_CRASH_SELF_TEST=panic|thread-panic|abort|access-violation|stack-overflow` crashes the process right after startup when crash diagnostics are on **and the storage backend is memory**; with any other backend startup fails with an error instead.
+- **Self-test** (verification only): `TIANGZ_DBPROXY_CRASH_SELF_TEST=panic|thread-panic|panic-after-thread-panic|abort|access-violation|stack-overflow` crashes the process right after startup when crash diagnostics are on **and the storage backend is memory**; with any other backend startup fails with an error instead.
 - **Release builds**: the release profile is unchanged. Linux backtraces keep function names but no line numbers; Windows needs the matching `.pdb` (check that the release artifacts include it; not verified here). Set `debug = "line-tables-only"` if line numbers are needed.
 - **Security**: dumps and cores contain process memory, including tokens and connection strings; restrict access to the directory.

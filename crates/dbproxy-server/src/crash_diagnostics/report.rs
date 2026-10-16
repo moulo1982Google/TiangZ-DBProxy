@@ -136,6 +136,38 @@ pub struct PanicDetails<'a> {
     pub backtrace: &'a str,
     /// 上一份报告之后因限流跳过的 panic 个数。 / Panics skipped by the rate limit since the previous report.
     pub suppressed_since_last: u64,
+    /// 补写被限流的 panic 时的原因；有值时报告多出 `deferred: true` 与 `deferred_reason:` 两行。
+    /// Reason when a rate-limited panic is written later; adds `deferred: true` and `deferred_reason:`.
+    pub deferred_reason: Option<&'a str>,
+}
+
+/// panic 发生时廉价采集的现场：文本字段与尚未符号化的回溯；符号化推迟到真正写报告时。
+/// Cheap snapshot taken at panic time: text fields plus an unsymbolised backtrace; symbolisation waits until a
+/// report is actually written.
+pub struct PanicCapture {
+    /// `<线程名> (ThreadId(n))`，与 TiangZ 一致。 / `<thread name> (ThreadId(n))`, as in TiangZ.
+    pub thread: String,
+    pub message: String,
+    pub location: Option<String>,
+    pub backtrace: std::backtrace::Backtrace,
+}
+
+impl PanicCapture {
+    /// 在当前线程采集；`force_capture` 只遍历栈帧、不解析符号。
+    /// Captures on the current thread; `force_capture` walks the frames without resolving symbols.
+    pub fn capture(message: &str, location: Option<String>) -> Self {
+        let thread = std::thread::current();
+        Self {
+            thread: format!(
+                "{} ({:?})",
+                thread.name().unwrap_or("<unnamed>"),
+                thread.id()
+            ),
+            message: message.to_owned(),
+            location,
+            backtrace: std::backtrace::Backtrace::force_capture(),
+        }
+    }
 }
 
 pub struct NativeDetails<'a> {
@@ -206,6 +238,10 @@ pub fn render_panic_report(
         "suppressed_since_last: {}",
         details.suppressed_since_last
     );
+    if let Some(reason) = details.deferred_reason {
+        let _ = writeln!(text, "deferred: true");
+        let _ = writeln!(text, "deferred_reason: {}", field_value(reason));
+    }
     let _ = writeln!(text);
     let _ = writeln!(text, "backtrace:");
     let _ = writeln!(text, "{}", details.backtrace.trim_end());
@@ -421,6 +457,20 @@ impl ReportLimiter {
             }
         }
     }
+
+    /// 致命 panic 不受限流：总是允许，并把间隔起点设为现在。返回此前被跳过的个数（并清零）。
+    /// Fatal panics bypass the limit: always admitted, restarting the interval now. Returns the skipped count and
+    /// resets it.
+    pub fn admit_unconditionally(&self, now_ms: u64) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.last_ms.store(now_ms, Ordering::Release);
+        self.suppressed.swap(0, Ordering::AcqRel)
+    }
+
+    /// 取出并清零跳过计数（补写被限流的 panic 时用）。 / Take and reset the skipped count (for deferred reports).
+    pub fn take_suppressed(&self) -> u64 {
+        self.suppressed.swap(0, std::sync::atomic::Ordering::AcqRel)
+    }
 }
 
 #[cfg(test)]
@@ -467,6 +517,7 @@ mod tests {
                 location: Some("src/main.rs:3:5".into()),
                 backtrace: "   0: frame_one\n   1: frame_two\n",
                 suppressed_since_last: 3,
+                deferred_reason: None,
             },
             &RecentLogSection::Lines {
                 capacity: 200,
@@ -483,6 +534,63 @@ mod tests {
             std::env::consts::ARCH
         );
         assert_eq!(report, expected);
+    }
+
+    #[test]
+    fn deferred_panic_report_adds_the_two_optional_keys_after_suppressed() {
+        let header = ReportHeader::new(77, timestamp(0, 0), "panic");
+        let report = render_panic_report(
+            &header,
+            &PanicDetails {
+                thread: "worker (ThreadId(7))",
+                message: "boom",
+                location: None,
+                backtrace: "   0: frame\n",
+                suppressed_since_last: 0,
+                deferred_reason: Some("main-thread-panic"),
+            },
+            &RecentLogSection::Disabled,
+        );
+        assert!(
+            report.contains(
+                "\nlocation: unknown\nsuppressed_since_last: 0\ndeferred: true\ndeferred_reason: main-thread-panic\n\nbacktrace:\n"
+            ),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn panic_capture_records_thread_identity_and_defers_symbolisation() {
+        let capture = PanicCapture::capture("boom", Some("src/x.rs:1:2".into()));
+        let current = std::thread::current();
+        assert_eq!(
+            capture.thread,
+            format!(
+                "{} ({:?})",
+                current.name().unwrap_or("<unnamed>"),
+                current.id()
+            )
+        );
+        assert_eq!(capture.message, "boom");
+        assert_eq!(capture.location.as_deref(), Some("src/x.rs:1:2"));
+        assert_eq!(
+            capture.backtrace.status(),
+            std::backtrace::BacktraceStatus::Captured
+        );
+    }
+
+    #[test]
+    fn fatal_admission_bypasses_the_limit_and_restarts_the_interval() {
+        let limiter = ReportLimiter::new(10_000);
+        assert_eq!(limiter.admit(0), Some(0));
+        assert_eq!(limiter.admit(1), None);
+        assert_eq!(limiter.admit(2), None);
+        // 补写路径先取走计数（其中一次就是被补写的那个 panic）。 / The deferred path takes the count first.
+        assert_eq!(limiter.take_suppressed(), 2);
+        assert_eq!(limiter.admit_unconditionally(3), 0);
+        assert_eq!(limiter.admit(4), None);
+        assert_eq!(limiter.admit_unconditionally(5), 1);
+        assert_eq!(limiter.admit(10_005), Some(0));
     }
 
     #[test]
