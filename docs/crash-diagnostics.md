@@ -71,7 +71,7 @@ panic 钩子同步写报告，写完再调用原来的钩子，所以 panic 语�
 - 被限流的 panic 不写报告，只计数，并往 stderr 打一行 `crash report suppressed by the rate limit`。最后一次被限流的现场存进一个**只保留一份**的缓存槽（内存有界）；钩子里只 `try_lock` 一次，拿不到就放弃缓存，不阻塞也不会 panic。下一份报告的 `suppressed_since_last:` 一栏写出此前被跳过的个数。
 - **致命 panic 不受限流**：主线程（`block_on` 所在线程，panic 后进程以 101 退出）的 panic，以及消息以 `panic in a function that cannot unwind` 或 `panic in a destructor during cleanup` 开头的 panic（之后进程必然 abort）。Tokio 任务里的 panic 被 Tokio 兜住，不算致命。
 - **补写**：致命 panic 发生时，先把缓存槽里那次被限流的 panic 补写成报告，报告在 `suppressed_since_last` 之后多两行 `deferred: true` 与 `deferred_reason: main-thread-panic`（或 `non-unwinding-panic`）；然后再写致命那一份。所以“可存活 panic 之后 10 秒内的致命 panic”不会丢报告。补写时缓存槽最多等约 100 ms，拿不到就跳过补写，致命那一份照写。
-- 正常写出一份报告后清空缓存槽；只在致命路径补写，进程正常运行时被限流的 panic 只留计数。
+- 允许写报告时，**先**清空缓存槽再符号化、写盘：槽里那份一定早于本份报告、已计入本份的 `suppressed_since_last`；写盘期间新被限流、进槽的 panic 保留下来，留给之后的致命路径补写。只在致命路径补写，进程正常运行时被限流的 panic 只留计数。
 - 限流只管 panic 报告；Windows 原生异常本来就只处理一次，不受限流影响。
 
 写报告失败（目录被删、磁盘满等）只往 stderr 打一行 `could not write a crash report`，不会二次 panic。
@@ -168,7 +168,11 @@ Linux 上原生崩溃不写文本记录：信号处理函数里能安全做的�
   - 原生异常再接 `thread_id`、`exception_code`（`0x%08X` 加可选名称）、`exception_address`、可选 `access_violation`、`minidump`；
   - 最后空行加 `recent_logs: <行数> of <容量>`（或 `disabled` / `unavailable`）和日志行。
   - 值里有换行时，续行以两个空格开头。
-- 环境变量：DBProxy 用 `TIANGZ_DBPROXY_CRASH_DIAGNOSTICS`、`TIANGZ_DBPROXY_CRASH_SELF_TEST`；TiangZ 使用自己的变量名，取值约定（`on|off`；`panic|thread-panic|abort|access-violation|stack-overflow`）相同；DBProxy 另有 `panic-after-thread-panic` 用于验证补写。
+- 环境变量：DBProxy 用 `TIANGZ_DBPROXY_CRASH_DIAGNOSTICS`（`on|off`）、`TIANGZ_DBPROXY_CRASH_SELF_TEST`；TiangZ 使用自己的变量名。自测取值两边**不完全相同**：
+  - 共有：`panic`、`thread-panic`、`abort`、`access-violation`、`stack-overflow`；
+  - 只有 DBProxy：`panic-after-thread-panic`（验证补写）；
+  - 只有 TiangZ：`oom`；
+  - 放行条件也不同：DBProxy 只允许内存后端；TiangZ 只允许 `process.environment` 为 development 或 test（以 TiangZ 文档为准）。
 - 文件权限：Unix 目录 `0700`、文件 `0600`；Windows 继承 ACL。
 
 ## 验证

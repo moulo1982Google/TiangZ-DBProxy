@@ -30,5 +30,5 @@
 
 - `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo test --workspace --locked` 通过；默认测试不连接任何数据库。
 - `cargo clippy -p tiangz-dbproxy-server --all-targets --locked --target x86_64-unknown-linux-gnu -- -D warnings` 通过（只做类型与 lint 检查，未在 Linux 上运行）。
-- 新增单元测试：Windows 上执行 26 项（名字含 crash 的库测试，另有 1 项 Unix 权限测试只在 Unix 执行）；集成测试 `tests/crash_diagnostics.rs` Windows 上执行 8 项（含访问冲突与栈溢出转储、`thread-panic` 限流且继续服务、致命 panic 补写被限流的那次、非内存后端拒绝自测），Unix 专用 1 项未在本机执行；全部通过。全工作区测试在补写改动之前跑过一次：286 项通过、115 项按原标记忽略（需真实 PG/Redis）。手动触发 panic 与访问冲突自测，核对了报告正文、回溯帧、`.dmp`（约 355 KB，`MDMP` 文件头）与退出码。
+- 新增单元测试：Windows 上执行 27 项（名字含 crash 的库测试，另有 1 项 Unix 权限测试只在 Unix 执行）；集成测试 `tests/crash_diagnostics.rs` Windows 上执行 8 项（含访问冲突与栈溢出转储、`thread-panic` 限流且继续服务、致命 panic 补写被限流的那次、非内存后端拒绝自测），Unix 专用 1 项未在本机执行；全部通过。全工作区 `cargo test --workspace --locked`：292 项通过、0 失败、115 项按原标记忽略（需真实 PG/Redis）。手动触发 panic 与访问冲突自测，核对了报告正文、回溯帧、`.dmp`（约 355 KB，`MDMP` 文件头）与退出码。
 - 未验证：Linux 上的 `abort` 自测、core 上限调整、`stack-overflow` 行为与 Unix 文件权限测试（只在 CI 运行）；用 WinDbg 实际打开 `.dmp`；release 构建的回溯与 `.pdb`；TypeScript SDK 未改动，未重跑。

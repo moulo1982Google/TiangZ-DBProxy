@@ -434,25 +434,52 @@ fn handle_panic(state: &InstalledState, info: &PanicHookInfo<'_>) {
     if let Some(reason) = fatal {
         flush_deferred_panic(state, reason);
     }
-    let admitted = match fatal {
-        Some(_) => Some(state.limiter.admit_unconditionally(now_ms)),
-        None => state.limiter.admit(now_ms),
+    admit_and_report(
+        &state.limiter,
+        &DEFERRED_PANIC,
+        capture,
+        fatal.is_some(),
+        now_ms,
+        |capture, suppressed| {
+            report_written(write_panic_report(state, capture, suppressed, None));
+        },
+    );
+}
+
+/// 限流判定与缓存槽维护；写报告由 `write` 完成（测试里可注入）。
+/// 允许写报告时，**先**清空缓存槽再写：槽里那份一定早于本份、已计入本份的 `suppressed_since_last`；
+/// 符号化与写盘期间新被限流、进槽的 panic 留给之后的致命路径补写，不会被本份清掉。
+/// Rate-limit decision and slot upkeep; `write` produces the report (injectable in tests).
+/// When a report is admitted the slot is cleared **before** writing: whatever it holds is older than this report and
+/// already counted in its `suppressed_since_last`. A panic suppressed while this report is being symbolised and
+/// written stays in the slot for a later fatal flush.
+fn admit_and_report(
+    limiter: &ReportLimiter,
+    slot: &Mutex<Option<PanicCapture>>,
+    capture: PanicCapture,
+    fatal: bool,
+    now_ms: u64,
+    write: impl FnOnce(&PanicCapture, u64),
+) {
+    let admitted = if fatal {
+        Some(limiter.admit_unconditionally(now_ms))
+    } else {
+        limiter.admit(now_ms)
     };
     match admitted {
         Some(suppressed) => {
-            report_written(write_panic_report(state, &capture, suppressed, None));
-            // 已经写出一份报告，此前缓存的被限流 panic 不再补写。 / A report was written; drop the older cached one.
-            if let Some(mut slot) = lock_deferred(false) {
-                *slot = None;
+            if let Some(mut cached) = lock_slot(slot, false) {
+                *cached = None;
             }
+            write(&capture, suppressed);
         }
         None => {
             let _ = writeln!(
                 io::stderr(),
                 "TiangZ DBProxy crash report suppressed by the rate limit (one per {PANIC_REPORT_MIN_INTERVAL_MS} ms)"
             );
-            if let Some(mut slot) = lock_deferred(false) {
-                *slot = Some(capture);
+            if let Some(mut cached) = lock_slot(slot, false) {
+                *cached = Some(capture);
             }
         }
     }
@@ -461,13 +488,20 @@ fn handle_panic(state: &InstalledState, info: &PanicHookInfo<'_>) {
 /// 最近一次被限流的 panic；只存一份，内存有界。 / The latest rate-limited panic; a single entry, so memory is bounded.
 static DEFERRED_PANIC: Mutex<Option<PanicCapture>> = Mutex::new(None);
 
+fn lock_deferred(wait: bool) -> Option<MutexGuard<'static, Option<PanicCapture>>> {
+    lock_slot(&DEFERRED_PANIC, wait)
+}
+
 /// `wait` 为 false 时只试一次；为 true 时（致命路径）最多重试约 100 ms。不会无限阻塞。
 /// With `wait` false only one attempt is made; with `wait` true (fatal path) it retries for about 100 ms. Never
 /// blocks indefinitely.
-fn lock_deferred(wait: bool) -> Option<MutexGuard<'static, Option<PanicCapture>>> {
+fn lock_slot(
+    slot: &Mutex<Option<PanicCapture>>,
+    wait: bool,
+) -> Option<MutexGuard<'_, Option<PanicCapture>>> {
     let attempts = if wait { 150 } else { 1 };
     for attempt in 0..attempts {
-        match DEFERRED_PANIC.try_lock() {
+        match slot.try_lock() {
             Ok(slot) => return Some(slot),
             Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
             Err(TryLockError::WouldBlock) if attempt < 50 => std::thread::yield_now(),
@@ -851,6 +885,57 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains(CRASH_DIAGNOSTICS_ENV), "{error}");
+    }
+
+    #[test]
+    fn slot_is_cleared_before_writing_so_panics_suppressed_during_the_write_survive() {
+        let limiter = ReportLimiter::new(10_000);
+        let slot = Mutex::new(Some(PanicCapture::capture("older", None)));
+        let mut written = Vec::new();
+        admit_and_report(
+            &limiter,
+            &slot,
+            PanicCapture::capture("first", None),
+            false,
+            0,
+            |capture, suppressed| {
+                // 写报告之前，比本份更早的缓存已被清掉。 / The older cached panic is gone before the write starts.
+                assert!(slot.try_lock().unwrap().is_none());
+                // 模拟符号化与写盘期间另一个线程被限流的 panic。 / Another thread is suppressed during the write.
+                admit_and_report(
+                    &limiter,
+                    &slot,
+                    PanicCapture::capture("during-write", None),
+                    false,
+                    1,
+                    |_, _| panic!("the second panic must be rate-limited"),
+                );
+                written.push((capture.message.clone(), suppressed));
+            },
+        );
+        assert_eq!(written, [("first".to_string(), 0)]);
+        // 写盘期间进槽的那份保留给致命路径补写。 / The panic cached during the write is kept for a fatal flush.
+        assert_eq!(
+            slot.try_lock()
+                .unwrap()
+                .as_ref()
+                .map(|capture| capture.message.as_str()),
+            Some("during-write")
+        );
+
+        // 致命 panic 不受限流；它写报告前同样先清槽（补写由调用方在此之前完成）。
+        // A fatal panic bypasses the limit and also clears the slot before writing (the caller flushes it first).
+        let mut fatal = Vec::new();
+        admit_and_report(
+            &limiter,
+            &slot,
+            PanicCapture::capture("fatal", None),
+            true,
+            2,
+            |capture, suppressed| fatal.push((capture.message.clone(), suppressed)),
+        );
+        assert_eq!(fatal, [("fatal".to_string(), 1)]);
+        assert!(slot.try_lock().unwrap().is_none());
     }
 
     #[test]
