@@ -643,13 +643,15 @@ impl DbProxyConfig {
         let backlog_enqueue_config = self.backlog.enqueue_config()?;
         let cache_repair = resolve_retry_queue("cacheRepair", self.cache_repair)?;
         let outbox = resolve_retry_queue("outbox", self.outbox)?;
-        let outbox_relay = self.outbox_relay.resolve(outbox.lease_ms, &environment)?;
-        // 在读取任何密钥之前解析并应用环境变量覆盖。 / Resolved, override included, before any secret is read.
+        // 在读取任何密钥之前解析并应用环境变量覆盖；outbox publisher 启用时 relay 解析会读连接串，必须排在它之前。
+        // Resolved, override included, before any secret is read; an enabled outbox publisher makes the relay read a
+        // connection string, so this must come first.
         let crash_diagnostics = self
             .diagnostics
             .crash
             .resolve(source)?
             .with_environment_override(crash_override)?;
+        let outbox_relay = self.outbox_relay.resolve(outbox.lease_ms, &environment)?;
 
         let auth_token = required_environment(&environment, &self.server.auth_token_env)?;
         let storage = match self.storage {
@@ -1162,6 +1164,45 @@ mod tests {
         fs::remove_file(&path).unwrap();
         assert!(forced.crash_diagnostics.enabled);
         assert_eq!(forced.crash_diagnostics.environment_override, Some(true));
+        let error = rejected.unwrap_err().to_string();
+        assert!(
+            error.contains(crate::crash_diagnostics::CRASH_DIAGNOSTICS_ENV),
+            "{error}"
+        );
+
+        // 启用 outbox publisher 时 relay 解析会读连接串；错误的开关取值必须在那之前报出。
+        // With an enabled outbox publisher the relay reads a connection string; a bad switch must fail before that.
+        let mut with_publisher = serde_json::json!({"configVersion":1,"server":{"listenAddr":"127.0.0.1:0","authTokenEnv":"AUTH"},"storage":{"backend":"postgresRedis","postgresUrlEnv":"PG","redisUrlEnv":"REDIS"}});
+        with_publisher["outboxRelay"] = serde_json::json!({
+            "defaultPublisher": "events-redis-v1",
+            "publishers": [{"id": "events-redis-v1", "backend": "redisStream", "connectionEnv": "EVENTS_REDIS_URL"}],
+            "sources": [{"producer": "game", "version": 1, "destination": "game.events"}]
+        });
+        let path = write_config(&with_publisher.to_string());
+        let publisher_reads = std::cell::Cell::new(0);
+        let accepted = load_config_with_crash_override(
+            &path,
+            |name| {
+                if name == "EVENTS_REDIS_URL" {
+                    publisher_reads.set(publisher_reads.get() + 1);
+                }
+                Some(match name {
+                    "AUTH" => "0123456789abcdef".into(),
+                    "PG" => "postgres://user:secret@localhost/db".into(),
+                    _ => "redis://:secret@localhost/3".into(),
+                })
+            },
+            Some("off"),
+        );
+        let rejected = load_config_with_crash_override(
+            &path,
+            |name| panic!("a bad crash override must fail before reading {name}"),
+            Some("enabled"),
+        );
+        fs::remove_file(&path).unwrap();
+        // 前提：这份配置确实会读 publisher 的连接串。 / Precondition: this config really reads the publisher secret.
+        assert_eq!(accepted.unwrap().outbox_relay.publishers.len(), 1);
+        assert_eq!(publisher_reads.get(), 1);
         let error = rejected.unwrap_err().to_string();
         assert!(
             error.contains(crate::crash_diagnostics::CRASH_DIAGNOSTICS_ENV),

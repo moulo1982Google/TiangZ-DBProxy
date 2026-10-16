@@ -124,7 +124,7 @@ Linux 上原生崩溃不写文本记录：信号处理函数里能安全做的�
 | `thread-panic` | 3 个后台线程依次 panic，被 join 吸收 | 进程继续服务；只写 1 份报告，另 2 次被限流计数 |
 | `abort` | `std::process::abort()` | Linux：SIGABRT，`coreDump` 开时有 core；Windows：不写报告（见局限） |
 | `access-violation` | 写地址 `0x10` | Windows：`.txt` 记录，`miniDump` 开时有 `.dmp`，退出码 `0xC0000005`；Linux：SIGSEGV，`coreDump` 开时有 core |
-| `stack-overflow` | 无限递归 | Windows：`.txt` 记录（`EXCEPTION_STACK_OVERFLOW`），`miniDump` 开时有 `.dmp`，退出码 `0xC00000FD`；Linux：Rust std 打印提示后以 SIGSEGV 结束（未在本机验证） |
+| `stack-overflow` | 无限递归 | Windows：`.txt` 记录（`EXCEPTION_STACK_OVERFLOW`），`miniDump` 开时有 `.dmp`，退出码 `0xC00000FD`；Linux：Rust std 命中栈守护页后打印提示并 abort，进程以 SIGABRT 结束，`coreDump` 开时有 core（未在本机验证） |
 
 - 崩溃诊断关闭时设置了这个变量只记一条 warn，不崩溃；取值不在上表时启动失败。
 - **非内存后端**（例如 `postgresRedis`）设置了这个变量时直接启动失败、以错误退出（退出码 1），不崩溃、不写转储，也不会连接数据库。这样生产环境误留的变量不会导致每次启动必崩，也不会在真实实例上产生含敏感内存的 `.dmp`。

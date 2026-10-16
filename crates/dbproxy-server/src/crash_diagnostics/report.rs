@@ -601,15 +601,22 @@ mod tests {
             .map(|_| {
                 let limiter = std::sync::Arc::clone(&limiter);
                 std::thread::spawn(move || {
-                    (0..100).filter(|_| limiter.admit(1_000).is_some()).count()
+                    (0..100)
+                        .filter_map(|_| limiter.admit(1_000))
+                        .collect::<Vec<_>>()
                 })
             })
             .collect::<Vec<_>>()
             .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .sum::<usize>();
-        assert_eq!(admitted, 1);
-        assert_eq!(limiter.admit(11_000), Some(799));
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(admitted.len(), 1, "{admitted:?}");
+        // 首份报告的 CAS 与 swap(0) 之间，其他线程的计数可能被它带走，所以只核对总数：
+        // 800 次中 1 次写出，其余 799 次一定出现在某一份报告的 suppressed 里，不多不少。
+        // Another thread may count between the first report's CAS and its swap(0), so only the total is checked:
+        // of 800 panics one is written and the other 799 appear in exactly one report's suppressed count.
+        let last = limiter.admit(11_000).unwrap();
+        assert_eq!(admitted.iter().sum::<u64>() + last, 799);
     }
 
     #[cfg(unix)]
