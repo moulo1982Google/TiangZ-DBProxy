@@ -1,4 +1,4 @@
-> 本轮发布：`v0.7.3`（DBProxy 单独发布）。新增多记录事务回执退休：`storage.operationReceiptRetentionDays`（默认 30 天）到期后删除回执、只留操作号标记，迟到查询或重提返回新错误码 `OPERATION_EXPIRED`（2007）；新增迁移 016；协议指纹改变但服务端仍接受旧客户端。所有实例需一起升级，退休执行后不能回滚。覆盖率统计改为包含真实库回归。见 [RELEASE-v0.7.3.md](RELEASE-v0.7.3.md)。
+> 本轮发布：`v0.7.4`（DBProxy 单独发布，2026-10-16）。新增崩溃诊断 `diagnostics.crash`（默认关闭）：panic 报告（回溯与最近日志）、Windows 未处理异常记录与可选 minidump、Linux 可选放开 core 上限、报告与转储保留上限；环境变量 `TIANGZ_DBPROXY_CRASH_DIAGNOSTICS=on|off`。协议、SDK 与数据库迁移不变，客户端无需升级。见 [RELEASE-v0.7.4.md](RELEASE-v0.7.4.md)。
 
 # TiangZ DBProxy
 
@@ -9,7 +9,7 @@
 [![tag](https://img.shields.io/github/v/tag/moulo1982Google/TiangZ-DBProxy?label=tag&sort=semver)](https://github.com/moulo1982Google/TiangZ-DBProxy/tags)
 [![license](https://img.shields.io/github/license/moulo1982Google/TiangZ-DBProxy?label=license)](LICENSE)
 
-当前版本为 `0.7.3`（正式版），服务与 Rust/TypeScript SDK 使用相同版本；相对 0.7.2 新增多记录事务回执退休、迁移 016 与错误码 `OPERATION_EXPIRED`（协议指纹改变，服务端仍接受 0.7.0–0.7.2 客户端）；0.7.1 引入迁移 013–015。此前候选（0.7.0-rc.2、v0.7.0-rc1、v0.7.0-rc2）的标签与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题。
+当前版本为 `0.7.4`（正式版），服务与 Rust/TypeScript SDK 使用相同版本；相对 0.7.3 新增崩溃诊断（默认关闭，见 [崩溃诊断](docs/crash-diagnostics.md)），协议、SDK 与迁移不变；0.7.3 相对 0.7.2 新增多记录事务回执退休、迁移 016 与错误码 `OPERATION_EXPIRED`（协议指纹改变，服务端仍接受 0.7.0–0.7.2 客户端）；0.7.1 引入迁移 013–015。此前候选（0.7.0-rc.2、v0.7.0-rc1、v0.7.0-rc2）的标签与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题。
 
 > 验收进度请先读[当前剩余清单（2026-09-29）](docs/acceptance-remaining-20260929.md)，历史证据见[索引与验收交接](docs/handoff-index-acceptance-20260922.md)。两小时测试及多项补测已完成；综合验收仍有缺口，不能把历史交接的未完成状态当作当前结论。
 
@@ -119,7 +119,7 @@ cargo run -p tiangz-dbproxy-server -- --config configs/local.json
 
 配置`observability.listenAddr`后，DBProxy在独立HTTP端口提供`/live`、`/ready`、`/dependencies`和Prometheus格式的`/metrics`。真实存储模式只有在 PostgreSQL 与可靠队列 Redis 都可达时才 Ready；独立快照缓存不可达时安全回源 PostgreSQL，并由缓存读写错误与回源指标告警，不把可降级缓存误判为持久依赖。本地Compose会启动Prometheus与Grafana并自动加载Dashboard；指标、告警和部署边界见[可观测性指南](OBSERVABILITY.md)。观测端口不要求业务认证，默认只允许loopback；私网或通配绑定必须显式设置`observability.allowNonLoopback=true`并限制网络来源，直接公网或多播地址被拒绝。禁止经Nginx暴露公网。容器抓取所需设置见[本地部署说明](deploy/local/README.md)。
 
-崩溃诊断（未发布，默认关闭）：配置`diagnostics.crash.enabled=true`或设置环境变量`TIANGZ_DBPROXY_CRASH_DIAGNOSTICS=on`（环境变量优先）后，panic 时在`diagnostics.crash.directory`（默认`logs/crash`，相对配置文件所在目录）写`crash-dbproxy-<pid>-<UTC时间>.txt`，含版本、线程、消息、位置、回溯和最近日志；Windows 可选`miniDump`写`.dmp`，Linux 可选`coreDump`放开 core 上限（core 位置由宿主机`core_pattern`决定）。报告与转储按`maxReports`/`maxDumps`保留最新的。字段、平台局限、自测入口和安全注意见[崩溃诊断](docs/crash-diagnostics.md)。
+崩溃诊断（0.7.4 起，默认关闭）：配置`diagnostics.crash.enabled=true`或设置环境变量`TIANGZ_DBPROXY_CRASH_DIAGNOSTICS=on`（环境变量优先）后，panic 时在`diagnostics.crash.directory`（默认`logs/crash`，相对配置文件所在目录）写`crash-dbproxy-<pid>-<UTC时间>.txt`，含版本、线程、消息、位置、回溯和最近日志；Windows 可选`miniDump`写`.dmp`，Linux 可选`coreDump`放开 core 上限（core 位置由宿主机`core_pattern`决定）。报告与转储按`maxReports`/`maxDumps`保留最新的。字段、平台局限、自测入口和安全注意见[崩溃诊断](docs/crash-diagnostics.md)。
 
 仓库提供`configs/perf-memory-4.json`，固定使用4个Runtime工作线程和MemoryStub。该配置只测DBProxy自身的网络、协议、调度、分片锁和事务语义，不把PostgreSQL或Redis性能混入结果。
 

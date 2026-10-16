@@ -1,6 +1,8 @@
-# 未发布 / Unreleased
+# v0.7.4
 
-本文件是下一版发布说明的草稿。发版时并入 `RELEASE-v<版本>.md` 后删除本文件。
+DBProxy 单独发布（GitHub Release，不上架 npm/crates.io）。之前的标签与附件保持不变。TiangZ 套件其他仓库本次不变；TiangZ 对 DBProxy 的客户端依赖仍固定在 `v0.7.3`（本版没有改客户端、协议或 SDK 代码），见下文“兼容与升级”。
+
+与 TiangZ 0.7.6 的崩溃诊断是同一套对外约定（配置字段与范围、文件名规则、报告格式 `format_version: 1`、开关取值 `on|off`）；两边各自独立实现，差异见 TiangZ 的 `docs/design/crash-diagnostics.md`（如默认目录：DBProxy 是配置文件所在目录下的 `logs/crash`）。
 
 ## 内容
 
@@ -23,6 +25,7 @@
 ## 兼容与升级
 
 - 不改协议、存储结构、迁移，客户端无需升级。
+- TiangZ 宿主内置的 DBProxy 客户端（`tiangz-dbproxy-client/core/protocol`）与 TypeScript SDK 仍可固定在 `v0.7.3`：本版没有改客户端、协议或 SDK 代码，只是包版本号随服务端变为 0.7.4。
 - 未配置 `diagnostics` 且未设置环境变量时行为与上一版相同。
 - `.dmp` 与 core 含进程内存（可能包括令牌、连接串、玩家数据），启用前规划好目录权限。
 
@@ -32,3 +35,4 @@
 - `cargo clippy -p tiangz-dbproxy-server --all-targets --locked --target x86_64-unknown-linux-gnu -- -D warnings` 通过（只做类型与 lint 检查，未在 Linux 上运行）。
 - 新增单元测试：Windows 上执行 27 项（名字含 crash 的库测试，另有 1 项 Unix 权限测试只在 Unix 执行）；集成测试 `tests/crash_diagnostics.rs` Windows 上执行 8 项（含访问冲突与栈溢出转储、`thread-panic` 限流且继续服务、致命 panic 补写被限流的那次、非内存后端拒绝自测），Unix 专用 1 项未在本机执行；全部通过。全工作区 `cargo test --workspace --locked`：292 项通过、0 失败、115 项按原标记忽略（需真实 PG/Redis）。手动触发 panic 与访问冲突自测，核对了报告正文、回溯帧、`.dmp`（约 355 KB，`MDMP` 文件头）与退出码。
 - 未验证：Linux 上的 `abort` 自测、core 上限调整、`stack-overflow` 行为与 Unix 文件权限测试（只在 CI 运行）；用 WinDbg 实际打开 `.dmp`；release 构建的回溯与 `.pdb`；TypeScript SDK 未改动，未重跑。
+- CI 结果以本版发布 PR 与 Release 页面为准，本文不重复记录。
