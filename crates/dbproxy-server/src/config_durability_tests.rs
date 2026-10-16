@@ -13,9 +13,11 @@ fn resolve(
         "outboxRelay":outbox
     }))
     .unwrap();
-    config.resolve(Path::new("fixture.json"), |name| {
-        (name == "AUTH").then(|| "fixture-token".to_string())
-    })
+    config.resolve(
+        Path::new("fixture.json"),
+        |name| (name == "AUTH").then(|| "fixture-token".to_string()),
+        None,
+    )
 }
 
 #[test]
@@ -81,9 +83,11 @@ fn invalid_or_incomplete_profiles_fail_before_reading_secrets() {
     .unwrap();
     assert!(
         config
-            .resolve(Path::new("fixture.json"), |_| panic!(
-                "invalid budget must fail before environment access"
-            ))
+            .resolve(
+                Path::new("fixture.json"),
+                |_| panic!("invalid budget must fail before environment access"),
+                None
+            )
             .is_err()
     );
 }

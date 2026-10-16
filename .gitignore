@@ -7,3 +7,6 @@
 *.swp
 /deploy/local/.env
 /perf/results/
+# 崩溃诊断默认目录 logs/crash 相对配置文件解析，用 configs/*.json 时会落在这里；转储可能含敏感内存。
+# Default crash directory (logs/crash, resolved against the config file); dumps may hold sensitive memory.
+/configs/logs/

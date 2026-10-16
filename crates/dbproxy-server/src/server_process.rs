@@ -9,8 +9,8 @@ use tiangz_dbproxy_server::{
     DbProxyBackend, DbProxyMetrics, DbProxyServer, MAINTENANCE_POSTGRES_CONNECTIONS, MemoryBackend,
     ObservabilityServer, RetryWorkerPolicy, ServerConfig, StorageBackend, StorageBackendConfig,
     config::{ResolvedDbProxyConfig, ResolvedStorage, config_path_from_args, load_config},
-    run_backlog_worker_observed, run_cache_repair_worker_observed, run_outbox_worker_observed,
-    run_storage_metrics_poller, tenant_span,
+    crash_diagnostics, run_backlog_worker_observed, run_cache_repair_worker_observed,
+    run_outbox_worker_observed, run_storage_metrics_poller, tenant_span,
 };
 use tokio::{sync::watch, task::JoinSet};
 use tracing::Instrument;
@@ -59,10 +59,9 @@ pub fn main_with_acceptance_worker(
             return Ok(());
         }
         let (deployment, configs) = tiangz_dbproxy_server::tenant_config::load_deployment(path)?;
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::try_new(&configs[0].log_filter)?)
-            .with_ansi(false)
-            .init();
+        // 崩溃诊断是进程级设置，`load_deployment` 已校验各租户一致。
+        // Crash diagnostics are process-wide; `load_deployment` already checked that tenants agree.
+        init_logging_and_crash_diagnostics(&configs)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(configs[0].runtime_worker_threads)
             .enable_all()
@@ -87,15 +86,40 @@ pub fn main_with_acceptance_worker(
     }
     let config_path = config_path_from_args(env::args())?;
     let config = load_config(config_path)?;
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_new(&config.log_filter)?)
-        .with_ansi(false)
-        .init();
+    init_logging_and_crash_diagnostics(std::slice::from_ref(&config))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.runtime_worker_threads)
         .enable_all()
         .build()?;
     runtime.block_on(run(config, receipt_cleanup, acceptance_worker))
+}
+
+/// 关闭崩溃诊断时日志初始化与以前完全相同；启用时标准输出同时写入最近日志缓冲。
+/// With crash diagnostics off, logging is set up exactly as before; when on, stdout output is also kept in the
+/// recent-log buffer.
+fn init_logging_and_crash_diagnostics(
+    configs: &[ResolvedDbProxyConfig],
+) -> Result<(), Box<dyn Error>> {
+    let config = &configs[0];
+    // 自测只允许在全部是内存后端的进程里运行。 / Self-tests only run when every tenant uses the memory backend.
+    let memory_backend_only = configs
+        .iter()
+        .all(|config| matches!(config.storage, ResolvedStorage::Memory { .. }));
+    let filter = EnvFilter::try_new(&config.log_filter)?;
+    let recent = crash_diagnostics::recent_log_buffer(&config.crash_diagnostics);
+    match recent.clone() {
+        Some(recent) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(crash_diagnostics::TeeMakeWriter::stdout(recent))
+            .init(),
+        None => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .init(),
+    }
+    crash_diagnostics::install(&config.crash_diagnostics, recent, memory_backend_only)?;
+    Ok(())
 }
 
 type BackendPair = (Arc<dyn DbProxyBackend>, Option<Arc<StorageBackend>>);
@@ -413,6 +437,9 @@ async fn run_servers(
     admission_metrics.mark_ready();
     let signal_task = tokio::spawn(signal_listener);
     tracing::info!(actual_addr = %server.local_addr()?, tenant_count = tenants.len(), "TiangZ DBProxy started");
+    // 只有启用崩溃诊断且设置了自测环境变量时才会触发，用于验证报告与转储。
+    // Fires only with crash diagnostics on and the self-test variable set; used to verify reports and dumps.
+    crash_diagnostics::run_self_test_if_requested();
     let serve_result = server.serve(shutdown_rx.clone()).await;
     signal_task.abort();
     admission_metrics.mark_stopping();

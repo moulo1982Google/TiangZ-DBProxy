@@ -119,6 +119,14 @@ pub fn validate_isolation(configs: &[ResolvedDbProxyConfig]) -> Result<(), Confi
                 "shared listener/runtime settings must agree across tenants".into(),
             ));
         }
+        // 崩溃诊断是进程级的（一个 panic 钩子、一个目录），各租户配置必须一致。
+        // Crash diagnostics are process-wide (one panic hook, one directory), so every tenant must agree.
+        if config.crash_diagnostics != first.crash_diagnostics {
+            return Err(ConfigError(
+                "diagnostics.crash must agree across tenants (after resolving the directory)"
+                    .into(),
+            ));
+        }
         if config
             .observability_listen_addr
             .is_some_and(|address| !monitoring.insert(address))

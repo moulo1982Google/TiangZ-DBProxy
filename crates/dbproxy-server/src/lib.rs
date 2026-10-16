@@ -6,6 +6,7 @@
 //! game repositories, entity lifecycle, and business validation stay in TiangZ.
 
 pub mod config;
+pub mod crash_diagnostics;
 pub mod tenancy;
 pub mod tenant_config;
 #[cfg(test)]
