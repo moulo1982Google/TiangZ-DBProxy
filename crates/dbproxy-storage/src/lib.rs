@@ -526,6 +526,21 @@ pub enum StorageError {
     },
 }
 
+impl StorageError {
+    /// PostgreSQL 因死锁（40P01）或序列化冲突（40001）回滚了本语句/事务；原样重试即可，不是数据或配置错误。
+    /// PostgreSQL rolled the statement/transaction back for a deadlock (40P01) or serialization
+    /// failure (40001); retrying the same work is safe, it is not a data or configuration fault.
+    pub fn is_retryable_conflict(&self) -> bool {
+        let Self::Postgres(error) = self else {
+            return false;
+        };
+        error.code().is_some_and(|code| {
+            *code == tokio_postgres::error::SqlState::T_R_DEADLOCK_DETECTED
+                || *code == tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE
+        })
+    }
+}
+
 /// Limits applied when Redis misses force a read from PostgreSQL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheFallbackConfig {

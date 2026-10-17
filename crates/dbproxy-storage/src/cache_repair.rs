@@ -135,15 +135,32 @@ impl PostgresCacheRepairQueue {
             .collect::<Result<Vec<_>, _>>()?;
         let mut client = self.acknowledgement_client(targets.len()).await?;
         client.ensure_connected().await?;
+        // 只是清理提示：先用 SKIP LOCKED 锁住空闲的修复行再删，被请求事务锁住的行留给持久修复。
+        // 请求事务会在同一事务里按自己的记录顺序写多条修复行，原先这里按执行计划顺序边删边等，
+        // 双方各持一行再等对方即死锁（2026-10-16 长稳 40P01）。不等待就不会进入等待环。
+        // Only a cleanup hint: lock idle repair rows with SKIP LOCKED, then delete them; rows held by
+        // a request transaction stay for durable repair. Request transactions upsert several repair
+        // rows in their own record order; the former plain DELETE waited row by row in plan order and
+        // deadlocked with them (40P01 in the 2026-10-16 soak). A statement that never waits cannot
+        // join a wait cycle.
         Ok(client
             .execute(
                 r#"
+WITH locked AS MATERIALIZED (
+    SELECT repair.namespace, repair.record_key, cached.revision
+    FROM dbproxy_cache_repairs AS repair
+    JOIN unnest($1::TEXT[], $2::TEXT[], $3::BIGINT[])
+        AS cached(namespace, record_key, revision)
+      ON repair.namespace = cached.namespace
+     AND repair.record_key = cached.record_key
+    WHERE repair.target_revision <= cached.revision
+    FOR UPDATE OF repair SKIP LOCKED
+)
 DELETE FROM dbproxy_cache_repairs AS repair
-USING unnest($1::TEXT[], $2::TEXT[], $3::BIGINT[])
-    AS cached(namespace, record_key, revision)
-WHERE repair.namespace = cached.namespace
-  AND repair.record_key = cached.record_key
-  AND repair.target_revision <= cached.revision
+USING locked
+WHERE repair.namespace = locked.namespace
+  AND repair.record_key = locked.record_key
+  AND repair.target_revision <= locked.revision
 "#,
                 &[&namespaces, &keys, &revisions],
             )

@@ -1035,7 +1035,15 @@ async fn run_durable_queue_worker(
                 }
                 Ok(DurableQueueProcessOutcome::Empty) => (DurableQueueMetricResult::Empty, true),
                 Err(error) => {
-                    tracing::error!(%error, worker = %worker_id, queue = queue_name, "durable queue worker failed");
+                    // 死锁/序列化冲突只回滚了本轮，持久行仍在，按原退避重试；记 WARN 以免与真故障混淆。
+                    // A deadlock/serialization conflict only rolled back this round; durable rows
+                    // remain and the usual backoff retries them, so log it below real failures.
+                    if matches!(&error, BackendError::Storage(storage) if storage.is_retryable_conflict())
+                    {
+                        tracing::warn!(%error, worker = %worker_id, queue = queue_name, "durable queue worker hit a retryable PostgreSQL conflict; retrying");
+                    } else {
+                        tracing::error!(%error, worker = %worker_id, queue = queue_name, "durable queue worker failed");
+                    }
                     (DurableQueueMetricResult::Failure, true)
                 }
             };
