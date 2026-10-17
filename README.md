@@ -169,6 +169,8 @@ cargo test -p tiangz-dbproxy-storage --test postgres_redis -- --ignored --nocapt
 
 ```powershell
 cargo test -p tiangz-dbproxy-storage --test cache_repair_concurrency -- --ignored --nocapture --test-threads=1
+# 重复请求与回执查询的键顺序（库默认排序规则须不是按字节，如 en_US.utf8，才构成反例）
+cargo test -p tiangz-dbproxy-storage --test receipt_key_order -- --ignored --nocapture --test-threads=1
 ```
 
 该组验证目标合并、实际修复 revision/缺失记录的 ACK、排队顺序、退避/死信保留、过期租约、同名 worker 和删除后重新入队隔离。它不在默认 `cargo test --workspace` 的通过数量中；真实 Redis 缓存读写还需执行上面的 `postgres_redis` 测试。迁移 010 的受控切换要求见[恢复手册](docs/durability-recovery-runbook.md)。

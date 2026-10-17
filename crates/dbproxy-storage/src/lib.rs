@@ -2460,9 +2460,12 @@ impl AsyncMultiRecordTransactionStore for PostgresSnapshotStore {
             }
             return Ok(None);
         };
+        // 与 sorted_unique_records 的 Rust 字节序逐位比对，必须按 "C"（字节）排序，不能用库默认排序规则。
+        // Compared by position with the Rust byte order of sorted_unique_records: sort with "C"
+        // (bytes), never the database default collation.
         let rows = client
             .query(
-                "SELECT namespace, record_key, new_revision FROM dbproxy_multi_transaction_records WHERE operation_id = $1 ORDER BY namespace, record_key",
+                "SELECT namespace, record_key, new_revision FROM dbproxy_multi_transaction_records WHERE operation_id = $1 ORDER BY namespace COLLATE \"C\", record_key COLLATE \"C\"",
                 &[&operation_id],
             )
             .await?;
@@ -2557,9 +2560,11 @@ impl PostgresSnapshotStore {
                     &[&operation_id],
                 )
                 .await?;
+            // 与按 Rust 字节序排序的 request.writes 逐位比对，必须按 "C"（字节）排序。
+            // Compared by position with request.writes in Rust byte order: sort with "C" (bytes).
             let rows = transaction
                 .query(
-                    "SELECT namespace, record_key, schema_name, schema_version, expected_revision, payload, updated_at_unix_ms, new_revision FROM dbproxy_multi_transaction_records WHERE operation_id = $1 ORDER BY namespace, record_key",
+                    "SELECT namespace, record_key, schema_name, schema_version, expected_revision, payload, updated_at_unix_ms, new_revision FROM dbproxy_multi_transaction_records WHERE operation_id = $1 ORDER BY namespace COLLATE \"C\", record_key COLLATE \"C\"",
                     &[&operation_id],
                 )
                 .await?;

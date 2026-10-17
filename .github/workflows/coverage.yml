@@ -61,6 +61,7 @@ jobs:
           suite cov_receipts -p tiangz-dbproxy-storage --test receipt_retention
           suite cov_retirement -p tiangz-dbproxy-storage --test operation_retirement
           suite cov_repair -p tiangz-dbproxy-storage --test cache_repair_concurrency
+          suite cov_receipt_order -p tiangz-dbproxy-storage --test receipt_key_order
           suite cov_worker -p tiangz-dbproxy-server --test receipt_cleanup_worker
           # Library-internal real-database tests (read pool, connection diagnostics); exact names.
           suite cov_read_pool -p tiangz-dbproxy-storage --lib :: postgres_read_pool::tests::real_read_pool_paths_capacity_cancellation_and_reconnect

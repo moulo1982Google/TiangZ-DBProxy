@@ -15,12 +15,18 @@
 - **未验证**：修复后尚未经长稳复验，是否完全不再出现 40P01 待下一轮长稳确认。
 - 详见 `docs/cache-repair-cleanup.md`“批量清理与请求事务的死锁”一节。
 
+### 修复：重复请求与回执查询的键顺序（误判 OperationIdConflict）
+
+- **现象**：数据库默认排序规则不是按字节（如官方 PostgreSQL 镜像的 `en_US.utf8`）时，键里有大小写混排（`B` 与 `a`）或标点与字母数字同位（`a_1` 与 `a1`、`a-b` 与 `aa`）的多记录事务或交易，用原 operation ID 合法重试会返回 `OperationIdConflict` 而不是 `Duplicate`；多记录回执查询（`load_multi_receipt`）同样报冲突；交易回执查询返回的记录、分录号、事件号顺序可能与提交时不同。命名空间只差大小写也会触发。当前已知的游戏键不触发。
+- **根因**：请求在 Rust 里按 `(namespace, record_key)`、分录号、事件号的字节序规范化；读回已存行的 SQL `ORDER BY` 没有指定排序规则，用的是库的默认语言排序，再与请求逐位比对。涉及 `crates/dbproxy-storage/src/lib.rs` 的多记录回执查询与多记录重复路径，`trade.rs` 的 `load_receipt_parts`（记录、分录、事件三条查询，交易重复路径与交易回执查询共用）。
+- **修复**：这五处 `ORDER BY` 的每个排序列都显式加 `COLLATE "C"`。PostgreSQL 的 C 排序对 UTF-8 按字节比较（与 `strcmp` 一致），等价于 Rust `str` 的 `Ord`（UTF-8 字节字典序、前缀较短者在前），也就是按 Unicode 码点排序。没有改成“读出后在 Rust 端再排序”：SQL 一处改动就让所有读回路径（含交易重复路径写修复行的顺序）与请求一致。
+- **执行计划**：这些查询都按 `operation_id` 过滤，仍走 `(operation_id, …)` 索引，只对本操作的几行多一个内存排序。在每表 20 万–30 万行的一次性数据上核对过，具体计划与通用计划都是 Index Scan + Sort，每条查询 5–6 个缓冲页。
+- **测试**：新增真实 PostgreSQL 用例 `receipt_key_order`（2 项），覆盖多记录事务的 `commit_records`/`apply_multi` 重试与 `load_multi_receipt`、交易的重试与 `load_trade_receipt`。修复前 3/3 次两项都失败（五条路径全部报冲突或顺序不符），修复后 3/3 通过。
+- 不改存储结构、迁移和已存数据，只改读回时的排序。
+
 ## 兼容与升级
 
 - 不改协议、SDK、存储结构与迁移，客户端无需升级。
 - 繁忙时被跳过、且之后的提示也没覆盖的修复行，会多一次后台修复：一次 PG 读、一次 Redis 写和 claim/acknowledge 两个小事务，量级可忽略，不影响请求结果与持久性。
 - 监控：`*_worker_polls_total` 多一个 `result` 标签值；按 `result` 分组的面板会自动显示，按固定标签集合校验的外部规则需要加上它。
-
-## 已知问题
-
-- 排序规则不一致（未在本版修复，单独立项）：`commit_records` 与交易的重复请求路径按 SQL `ORDER BY namespace, record_key`（数据库排序规则）读回记录，再与按 Rust 字节序排好的请求逐条比对，两种顺序不同的键会把合法重试判成 `OperationIdConflict`。当前已知的游戏键不触发。
+- 键顺序修复只改读回排序：升级后，此前被误判为 `OperationIdConflict` 的同一请求用原 operation ID 重试会得到 `Duplicate`；已存数据不变。

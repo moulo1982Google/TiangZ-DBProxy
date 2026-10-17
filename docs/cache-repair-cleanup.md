@@ -65,6 +65,7 @@ v0.7.4、`postgresRedis` 后端、2 个请求分片、1000 客户端 16 小时�
 - `cache_repair_concurrency` 全部 10 项、`postgres_redis` 22 项、`postgres_redis_network` 2 项真实库用例通过；默认测试、fmt、全目标严格 Clippy 通过。
 - 未在 220 长稳上复验；修复后长稳是否完全不再出现 40P01 待下一轮长稳确认。
 
-### 已知问题（未在本次修复）
+### 同版本修复的相关问题：重复请求比对的排序规则
 
-- `commit_records` 与交易的重复请求路径用 SQL 的 `ORDER BY namespace, record_key` 读回已存记录（`crates/dbproxy-storage/src/lib.rs` 的多记录回执查询、`trade.rs` 的 `load_receipt_parts`），按数据库排序规则排序，再与按 Rust 字节序排好的请求逐条比对。两种顺序不同的键会把合法重试判成 `OperationIdConflict`。当前已知的游戏键不触发；单独立项处理。
+- 评审中发现：`commit_records` 与交易的重复请求路径、多记录回执查询用 SQL 的 `ORDER BY namespace, record_key`（交易另有分录号、事件号）读回已存行，按数据库默认排序规则排序，再与按 Rust 字节序排好的请求逐条比对。两种顺序不同的键会把合法重试判成 `OperationIdConflict`；交易的重复路径还会按这个顺序写修复行。
+- 0.7.5 同版本修复：这些 `ORDER BY` 都显式加 `COLLATE "C"`，与 Rust 字节序一致。详见 [交易安全与 Outbox](trade-safety-and-outbox.md#故障语义) 与本版发布说明。

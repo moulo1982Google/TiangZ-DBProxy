@@ -104,21 +104,24 @@ where
     let Some(header) = header else {
         return Ok(None);
     };
+    // 三组行都要与按 Rust 字节序规范化的请求逐位比对，排序必须用 "C"（按字节），不能用库默认排序规则。
+    // All three row sets are compared by position with the request normalized in Rust byte order,
+    // so sort with "C" (byte order) instead of the database default collation.
     let records = client
         .query(
-            "SELECT namespace, record_key, new_revision, schema_name, schema_version, expected_revision, payload, updated_at_unix_ms FROM dbproxy_trade_operation_records WHERE operation_id = $1 ORDER BY namespace, record_key",
+            "SELECT namespace, record_key, new_revision, schema_name, schema_version, expected_revision, payload, updated_at_unix_ms FROM dbproxy_trade_operation_records WHERE operation_id = $1 ORDER BY namespace COLLATE \"C\", record_key COLLATE \"C\"",
             &[&operation_id],
         )
         .await?;
     let ledger = client
         .query(
-            "SELECT posting_id, account_id, asset, amount, metadata FROM dbproxy_ledger_postings WHERE operation_id = $1 ORDER BY posting_id",
+            "SELECT posting_id, account_id, asset, amount, metadata FROM dbproxy_ledger_postings WHERE operation_id = $1 ORDER BY posting_id COLLATE \"C\"",
             &[&operation_id],
         )
         .await?;
     let outbox = client
         .query(
-            "SELECT event_id, topic, partition_key, payload, occurred_at_unix_ms FROM dbproxy_outbox WHERE operation_id = $1 ORDER BY event_id",
+            "SELECT event_id, topic, partition_key, payload, occurred_at_unix_ms FROM dbproxy_outbox WHERE operation_id = $1 ORDER BY event_id COLLATE \"C\"",
             &[&operation_id],
         )
         .await?;
