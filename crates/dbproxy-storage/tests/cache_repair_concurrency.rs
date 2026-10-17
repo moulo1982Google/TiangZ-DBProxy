@@ -93,6 +93,33 @@ async fn bounded(future: impl Future<Output = ()>) {
         .expect("repair regression must not hang");
 }
 
+/// 与请求事务内 `enqueue_in_transaction` 相同的语句，用于在事务中途停下观察锁。
+/// The statement request transactions run through `enqueue_in_transaction`, issued by hand so the
+/// test can pause between rows while their locks are held.
+const REQUEST_ENQUEUE: &str = "INSERT INTO dbproxy_cache_repairs (namespace, record_key, target_revision) VALUES ($1, $2, $3) ON CONFLICT (namespace, record_key) DO UPDATE SET target_revision = GREATEST(dbproxy_cache_repairs.target_revision, EXCLUDED.target_revision)";
+
+async fn raw_client() -> (tokio_postgres::Client, JoinHandle<()>) {
+    let url = std::env::var("DBPROXY_TEST_POSTGRES_URL").expect("dedicated test database required");
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    (
+        client,
+        tokio::spawn(async move { connection.await.unwrap() }),
+    )
+}
+
+fn cached(record: &RecordKey, revision: u64) -> tiangz_dbproxy_core::SnapshotEnvelope {
+    tiangz_dbproxy_core::SnapshotEnvelope {
+        record: record.clone(),
+        revision: Revision(revision),
+        schema: "test".into(),
+        schema_version: 1,
+        payload: vec![1],
+        updated_at_unix_ms: 1,
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires dedicated PostgreSQL; run serially"]
 async fn newer_targets_keep_live_leases_and_ack_uses_actual_repaired_revision() {
@@ -359,4 +386,211 @@ async fn settlement_rechecks_expiry_after_waiting_for_an_unchanged_locked_row() 
             assert!(f.queue.acknowledge(&current, Some(Revision(1))).await.unwrap());
         }
     }).await;
+}
+
+/// 2026-10-16 长稳出现 40P01：批量清理按计划顺序删行，提交多条记录的请求事务按记录顺序写修复行，
+/// 两边各持一行再等对方。清理改为跳过已被锁住的行后不再等待，因此不会进入死锁环。
+/// The 2026-10-16 soak hit 40P01: the batch cleanup deleted rows in plan order while a multi-record
+/// request transaction upserted repair rows in record order, each holding one row and waiting for the
+/// other. Cleanup now skips rows that are already locked, so it never waits and cannot close a cycle.
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL; run serially"]
+async fn batch_cleanup_never_deadlocks_with_a_request_writing_several_repair_rows() {
+    bounded(async {
+        let f = Fixture::new().await;
+        let a = RecordKey::new(&f.record.namespace, "deadlock-a").unwrap();
+        let b = RecordKey::new(&f.record.namespace, "deadlock-b").unwrap();
+        let mut outcomes = Vec::new();
+        // 两个方向各跑一次：无论清理按数组顺序还是堆顺序访问，总有一个方向会先删到请求稍后要写的行。
+        // Both directions: whether cleanup visits rows in array or heap order, one direction reaches
+        // the row the request writes second before the row it already holds.
+        for (first, second) in [(&a, &b), (&b, &a)] {
+            f.sql
+                .execute(
+                    "DELETE FROM dbproxy_cache_repairs WHERE namespace=$1",
+                    &[&f.record.namespace],
+                )
+                .await
+                .unwrap();
+            f.writer.enqueue(second, Revision(1)).await.unwrap();
+            f.writer.enqueue(first, Revision(1)).await.unwrap();
+            let (mut request, request_connection) = raw_client().await;
+            let request_pid: i32 = request
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get(0);
+            let tx = request.transaction().await.unwrap();
+            tx.execute(REQUEST_ENQUEUE, &[&first.namespace, &first.key, &2_i64])
+                .await
+                .unwrap();
+            let queue = f.writer.clone();
+            let batch = [cached(second, 1), cached(first, 1)];
+            let ack = tokio::spawn(async move { queue.acknowledge_cached_multi(&batch).await });
+            // 清理要么自己结束，要么真的被请求事务挡住，再让请求写第二行。
+            // Let the request write its second row only once cleanup finished or is really blocked.
+            timeout(Duration::from_secs(5), async {
+                while !ack.is_finished() {
+                    let blocked: bool = f
+                        .sql
+                        .query_one(
+                            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                            &[&request_pid],
+                        )
+                        .await
+                        .unwrap()
+                        .get(0);
+                    if blocked {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cleanup must finish or block on the request");
+            tx.execute(REQUEST_ENQUEUE, &[&second.namespace, &second.key, &2_i64])
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            drop(request);
+            request_connection.await.unwrap();
+            let mut targets = Vec::new();
+            for record in [first, second] {
+                let target: i64 = f
+                    .sql
+                    .query_one(
+                        "SELECT target_revision FROM dbproxy_cache_repairs WHERE namespace=$1 AND record_key=$2",
+                        &[&record.namespace, &record.key],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                targets.push(target);
+            }
+            let result = ack.await.unwrap();
+            // 缓存写到新版本后的下一次批量清理，必须删掉之前被跳过和被重写的两行。
+            // The next batch cleanup after caching the new revision must delete both the skipped
+            // and the rewritten row.
+            let settled = f
+                .writer
+                .acknowledge_cached_multi(&[cached(first, 2), cached(second, 2)])
+                .await
+                .unwrap();
+            let remaining: i64 = f
+                .sql
+                .query_one(
+                    "SELECT COUNT(*) FROM dbproxy_cache_repairs WHERE namespace=$1",
+                    &[&f.record.namespace],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            outcomes.push((first.key.clone(), result, targets, settled, remaining));
+        }
+        // 先报死锁本身，再核对清理结果，避免把另一个方向的计数差异误当成复现。
+        // Report the deadlock itself first, then the cleanup results.
+        for (first, result, ..) in &outcomes {
+            if let Err(error) = result {
+                panic!("cleanup failed while the request held {first}: {error}");
+            }
+        }
+        for (first, result, targets, settled, remaining) in outcomes {
+            // 请求持有的行被跳过，另一行被删除后又被请求按新目标写回；两行都保留新目标。
+            // The held row is skipped; the other is deleted and rewritten by the request. Both keep
+            // the newer target, so no repair is lost.
+            assert_eq!(result.unwrap(), 1, "request held {first}");
+            assert_eq!(targets, vec![2, 2], "request held {first}");
+            // 最终一致：被跳过的行在后续清理中被删除，不会滞留。
+            // Eventual cleanup: the skipped row is removed by a later batch and does not linger.
+            assert_eq!(settled, 2, "request held {first}");
+            assert_eq!(remaining, 0, "request held {first}");
+        }
+        f.sql
+            .execute(
+                "DELETE FROM dbproxy_cache_repairs WHERE namespace=$1",
+                &[&f.record.namespace],
+            )
+            .await
+            .unwrap();
+    })
+    .await;
+}
+
+/// 工作线程据此把真实的 40P01/40001 记为可重试的 WARN；其他数据库错误仍是 ERROR。
+/// Workers log real 40P01/40001 failures as retryable warnings; other database errors stay errors.
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL; run serially"]
+async fn real_deadlock_and_serialization_failures_are_retryable_conflicts() {
+    use tiangz_dbproxy_storage::StorageError;
+    bounded(async {
+        let f = Fixture::new().await;
+        let a = RecordKey::new(&f.record.namespace, "conflict-a").unwrap();
+        let b = RecordKey::new(&f.record.namespace, "conflict-b").unwrap();
+        f.writer.enqueue(&a, Revision(1)).await.unwrap();
+        f.writer.enqueue(&b, Revision(1)).await.unwrap();
+        let bump = "UPDATE dbproxy_cache_repairs SET target_revision=target_revision+1 WHERE namespace=$1 AND record_key=$2";
+        let (mut one, one_connection) = raw_client().await;
+        let (mut two, two_connection) = raw_client().await;
+
+        // 两个事务交叉更新两行，PostgreSQL 必定回滚其中一个（40P01）。
+        // Two transactions update the rows crosswise; PostgreSQL must abort one with 40P01.
+        let first = one.transaction().await.unwrap();
+        let second = two.transaction().await.unwrap();
+        first.execute(bump, &[&a.namespace, &a.key]).await.unwrap();
+        second.execute(bump, &[&b.namespace, &b.key]).await.unwrap();
+        type Params<'a> = [&'a (dyn tokio_postgres::types::ToSql + Sync); 2];
+        let b_params: Params = [&b.namespace, &b.key];
+        let a_params: Params = [&a.namespace, &a.key];
+        let (left, right) = tokio::join!(
+            first.execute(bump, &b_params),
+            second.execute(bump, &a_params)
+        );
+        let deadlock = match (left, right) {
+            (Err(error), Ok(_)) | (Ok(_), Err(error)) => StorageError::from(error),
+            other => panic!("expected exactly one deadlock victim: {other:?}"),
+        };
+        assert!(deadlock.is_retryable_conflict(), "{deadlock}");
+        assert!(deadlock.to_string().contains("40P01"), "{deadlock}");
+        drop((first, second));
+
+        // 可重复读事务更新一行已被他人提交修改的行，得到 40001。
+        // A repeatable-read transaction updating a row changed by a later commit gets 40001.
+        let reader = one
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .start()
+            .await
+            .unwrap();
+        reader
+            .query_one(
+                "SELECT target_revision FROM dbproxy_cache_repairs WHERE namespace=$1 AND record_key=$2",
+                &[&a.namespace, &a.key],
+            )
+            .await
+            .unwrap();
+        two.execute(bump, &[&a.namespace, &a.key]).await.unwrap();
+        let serialization =
+            StorageError::from(reader.execute(bump, &[&a.namespace, &a.key]).await.unwrap_err());
+        assert!(serialization.is_retryable_conflict(), "{serialization}");
+        assert!(serialization.to_string().contains("40001"), "{serialization}");
+        drop(reader);
+
+        // 其他数据库错误与非数据库错误不算可重试冲突。
+        // Other database errors and non-database errors are not retryable conflicts.
+        let division = StorageError::from(f.sql.query_one("SELECT 1/0", &[]).await.unwrap_err());
+        assert!(!division.is_retryable_conflict(), "{division}");
+        assert!(!StorageError::CacheFallbackGateClosed.is_retryable_conflict());
+
+        drop((one, two));
+        one_connection.await.unwrap();
+        two_connection.await.unwrap();
+        f.sql
+            .execute(
+                "DELETE FROM dbproxy_cache_repairs WHERE namespace=$1",
+                &[&f.record.namespace],
+            )
+            .await
+            .unwrap();
+    })
+    .await;
 }

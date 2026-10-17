@@ -1,4 +1,4 @@
-> 本轮发布：`v0.7.4`（DBProxy 单独发布，2026-10-16）。新增崩溃诊断 `diagnostics.crash`（默认关闭）：panic 报告（回溯与最近日志）、Windows 未处理异常记录与可选 minidump、Linux 可选放开 core 上限、报告与转储保留上限；环境变量 `TIANGZ_DBPROXY_CRASH_DIAGNOSTICS=on|off`。协议、SDK 与数据库迁移不变，客户端无需升级。见 [RELEASE-v0.7.4.md](RELEASE-v0.7.4.md)。
+> 本轮发布：`v0.7.5`（DBProxy 单独发布，2026-10-17）。两项存储修复：缓存修复队列的批量清理改用 `SKIP LOCKED`，不再与请求事务死锁（40P01）；重复请求与回执查询按字节序读回，数据库默认排序规则不是按字节时不再把合法重试误判为 `OperationIdConflict`。持久队列 worker 的可重试冲突改记 WARN，并在 `*_worker_polls_total` 中单独计为 `result="retryable_conflict"`。协议、SDK、配置与数据库迁移不变，客户端无需升级；修复后尚未经长稳复验。见 [RELEASE-v0.7.5.md](RELEASE-v0.7.5.md)。
 
 # TiangZ DBProxy
 
@@ -9,7 +9,7 @@
 [![tag](https://img.shields.io/github/v/tag/moulo1982Google/TiangZ-DBProxy?label=tag&sort=semver)](https://github.com/moulo1982Google/TiangZ-DBProxy/tags)
 [![license](https://img.shields.io/github/license/moulo1982Google/TiangZ-DBProxy?label=license)](LICENSE)
 
-当前版本为 `0.7.4`（正式版），服务与 Rust/TypeScript SDK 使用相同版本；相对 0.7.3 新增崩溃诊断（默认关闭，见 [崩溃诊断](docs/crash-diagnostics.md)），协议、SDK 与迁移不变；0.7.3 相对 0.7.2 新增多记录事务回执退休、迁移 016 与错误码 `OPERATION_EXPIRED`（协议指纹改变，服务端仍接受 0.7.0–0.7.2 客户端）；0.7.1 引入迁移 013–015。此前候选（0.7.0-rc.2、v0.7.0-rc1、v0.7.0-rc2）的标签与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题。
+当前版本为 `0.7.5`（正式版），服务与 Rust/TypeScript SDK 使用相同版本；相对 0.7.4 修复缓存修复队列死锁与重复请求比对的排序规则（见 [RELEASE-v0.7.5.md](RELEASE-v0.7.5.md)），协议、SDK 与迁移不变；0.7.4 相对 0.7.3 新增崩溃诊断（默认关闭，见 [崩溃诊断](docs/crash-diagnostics.md)），协议、SDK 与迁移不变；0.7.3 相对 0.7.2 新增多记录事务回执退休、迁移 016 与错误码 `OPERATION_EXPIRED`（协议指纹改变，服务端仍接受 0.7.0–0.7.2 客户端）；0.7.1 引入迁移 013–015。此前候选（0.7.0-rc.2、v0.7.0-rc1、v0.7.0-rc2）的标签与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题。
 
 > 验收进度请先读[当前剩余清单（2026-09-29）](docs/acceptance-remaining-20260929.md)，历史证据见[索引与验收交接](docs/handoff-index-acceptance-20260922.md)。两小时测试及多项补测已完成；综合验收仍有缺口，不能把历史交接的未完成状态当作当前结论。
 
@@ -169,6 +169,8 @@ cargo test -p tiangz-dbproxy-storage --test postgres_redis -- --ignored --nocapt
 
 ```powershell
 cargo test -p tiangz-dbproxy-storage --test cache_repair_concurrency -- --ignored --nocapture --test-threads=1
+# 重复请求与回执查询的键顺序（库默认排序规则须不是按字节，如 en_US.utf8，才构成反例）
+cargo test -p tiangz-dbproxy-storage --test receipt_key_order -- --ignored --nocapture --test-threads=1
 ```
 
 该组验证目标合并、实际修复 revision/缺失记录的 ACK、排队顺序、退避/死信保留、过期租约、同名 worker 和删除后重新入队隔离。它不在默认 `cargo test --workspace` 的通过数量中；真实 Redis 缓存读写还需执行上面的 `postgres_redis` 测试。迁移 010 的受控切换要求见[恢复手册](docs/durability-recovery-runbook.md)。

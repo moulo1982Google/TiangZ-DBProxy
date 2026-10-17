@@ -124,7 +124,11 @@ in-memory best-effort task:
   `dbproxy_cache_repair_dead_lettered` are the current queue states.
 - `dbproxy_cache_repair_oldest_age_seconds` is the age of the oldest non-dead repair target.
 - `dbproxy_cache_repair_worker_polls_total{result="..."}` uses the fixed result set
-  `committed`, `retry_scheduled`, `dead_lettered`, `lease_lost`, `empty`, and `failure`.
+  `committed`, `retry_scheduled`, `dead_lettered`, `lease_lost`, `empty`, `failure`, and
+  `retryable_conflict`. `retryable_conflict` counts rounds rolled back by a PostgreSQL deadlock
+  (40P01) or serialization failure (40001); they use the same retry delay as `failure` and are
+  logged at WARN instead of ERROR, so alert on a sustained `retryable_conflict` rate rather than on
+  ERROR logs alone.
 
 A cache write error can be transient without affecting PostgreSQL durability. A growing oldest
 age or any dead letter is the actionable signal. The local rules warn above 60 seconds for five

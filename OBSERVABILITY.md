@@ -69,7 +69,7 @@ Grafana会自动配置Prometheus数据源并加载`TiangZ DBProxy Overview`，�
 | `dbproxy_backlog_oldest_pending_age_seconds` | Age of the oldest pending backlog item; zero when empty |
 | `dbproxy_cache_repair_pending` / `dbproxy_cache_repair_processing` / `dbproxy_cache_repair_dead_lettered` | PostgreSQL-backed cache repair queue state |
 | `dbproxy_cache_repair_oldest_age_seconds` | Age of the oldest committed snapshot still awaiting cache repair |
-| `dbproxy_cache_repair_worker_polls_total` | Repair worker outcomes: committed/retry/dead-letter/lease-lost/empty/failure |
+| `dbproxy_cache_repair_worker_polls_total` | Repair worker outcomes: committed/retry/dead-letter/lease-lost/empty/failure/retryable-conflict（PG 死锁或序列化冲突，日志为 WARN） |
 | `dbproxy_outbox_pending` / `dbproxy_outbox_processing` / `dbproxy_outbox_dead_lettered` | PostgreSQL transactional Outbox state |
 | `dbproxy_outbox_oldest_age_seconds` | Age of the oldest unpublished non-dead event |
 | `dbproxy_outbox_worker_polls_total` | Outbox worker outcomes using the same fixed result labels |

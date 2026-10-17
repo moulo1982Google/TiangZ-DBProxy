@@ -82,6 +82,10 @@ Outbox 事件与交易在同一事务写入，因此不存在“交易已提交�
 | Redis 已 XADD，PG ACK 失败 | 可能重复事件 | 消费者按 event ID 去重 |
 | DBProxy worker 崩溃 | 租约到期后重新领取 | 无需人工释放租约 |
 
+重复请求的比对按位置进行：请求在 Rust 里按记录 `(namespace, record_key)`、分录号、事件号的字节序规范化，读回已存行的 SQL 必须用同一顺序，所以这些 `ORDER BY` 都显式写 `COLLATE "C"`（PostgreSQL 的 C 排序按字节比较，与 Rust `str` 的顺序一致）。0.7.4 及以前用库的默认排序规则（如 `en_US.utf8`）排序，`B`/`a`、`a_1`/`a1` 这类键的先后与字节序相反，合法重试和回执查询会被误判为 `OperationIdConflict`，交易回执的返回顺序也可能与提交时不同；0.7.5 修复。执行计划仍按 `operation_id` 走索引，只对本操作的几行额外排序。
+
+前提：数据库编码须为 UTF8（官方 PostgreSQL 镜像默认如此）。“C 排序的字节序 = Rust 字符串顺序 = 码点序”只在 UTF8 编码下成立；其他服务端编码下文本以别的字节存储，C 排序与 Rust 顺序可能不一致。本版不在连接时校验 `server_encoding`，列为后续事项。
+
 ## 运维检查
 
 重点指标是：
