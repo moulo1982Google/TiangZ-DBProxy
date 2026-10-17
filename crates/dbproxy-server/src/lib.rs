@@ -1035,16 +1035,19 @@ async fn run_durable_queue_worker(
                 }
                 Ok(DurableQueueProcessOutcome::Empty) => (DurableQueueMetricResult::Empty, true),
                 Err(error) => {
-                    // 死锁/序列化冲突只回滚了本轮，持久行仍在，按原退避重试；记 WARN 以免与真故障混淆。
+                    // 死锁/序列化冲突只回滚了本轮，持久行仍在，按原退避重试；记 WARN 以免与真故障混淆，
+                    // 指标单独记 retryable_conflict，持续冲突仍可告警。
                     // A deadlock/serialization conflict only rolled back this round; durable rows
-                    // remain and the usual backoff retries them, so log it below real failures.
+                    // remain and the usual backoff retries them. Log it below real failures and
+                    // count it under its own label so persistent conflicts stay alertable.
                     if matches!(&error, BackendError::Storage(storage) if storage.is_retryable_conflict())
                     {
                         tracing::warn!(%error, worker = %worker_id, queue = queue_name, "durable queue worker hit a retryable PostgreSQL conflict; retrying");
+                        (DurableQueueMetricResult::RetryableConflict, true)
                     } else {
                         tracing::error!(%error, worker = %worker_id, queue = queue_name, "durable queue worker failed");
+                        (DurableQueueMetricResult::Failure, true)
                     }
-                    (DurableQueueMetricResult::Failure, true)
                 }
             };
             if let Some(metrics) = &metrics {
@@ -1052,7 +1055,11 @@ async fn run_durable_queue_worker(
             }
             if should_idle {
                 idle = Some(
-                    if matches!(metric_result, DurableQueueMetricResult::Failure) {
+                    if matches!(
+                        metric_result,
+                        DurableQueueMetricResult::Failure
+                            | DurableQueueMetricResult::RetryableConflict
+                    ) {
                         Duration::from_millis(policy.base_retry_delay_ms)
                     } else {
                         idle_delay

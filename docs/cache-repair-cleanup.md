@@ -45,22 +45,26 @@ v0.7.4、`postgresRedis` 后端、2 个请求分片、1000 客户端 16 小时�
 
 ### 根因
 
-- 请求一侧：`commit_records`、交易、`save_batch` 在同一个事务里逐条调用 `enqueue_in_transaction`，每条记录一次 `INSERT ... ON CONFLICT DO UPDATE`，修复行的行锁一直持有到事务提交。`commit_records` 与交易按 Rust 字节序排序记录后写；`save_batch` 按调用方给的顺序写，没有统一顺序。
+- 请求一侧：`commit_records`、交易、`save_batch` 在同一个事务里逐条调用 `enqueue_in_transaction`，每条记录一次 `INSERT ... ON CONFLICT DO UPDATE`，修复行的行锁一直持有到事务提交。`commit_records` 与交易按 Rust 字节序排序记录后写；服务端的 `save_multi` 和积压落库在调用 `save_batch`/`save_queued_batch` 前也按记录排序，存储层的 `save_batch` 本身则按调用方给的顺序写，直接调用它的宿主不保证顺序。
 - 清理一侧：`acknowledge_cached_revisions`（服务端后台提示刷新和 `acknowledge_cached_multi` 共用）原来是一条 DELETE，按执行计划的顺序（unnest 数组顺序或表的堆顺序；提示来自 HashMap，顺序随机）逐行删，遇到被锁的行就等待。
 - 两边对同一批行的加锁顺序不一致：请求事务已写 A、接着写 B，清理语句已删 B、接着等 A，各持一行再等对方即成环。PostgreSQL 回滚先进入等待的一方，长稳里都是清理语句。
-- 只在清理一侧按键排序不够：`save_batch` 没有统一顺序；而且 SQL 的 `ORDER BY` 默认按数据库排序规则，和 Rust 的字节序也不一定一致。
+- 也可以让清理一侧按同样的顺序加锁，但要求所有请求路径（包括存储层的直接调用者）都按同一顺序写，而且 SQL 的 `ORDER BY` 默认按数据库排序规则，和 Rust 的字节序不一定一致，需要显式 `COLLATE "C"`。清理不等待更简单，也不依赖请求一侧的顺序。
 
 ### 修复
 
 - 批量清理改为两步写在一条语句里：先 `SELECT ... FOR UPDATE OF repair SKIP LOCKED` 锁住与提示匹配、`target_revision <= 已缓存版本` 且没有被别人锁住的修复行，再按键删除这些行并再次核对版本条件。
-- 清理语句不再等待任何行锁，就不会进入等待环，与请求事务按什么顺序写无关。被请求事务锁住的行被跳过：那条请求往往正在写更新的目标，即便不是，修复行仍是持久目标，原 CacheRepair worker 照常重建缓存后确认，代价最多是一次多余的 Redis 写。提示本来就是尽力而为，语义不变。
+- 清理语句不再等待任何行锁，就不会进入等待环，与请求事务按什么顺序写无关。被请求事务锁住的行被跳过：那条请求往往正在写更新的目标，即便不是，修复行仍是持久目标，若之后的清理提示也没覆盖它，原 CacheRepair worker 照常重建缓存后确认，代价是一次 PG 读、一次 Redis 写和 claim/acknowledge 两个小事务，量级可忽略。提示本来就是尽力而为，语义不变；用例另外核对了缓存到新版本后的下一次批量清理会删掉被跳过的行。
 - 单条清理 `acknowledge_cached` 一条语句只锁一行，不可能与别人成环，保持原样（仍会等待并在等待后复核版本）。
-- 持久队列工作线程（缓存修复与 Outbox 共用）遇到 PostgreSQL 死锁 40P01 或序列化冲突 40001 时改记 WARN（`durable queue worker hit a retryable PostgreSQL conflict; retrying`），其他错误仍记 ERROR。指标仍记一次 `failure`，重试间隔不变。判断依据是新增的公开方法 `StorageError::is_retryable_conflict()`。
+- 持久队列工作线程（缓存修复与 Outbox 共用）遇到 PostgreSQL 死锁 40P01 或序列化冲突 40001 时改记 WARN（`durable queue worker hit a retryable PostgreSQL conflict; retrying`），其他错误仍记 ERROR。指标 `dbproxy_cache_repair_worker_polls_total` / `dbproxy_outbox_worker_polls_total` 对这类轮次记新标签 `result="retryable_conflict"`，不再混入 `failure`，告警按这个标签的持续速率判断；重试间隔与 `failure` 相同。判断依据是新增的公开方法 `StorageError::is_retryable_conflict()`。
 - 不改协议、SDK、存储结构与迁移。
 
 ### 验证
 
-- 新增真实 PostgreSQL 用例 `batch_cleanup_never_deadlocks_with_a_request_writing_several_repair_rows`：请求事务先写一行并保持事务，清理批次同时包含这一行和请求稍后要写的另一行，两个方向各跑一次。修复前连续 5 次都以 `40P01: deadlock detected` 失败；修复后连续 5 次通过，清理只删除未被持有的那一行，事务提交后两行都保留新目标。
+- 新增真实 PostgreSQL 用例 `batch_cleanup_never_deadlocks_with_a_request_writing_several_repair_rows`：请求事务先写一行并保持事务，清理批次同时包含这一行和请求稍后要写的另一行，两个方向各跑一次。修复前连续 5 次都以 `40P01: deadlock detected` 失败；修复后连续 5 次通过，清理只删除未被持有的那一行，事务提交后两行都保留新目标，再按新版本批量清理一次两行都被删除、表内不剩修复行。
 - 新增 `real_deadlock_and_serialization_failures_are_retryable_conflicts`：用两个连接制造真实的 40P01 与 40001，确认判为可重试；除零错误和非数据库错误不判。
 - `cache_repair_concurrency` 全部 10 项、`postgres_redis` 22 项、`postgres_redis_network` 2 项真实库用例通过；默认测试、fmt、全目标严格 Clippy 通过。
 - 未在 220 长稳上复验；修复后长稳是否完全不再出现 40P01 待下一轮长稳确认。
+
+### 已知问题（未在本次修复）
+
+- `commit_records` 与交易的重复请求路径用 SQL 的 `ORDER BY namespace, record_key` 读回已存记录（`crates/dbproxy-storage/src/lib.rs` 的多记录回执查询、`trade.rs` 的 `load_receipt_parts`），按数据库排序规则排序，再与按 Rust 字节序排好的请求逐条比对。两种顺序不同的键会把合法重试判成 `OperationIdConflict`。当前已知的游戏键不触发；单独立项处理。

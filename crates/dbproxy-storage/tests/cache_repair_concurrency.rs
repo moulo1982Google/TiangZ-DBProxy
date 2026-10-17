@@ -467,21 +467,43 @@ async fn batch_cleanup_never_deadlocks_with_a_request_writing_several_repair_row
                     .get(0);
                 targets.push(target);
             }
-            outcomes.push((first.key.clone(), ack.await.unwrap(), targets));
+            let result = ack.await.unwrap();
+            // 缓存写到新版本后的下一次批量清理，必须删掉之前被跳过和被重写的两行。
+            // The next batch cleanup after caching the new revision must delete both the skipped
+            // and the rewritten row.
+            let settled = f
+                .writer
+                .acknowledge_cached_multi(&[cached(first, 2), cached(second, 2)])
+                .await
+                .unwrap();
+            let remaining: i64 = f
+                .sql
+                .query_one(
+                    "SELECT COUNT(*) FROM dbproxy_cache_repairs WHERE namespace=$1",
+                    &[&f.record.namespace],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            outcomes.push((first.key.clone(), result, targets, settled, remaining));
         }
         // 先报死锁本身，再核对清理结果，避免把另一个方向的计数差异误当成复现。
         // Report the deadlock itself first, then the cleanup results.
-        for (first, result, _) in &outcomes {
+        for (first, result, ..) in &outcomes {
             if let Err(error) = result {
                 panic!("cleanup failed while the request held {first}: {error}");
             }
         }
-        for (first, result, targets) in outcomes {
+        for (first, result, targets, settled, remaining) in outcomes {
             // 请求持有的行被跳过，另一行被删除后又被请求按新目标写回；两行都保留新目标。
             // The held row is skipped; the other is deleted and rewritten by the request. Both keep
             // the newer target, so no repair is lost.
             assert_eq!(result.unwrap(), 1, "request held {first}");
             assert_eq!(targets, vec![2, 2], "request held {first}");
+            // 最终一致：被跳过的行在后续清理中被删除，不会滞留。
+            // Eventual cleanup: the skipped row is removed by a later batch and does not linger.
+            assert_eq!(settled, 2, "request held {first}");
+            assert_eq!(remaining, 0, "request held {first}");
         }
         f.sql
             .execute(

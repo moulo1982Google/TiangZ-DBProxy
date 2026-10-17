@@ -1277,6 +1277,10 @@ pub(crate) enum DurableQueueMetricResult {
     LeaseLost,
     Empty,
     Failure,
+    /// PostgreSQL 死锁或序列化冲突回滚了本轮，按失败退避重试；与 `Failure` 分开计数以便告警。
+    /// A deadlock/serialization rollback retried with the failure backoff, counted apart from
+    /// `Failure` so alerts can still see it after the log moved to WARN.
+    RetryableConflict,
 }
 
 pub(crate) enum HandshakeRejection {
@@ -1300,13 +1304,15 @@ const ERROR_CODE_NAMES: [&str; 12] = [
     "operation_expired",
 ];
 
-const DURABLE_QUEUE_RESULT_NAMES: [&str; 6] = [
+// 顺序与 `DurableQueueMetricResult` 的判别值一致。 / Order matches `DurableQueueMetricResult`.
+const DURABLE_QUEUE_RESULT_NAMES: [&str; 7] = [
     "committed",
     "retry_scheduled",
     "dead_lettered",
     "lease_lost",
     "empty",
     "failure",
+    "retryable_conflict",
 ];
 
 struct DurableQueueMetricRefs<'a> {
@@ -1653,6 +1659,16 @@ mod tests {
             DurableQueueMetricKind::Outbox,
             DurableQueueMetricResult::Committed,
         );
+        for _ in 0..2 {
+            metrics.durable_queue_finished(
+                DurableQueueMetricKind::Outbox,
+                DurableQueueMetricResult::RetryableConflict,
+            );
+        }
+        metrics.durable_queue_finished(
+            DurableQueueMetricKind::Outbox,
+            DurableQueueMetricResult::Failure,
+        );
         metrics.outbox_depth_updated(6, 2, 1, Some(4_500));
         let output = metrics.prometheus("memory");
         assert!(output.contains("dbproxy_ready 1"));
@@ -1686,6 +1702,16 @@ mod tests {
         assert!(output.contains("dbproxy_cache_repair_dead_lettered 2"));
         assert!(output.contains("dbproxy_cache_repair_oldest_age_seconds 3.500"));
         assert!(output.contains("dbproxy_outbox_worker_polls_total{result=\"committed\"} 1"));
+        // 可重试冲突与普通失败分开计数。 / Retryable conflicts are counted apart from failures.
+        assert!(
+            output.contains("dbproxy_outbox_worker_polls_total{result=\"retryable_conflict\"} 2")
+        );
+        assert!(output.contains("dbproxy_outbox_worker_polls_total{result=\"failure\"} 1"));
+        assert!(
+            output.contains(
+                "dbproxy_cache_repair_worker_polls_total{result=\"retryable_conflict\"} 0"
+            )
+        );
         assert!(output.contains("dbproxy_outbox_pending 6"));
         assert!(output.contains("dbproxy_outbox_dead_lettered 1"));
         assert!(output.contains("dbproxy_outbox_oldest_age_seconds 4.500"));
