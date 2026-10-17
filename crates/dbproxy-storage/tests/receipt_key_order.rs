@@ -16,9 +16,11 @@ use tiangz_dbproxy_core::{
 };
 use tiangz_dbproxy_storage::PostgresSnapshotStore;
 
-/// 在常见的语言排序规则下与字节序先后不同的键（`1:x`/`10` 在 glibc en_US 下两种顺序相同，作对照）。
-/// Keys whose linguistic order differs from byte order (`1:x`/`10` agree under glibc en_US; kept as
-/// a control).
+/// 在常见的语言排序规则下与字节序先后不同的键。`1:x`/`10` 是对照项：2026-10-17 在 PostgreSQL 18.6
+/// （libc 提供的 en_US.utf8）上实测，默认排序与 "C" 排序都是 `10` 在前；其他平台或版本的结果不影响用例。
+/// Keys whose linguistic order differs from byte order. `1:x`/`10` is a control: on PostgreSQL 18.6
+/// with libc en_US.utf8 (measured 2026-10-17) both the default and "C" collations put `10` first;
+/// whether another platform agrees does not affect the test.
 const KEYS: [&str; 8] = ["a_1", "a1", "B", "a", "1:x", "10", "a-b", "aa"];
 
 fn suffix() -> String {
@@ -40,17 +42,21 @@ async fn store() -> PostgresSnapshotStore {
         .await
         .unwrap();
     let task = tokio::spawn(async move { connection.await.unwrap() });
-    // 只提示，不跳过：排序规则本来就是字节序时，用例照常通过但不构成反例。
-    // Informational only: under a byte-order collation the test passes but proves nothing.
+    // 排序规则本来就是字节序时，用例照常通过但不构成反例。CI 设
+    // DBPROXY_TEST_REQUIRE_LINGUISTIC_COLLATION=1 时直接失败，避免回归静默失去意义；本地未设置时只提示。
+    // Under a byte-order collation the test passes but proves nothing. CI sets
+    // DBPROXY_TEST_REQUIRE_LINGUISTIC_COLLATION=1 to fail instead of silently losing the regression.
     let differs: bool = sql
         .query_one("SELECT NOT ('a1' < 'a_1')", &[])
         .await
         .unwrap()
         .get(0);
     if !differs {
-        eprintln!(
-            "database default collation already sorts by bytes; key-order regression is vacuous here"
-        );
+        let message = "database default collation already sorts by bytes (e.g. C/POSIX); the key-order regression cannot detect anything here, use a database whose default collation is linguistic such as en_US.utf8";
+        if std::env::var("DBPROXY_TEST_REQUIRE_LINGUISTIC_COLLATION").as_deref() == Ok("1") {
+            panic!("{message}");
+        }
+        eprintln!("{message}");
     }
     drop(sql);
     task.await.unwrap();

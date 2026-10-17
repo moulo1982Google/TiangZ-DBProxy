@@ -180,15 +180,17 @@ VALUES('index-dead','index-background','audit','dead','',0,NULL,clock_timestamp(
 ANALYZE dbproxy_ledger_postings;
 ANALYZE dbproxy_outbox;
 "#).await.unwrap();
+    // 与 trade.rs load_receipt_parts 的生产查询逐字相同（含 COLLATE "C"），审计落在真实执行的语句上。
+    // Byte-for-byte the production queries of trade.rs load_receipt_parts (including COLLATE "C").
     let queries = [
         (
             "ledger",
-            "SELECT posting_id,account_id,asset,amount,metadata FROM dbproxy_ledger_postings WHERE operation_id=$1 ORDER BY posting_id",
+            "SELECT posting_id, account_id, asset, amount, metadata FROM dbproxy_ledger_postings WHERE operation_id = $1 ORDER BY posting_id COLLATE \"C\"",
             "dbproxy_ledger_postings_operation",
         ),
         (
             "outbox",
-            "SELECT event_id,topic,partition_key,payload,occurred_at_unix_ms FROM dbproxy_outbox WHERE operation_id=$1 ORDER BY event_id",
+            "SELECT event_id, topic, partition_key, payload, occurred_at_unix_ms FROM dbproxy_outbox WHERE operation_id = $1 ORDER BY event_id COLLATE \"C\"",
             "dbproxy_outbox_operation",
         ),
         ("stats", STATS, "dbproxy_outbox_"),

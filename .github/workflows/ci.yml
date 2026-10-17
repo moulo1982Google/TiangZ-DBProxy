@@ -159,6 +159,7 @@ jobs:
         # 官方镜像默认排序规则 en_US.utf8 与字节序不同，正好用来复现。 / The image's en_US.utf8 default differs from byte order.
         env:
           DBPROXY_TEST_POSTGRES_URL: postgres://tiangz:tiangz_dev@127.0.0.1:5432/receipt_order_regression
+          DBPROXY_TEST_REQUIRE_LINGUISTIC_COLLATION: "1"
         run: |
           docker exec tiangz-dbproxy-postgres createdb -U tiangz receipt_order_regression
           cargo test -p tiangz-dbproxy-storage --test receipt_key_order --locked -- --ignored --nocapture --test-threads=1

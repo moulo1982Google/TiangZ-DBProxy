@@ -25,6 +25,8 @@ DBProxy 单独发布（GitHub Release，不上架 npm/crates.io）。之前的�
 - **执行计划**：这些查询都按 `operation_id` 过滤，仍走 `(operation_id, …)` 索引，只对本操作的几行多一个内存排序。在每表 20 万–30 万行的一次性数据上核对过，具体计划与通用计划都是 Index Scan + Sort，每条查询 5–6 个缓冲页。
 - **测试**：新增真实 PostgreSQL 用例 `receipt_key_order`（2 项），覆盖多记录事务的 `commit_records`/`apply_multi` 重试与 `load_multi_receipt`、交易的重试与 `load_trade_receipt`。修复前 3/3 次两项都失败（五条路径全部报冲突或顺序不符），修复后 3/3 通过。
 - 不改存储结构、迁移和已存数据，只改读回时的排序。
+- **前提**：数据库编码须为 UTF8（官方 PostgreSQL 镜像默认如此）；“C 排序的字节序 = Rust 字符串顺序 = 码点序”只在 UTF8 编码下成立。本版不在连接时校验 `server_encoding`，列为后续事项。
+- 用例在库默认排序规则已是字节序时不构成反例：CI 与覆盖率工作流设 `DBPROXY_TEST_REQUIRE_LINGUISTIC_COLLATION=1`，此时直接失败；本地未设置时只打印提示。`schema_indexes` 的计划审计改用与生产完全相同的分录、事件查询文本（含 `COLLATE "C"`）。
 
 ## 兼容与升级
 
