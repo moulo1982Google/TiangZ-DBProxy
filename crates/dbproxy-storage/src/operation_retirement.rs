@@ -3,6 +3,11 @@
 //! Multi-record transaction receipt retirement: after the retention the header and its records
 //! are deleted and the operation claim is marked retired, so a late lookup or replay is answered
 //! `OperationExpired`, never "not executed". Receipts carrying commit effects are kept.
+//!
+//! 退休标记再保留一段时间（默认 7 天）后删除：之后用同一个操作号查询得到“没有回执”，重提会被当作新操作。
+//! Retired markers are deleted after a second retention (7 days by default). After that a lookup of
+//! the id finds no receipt and a replay is treated as a new operation; expected revisions still
+//! reject a replay whose records have moved on.
 use std::time::Duration;
 
 use crate::{PostgresSnapshotStore, StorageError};
@@ -16,6 +21,22 @@ pub const DEFAULT_OPERATION_RECEIPT_RETENTION: Duration = Duration::from_secs(30
 pub const MIN_OPERATION_RECEIPT_RETENTION: Duration = Duration::from_secs(86_400);
 /// 上限十年，只防止配置错误。 / Ten-year ceiling, only to reject misconfiguration.
 pub const MAX_OPERATION_RECEIPT_RETENTION: Duration = Duration::from_secs(3650 * 86_400);
+
+/// 退休标记默认保留 7 天。 / Retired markers are kept for 7 days by default.
+pub const DEFAULT_RETIRED_OPERATION_RETENTION: Duration = Duration::from_secs(7 * 86_400);
+/// 下限 1 天、上限十年，与回执保留期相同。 / Same one-day floor and ten-year ceiling as receipts.
+pub const MIN_RETIRED_OPERATION_RETENTION: Duration = Duration::from_secs(86_400);
+pub const MAX_RETIRED_OPERATION_RETENTION: Duration = Duration::from_secs(3650 * 86_400);
+
+/// Reject marker retention outside [`MIN_RETIRED_OPERATION_RETENTION`, `MAX_RETIRED_OPERATION_RETENTION`].
+pub fn validate_retired_operation_retention(retention: Duration) -> Result<Duration, StorageError> {
+    if retention < MIN_RETIRED_OPERATION_RETENTION || retention > MAX_RETIRED_OPERATION_RETENTION {
+        return Err(StorageError::InvalidRetiredOperationRetention {
+            seconds: retention.as_secs(),
+        });
+    }
+    Ok(retention)
+}
 
 /// Reject retention outside [`MIN_OPERATION_RECEIPT_RETENTION`, `MAX_OPERATION_RECEIPT_RETENTION`].
 pub fn validate_operation_receipt_retention(retention: Duration) -> Result<Duration, StorageError> {
@@ -56,6 +77,31 @@ impl PostgresSnapshotStore {
         transaction.commit().await?;
         Ok(retired)
     }
+
+    /// Delete at most 500 retired multi-record markers whose retirement is strictly older than
+    /// `retention` (server time `retired_at`), skipping markers locked by a late replay.
+    /// Returns the number of markers deleted. Call on a dedicated maintenance connection.
+    pub async fn purge_retired_operations(&self, retention: Duration) -> Result<u64, StorageError> {
+        let retention = validate_retired_operation_retention(retention)?;
+        let mut client = self
+            .client
+            .lock_for("purge_retired_operations", None, 0, None)
+            .await
+            .expect("unbounded maintenance lock");
+        client.ensure_connected().await?;
+        let transaction = client.transaction().await?;
+        transaction
+            .batch_execute("SET LOCAL statement_timeout='5s'; SET LOCAL lock_timeout='100ms'")
+            .await?;
+        let purged = transaction
+            .execute(
+                include_str!("operation_claim_purge.sql"),
+                &[&retention.as_secs_f64()],
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(purged)
+    }
 }
 
 #[cfg(test)]
@@ -80,6 +126,49 @@ mod tests {
             !sql.contains("updated_at_unix_ms"),
             "client timestamps must not decide age"
         );
+    }
+
+    #[test]
+    fn purge_sql_matches_batch_constant_and_guards() {
+        let sql = include_str!("operation_claim_purge.sql");
+        assert!(sql.contains(&format!(
+            "LIMIT {OPERATION_RETIREMENT_BATCH_SIZE}
+"
+        )));
+        assert_eq!(sql.matches("LIMIT ").count(), 1);
+        assert!(sql.contains("make_interval(secs => $1::double precision)"));
+        assert!(sql.contains("FOR UPDATE SKIP LOCKED"));
+        assert!(sql.contains("claim.operation_kind = 'multi'"));
+        assert!(sql.contains("claim.retired_at IS NOT NULL"));
+        assert!(
+            sql.contains("retired_at <"),
+            "age must use the server-side retirement time"
+        );
+    }
+
+    #[test]
+    fn retired_marker_retention_bounds_are_enforced() {
+        assert_eq!(
+            DEFAULT_RETIRED_OPERATION_RETENTION,
+            Duration::from_secs(7 * 86_400)
+        );
+        for ok in [
+            MIN_RETIRED_OPERATION_RETENTION,
+            DEFAULT_RETIRED_OPERATION_RETENTION,
+            MAX_RETIRED_OPERATION_RETENTION,
+        ] {
+            assert_eq!(validate_retired_operation_retention(ok).unwrap(), ok);
+        }
+        for bad in [
+            Duration::ZERO,
+            Duration::from_secs(86_399),
+            MAX_RETIRED_OPERATION_RETENTION + Duration::from_secs(1),
+        ] {
+            assert!(matches!(
+                validate_retired_operation_retention(bad),
+                Err(StorageError::InvalidRetiredOperationRetention { .. })
+            ));
+        }
     }
 
     #[test]

@@ -252,6 +252,9 @@ pub struct DbProxyMetrics {
     operation_retirement_batches: AtomicU64,
     operation_retirement_retired: AtomicU64,
     operation_retirement_failures: AtomicU64,
+    operation_marker_purge_batches: AtomicU64,
+    operation_marker_purge_deleted: AtomicU64,
+    operation_marker_purge_failures: AtomicU64,
     backlog_committed: AtomicU64,
     backlog_empty_polls: AtomicU64,
     backlog_failures: AtomicU64,
@@ -319,6 +322,9 @@ impl Default for DbProxyMetrics {
             operation_retirement_batches: AtomicU64::new(0),
             operation_retirement_retired: AtomicU64::new(0),
             operation_retirement_failures: AtomicU64::new(0),
+            operation_marker_purge_batches: AtomicU64::new(0),
+            operation_marker_purge_deleted: AtomicU64::new(0),
+            operation_marker_purge_failures: AtomicU64::new(0),
             backlog_committed: AtomicU64::new(0),
             backlog_empty_polls: AtomicU64::new(0),
             backlog_failures: AtomicU64::new(0),
@@ -379,6 +385,22 @@ impl DbProxyMetrics {
             }
             None => {
                 self.receipt_cleanup_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// 删除退休标记一批的结果；None 表示失败。 / One retired-marker purge batch; None means it failed.
+    pub fn operation_marker_purge_completed(&self, deleted: Option<u64>) {
+        self.operation_marker_purge_batches
+            .fetch_add(1, Ordering::Relaxed);
+        match deleted {
+            Some(count) => {
+                self.operation_marker_purge_deleted
+                    .fetch_add(count, Ordering::Relaxed);
+            }
+            None => {
+                self.operation_marker_purge_failures
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1168,6 +1190,27 @@ impl DbProxyMetrics {
             "Multi-record transaction receipt retirement failures",
             "counter",
             &self.operation_retirement_failures,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_operation_marker_purge_batches_total",
+            "Retired operation marker purge batches",
+            "counter",
+            &self.operation_marker_purge_batches,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_operation_marker_purge_deleted_total",
+            "Retired operation markers deleted after their retention",
+            "counter",
+            &self.operation_marker_purge_deleted,
+        );
+        write_atomic_metric(
+            &mut output,
+            "dbproxy_operation_marker_purge_failures_total",
+            "Retired operation marker purge failures",
+            "counter",
+            &self.operation_marker_purge_failures,
         );
         metric_header(
             &mut output,
@@ -1961,4 +2004,16 @@ fn operation_retirement_metrics_distinguish_retired_empty_and_failed_batches() {
     assert!(text.contains("dbproxy_operation_retirement_batches_total 3"));
     assert!(text.contains("dbproxy_operation_retirement_retired_total 500"));
     assert!(text.contains("dbproxy_operation_retirement_failures_total 1"));
+}
+
+#[test]
+fn operation_marker_purge_metrics_distinguish_deleted_empty_and_failed_batches() {
+    let metrics = DbProxyMetrics::default();
+    metrics.operation_marker_purge_completed(Some(500));
+    metrics.operation_marker_purge_completed(Some(0));
+    metrics.operation_marker_purge_completed(None);
+    let text = metrics.prometheus("postgresRedis");
+    assert!(text.contains("dbproxy_operation_marker_purge_batches_total 3"));
+    assert!(text.contains("dbproxy_operation_marker_purge_deleted_total 500"));
+    assert!(text.contains("dbproxy_operation_marker_purge_failures_total 1"));
 }

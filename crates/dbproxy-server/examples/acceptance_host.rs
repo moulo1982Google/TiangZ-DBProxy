@@ -138,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 backend.clone(),
                 "acceptance".into(),
                 operation_retention,
+                tiangz_dbproxy_storage::DEFAULT_RETIRED_OPERATION_RETENTION,
                 Arc::new(DbProxyMetrics::default()),
                 shutdown.clone(),
             ))

@@ -156,6 +156,7 @@ async fn prepare_backend(config: &ResolvedDbProxyConfig) -> Result<BackendPair, 
             postgres_read_connections,
             receipt_retention_hours: _,
             operation_receipt_retention_days: _,
+            retired_operation_retention_days: _,
             cache_fallback_concurrency,
             cache_fallback_timeout_ms,
             cache_operation_timeout_ms,
@@ -352,6 +353,10 @@ async fn run_servers(
                         config
                             .storage
                             .operation_receipt_retention()
+                            .expect("a durable backend always comes from postgresRedis storage"),
+                        config
+                            .storage
+                            .retired_operation_retention()
                             .expect("a durable backend always comes from postgresRedis storage"),
                         Arc::clone(metrics),
                         shutdown_rx.clone(),
