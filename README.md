@@ -21,7 +21,7 @@ TiangZ DBProxy 是独立的 Rust 持久化服务项目。
 
 - 玩家、Item、任务等快照的读取与写入
 - Revision 和 Compare-And-Swap 版本校验
-- 重试幂等与请求去重（PG 普通回执至少保留 `storage.receiptRetentionHours`，默认 24 小时、下限 1 小时；多记录事务回执保留 `storage.operationReceiptRetentionDays`，默认 30 天，之后只留操作号标记，迟到查询或重提返回 `OPERATION_EXPIRED`）
+- 重试幂等与请求去重（PG 普通回执至少保留 `storage.receiptRetentionHours`，默认 24 小时、下限 1 小时；多记录事务回执保留 `storage.operationReceiptRetentionDays`，默认 30 天，之后只留操作号标记，迟到查询或重提返回 `OPERATION_EXPIRED`；标记再保留 `storage.retiredOperationRetentionDays`，默认 7 天，之后删除）
 - Redis 缓存、PostgreSQL/MySQL/MongoDB 等存储适配
 - 监控、故障恢复和部署协议
 

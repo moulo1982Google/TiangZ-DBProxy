@@ -10,7 +10,7 @@ TiangZ 只依赖版本化协议和 SDK，不依赖 Redis、PostgreSQL 或 storag
 
 PostgreSQL 普通快照 `request_id` 回执至少保留配置的时长（`storage.receiptRetentionHours`，默认 24 小时，下限 1 小时），后台之后分批清理。回执删除后不再保证返回旧结果：带版本检查的请求仍检查版本，无版本检查的请求可能再次执行。事务 `operation_id` 回执不参与这次清理。详见[回执保留规则](record-deletion-and-receipt-retention.md)。
 
-多记录事务回执（`ApplyMultiTransaction` / 不带效果的 `CommitRecords`）保留 `storage.operationReceiptRetentionDays`（默认 30 天，1–3650）。之后删除事务头和回执记录，操作号只留“已退休”标记；再查询或原样重提这个操作号，返回 `OPERATION_EXPIRED`（2007），**不会返回“查无回执”，也不会重新执行**。带追加记录或 Outbox 事件的操作不退休。单记录事务和交易回执不受影响。详见[回执保留规则](record-deletion-and-receipt-retention.md)附录二。
+多记录事务回执（`ApplyMultiTransaction` / 不带效果的 `CommitRecords`）保留 `storage.operationReceiptRetentionDays`（默认 30 天，1–3650）。之后删除事务头和回执记录，操作号只留“已退休”标记；再查询或原样重提这个操作号，返回 `OPERATION_EXPIRED`（2007），**不会返回“查无回执”，也不会重新执行**。标记再保留 `storage.retiredOperationRetentionDays`（默认 7 天，1–3650）后删除，此后这个操作号与从没用过一样：查询返回“没有回执”，提交按新操作处理（期望版本号仍会拒绝记录已变化的提交）。带追加记录或 Outbox 事件的操作不退休。单记录事务和交易回执不受影响。详见[回执保留规则](record-deletion-and-receipt-retention.md)附录二。
 
 ## 帧、大小与握手
 
