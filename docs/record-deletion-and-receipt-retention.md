@@ -410,7 +410,7 @@ cargo test -p tiangz-dbproxy-server --test receipt_cleanup_worker --locked -- --
   - 迁移 016 增加的部分索引 `dbproxy_operation_claims_multi_retention` 负责找到待退休的操作号；删除事务头和更新标记都按主键数组定位，避免整表哈希连接。
   - 实测：30 万个事务头、30 万个操作号时，一批 500 个约 15 ms，全部走索引。
 - 指标：`dbproxy_operation_retirement_batches_total`、`_retired_total`、`_failures_total`。
-- 标记删除（第二级保留期，0.7.6 起）：退休满 `storage.retiredOperationRetentionDays`（默认 7 天，取值 1–3650）后删除操作号这一行。
+- 标记删除（第二级保留期，0.7.6 起，见 `RELEASE-v0.7.6.md`）：退休满 `storage.retiredOperationRetentionDays`（默认 7 天，取值 1–3650）后删除操作号这一行。
   - 按服务端退休时间 `retired_at` 计算；同一个后台任务每轮先退休、再删标记，任一步满批停 1 秒，否则停 60 秒。每批最多 500，`FOR UPDATE SKIP LOCKED`，语句超时 5 秒、锁超时 100 ms。
   - 迁移 017 增加部分索引 `dbproxy_operation_claims_retired_purge(retired_at, operation_id) WHERE retired_at IS NOT NULL AND operation_kind = 'multi'`。
   - 标记删掉以后，这个操作号就和从没用过一样：`LoadMultiTransaction` 返回“没有回执”，用它提交按新操作处理。带期望版本号的提交（多记录事务都带）在记录已经变化后会得到版本冲突，不会重复写入；记录在这期间一直没变时，重提会再执行一次。所以第二级保留期必须长于调用方可能重发旧操作号的最长时间。
