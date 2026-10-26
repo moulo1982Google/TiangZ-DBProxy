@@ -1,4 +1,4 @@
-> 本轮发布：`v0.7.5`（DBProxy 单独发布，2026-10-17）。两项存储修复：缓存修复队列的批量清理改用 `SKIP LOCKED`，不再与请求事务死锁（40P01）；重复请求与回执查询按字节序读回，数据库默认排序规则不是按字节时不再把合法重试误判为 `OperationIdConflict`。持久队列 worker 的可重试冲突改记 WARN，并在 `*_worker_polls_total` 中单独计为 `result="retryable_conflict"`。协议、SDK、配置与数据库迁移不变，客户端无需升级；修复后尚未经长稳复验。见 [RELEASE-v0.7.5.md](RELEASE-v0.7.5.md)。
+> 本轮发布：`v0.7.6`（DBProxy 单独发布，2026-10-25）。多记录事务回执退休后留下的操作号标记，再保留 `storage.retiredOperationRetentionDays`（默认 7 天）后删除，操作号表不再随历史操作总数一直增长；删除后该操作号与从没用过一样。迁移 017（一个部分索引）；协议、SDK 与客户端不变。见 [RELEASE-v0.7.6.md](RELEASE-v0.7.6.md)。
 
 # TiangZ DBProxy
 
@@ -9,7 +9,7 @@
 [![tag](https://img.shields.io/github/v/tag/moulo1982Google/TiangZ-DBProxy?label=tag&sort=semver)](https://github.com/moulo1982Google/TiangZ-DBProxy/tags)
 [![license](https://img.shields.io/github/license/moulo1982Google/TiangZ-DBProxy?label=license)](LICENSE)
 
-当前版本为 `0.7.5`（正式版），服务与 Rust/TypeScript SDK 使用相同版本；相对 0.7.4 修复缓存修复队列死锁与重复请求比对的排序规则（见 [RELEASE-v0.7.5.md](RELEASE-v0.7.5.md)），协议、SDK 与迁移不变；0.7.4 相对 0.7.3 新增崩溃诊断（默认关闭，见 [崩溃诊断](docs/crash-diagnostics.md)），协议、SDK 与迁移不变；0.7.3 相对 0.7.2 新增多记录事务回执退休、迁移 016 与错误码 `OPERATION_EXPIRED`（协议指纹改变，服务端仍接受 0.7.0–0.7.2 客户端）；0.7.1 引入迁移 013–015。此前候选（0.7.0-rc.2、v0.7.0-rc1、v0.7.0-rc2）的标签与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题。
+当前版本为 `0.7.6`（正式版），服务与 Rust/TypeScript SDK 使用相同版本；相对 0.7.5 新增退休标记的第二级保留期与迁移 017（见 [RELEASE-v0.7.6.md](RELEASE-v0.7.6.md)），协议与 SDK 不变；0.7.5 相对 0.7.4 修复缓存修复队列死锁与重复请求比对的排序规则（见 [RELEASE-v0.7.5.md](RELEASE-v0.7.5.md)），协议、SDK 与迁移不变；0.7.4 相对 0.7.3 新增崩溃诊断（默认关闭，见 [崩溃诊断](docs/crash-diagnostics.md)），协议、SDK 与迁移不变；0.7.3 相对 0.7.2 新增多记录事务回执退休、迁移 016 与错误码 `OPERATION_EXPIRED`（协议指纹改变，服务端仍接受 0.7.0–0.7.2 客户端）；0.7.1 引入迁移 013–015。此前候选（0.7.0-rc.2、v0.7.0-rc1、v0.7.0-rc2）的标签与验收历史保留在下文。0.7 的预算、租户与容量/恢复改进见现有专题。
 
 > 验收进度请先读[当前剩余清单（2026-09-29）](docs/acceptance-remaining-20260929.md)，历史证据见[索引与验收交接](docs/handoff-index-acceptance-20260922.md)。两小时测试及多项补测已完成；综合验收仍有缺口，不能把历史交接的未完成状态当作当前结论。
 
@@ -21,7 +21,7 @@ TiangZ DBProxy 是独立的 Rust 持久化服务项目。
 
 - 玩家、Item、任务等快照的读取与写入
 - Revision 和 Compare-And-Swap 版本校验
-- 重试幂等与请求去重（PG 普通回执至少保留 `storage.receiptRetentionHours`，默认 24 小时、下限 1 小时；多记录事务回执保留 `storage.operationReceiptRetentionDays`，默认 30 天，之后只留操作号标记，迟到查询或重提返回 `OPERATION_EXPIRED`）
+- 重试幂等与请求去重（PG 普通回执至少保留 `storage.receiptRetentionHours`，默认 24 小时、下限 1 小时；多记录事务回执保留 `storage.operationReceiptRetentionDays`，默认 30 天，之后只留操作号标记，迟到查询或重提返回 `OPERATION_EXPIRED`；标记再保留 `storage.retiredOperationRetentionDays`，默认 7 天，之后删除）
 - Redis 缓存、PostgreSQL/MySQL/MongoDB 等存储适配
 - 监控、故障恢复和部署协议
 

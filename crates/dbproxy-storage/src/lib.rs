@@ -53,9 +53,11 @@ mod redis_durability;
 mod redis_durability_fixture;
 mod schema_indexes;
 pub use operation_retirement::{
-    DEFAULT_OPERATION_RECEIPT_RETENTION, MAX_OPERATION_RECEIPT_RETENTION,
-    MIN_OPERATION_RECEIPT_RETENTION, OPERATION_RETIREMENT_BATCH_SIZE,
-    validate_operation_receipt_retention,
+    DEFAULT_OPERATION_RECEIPT_RETENTION, DEFAULT_RETIRED_OPERATION_RETENTION,
+    MAX_OPERATION_RECEIPT_RETENTION, MAX_RETIRED_OPERATION_RETENTION,
+    MIN_OPERATION_RECEIPT_RETENTION, MIN_RETIRED_OPERATION_RETENTION,
+    OPERATION_RETIREMENT_BATCH_SIZE, validate_operation_receipt_retention,
+    validate_retired_operation_retention,
 };
 pub use postgres_request::{
     DEFAULT_POSTGRES_CONNECTION_WAIT_TIMEOUT_MS, DEFAULT_POSTGRES_RECONNECT_COOLDOWN_MS,
@@ -461,6 +463,10 @@ pub enum StorageError {
         "multi-record receipt retention must be between 1 and 3650 days; got {seconds} seconds"
     )]
     InvalidOperationReceiptRetention { seconds: u64 },
+    #[error(
+        "retired operation marker retention must be between 1 and 3650 days; got {seconds} seconds"
+    )]
+    InvalidRetiredOperationRetention { seconds: u64 },
     #[error("PostgreSQL reconnect cooldown must be representable and at least one millisecond")]
     InvalidPostgresReconnectCooldown,
     #[error(
@@ -1727,6 +1733,13 @@ impl PostgresSnapshotStore {
             16,
             "operation-retirement",
             include_str!("../migrations/016_operation_retirement.sql"),
+        )
+        .await?;
+        apply_schema_migration(
+            &transaction,
+            17,
+            "retired-operation-purge",
+            include_str!("../migrations/017_retired_operation_purge.sql"),
         )
         .await?;
         schema_indexes::validate(&transaction).await?;

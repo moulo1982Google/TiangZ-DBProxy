@@ -2875,24 +2875,30 @@ pub async fn run_receipt_cleanup_worker(
 /// 多记录事务回执退休：每租户一个任务，与普通回执清理共用维护连接（互斥串行）。满批停 1 秒，空闲或失败停 1 分钟。
 /// Multi-record receipt retirement, one task per tenant, sharing the receipt-cleanup maintenance
 /// connection (serialized by its lock). Full batches pause one second, idle/failing ones a minute.
+/// 退休到期的多记录事务回执，再删除超过第二保留期的退休标记；任一步满批时 1 秒后继续，否则 60 秒。
+/// Retires expired multi-record receipts, then deletes retired markers past their own retention;
+/// a full batch in either step continues after 1 second, otherwise the worker waits 60 seconds.
 pub async fn run_operation_retirement_worker(
     backend: Arc<StorageBackend>,
     tenant: String,
     retention: Duration,
+    marker_retention: Duration,
     metrics: Arc<DbProxyMetrics>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     tracing::info!(
         %tenant,
         retention_days = retention.as_secs_f64() / 86_400.0,
+        marker_retention_days = marker_retention.as_secs_f64() / 86_400.0,
         "multi-record receipt retirement started"
     );
     loop {
         if *shutdown.borrow() {
             return;
         }
+        let full = tiangz_dbproxy_storage::OPERATION_RETIREMENT_BATCH_SIZE;
         let started = std::time::Instant::now();
-        let delay = match backend
+        let retired_full = match backend
             .receipt_cleanup
             .retire_expired_operations(retention)
             .await
@@ -2902,17 +2908,37 @@ pub async fn run_operation_retirement_worker(
                 if retired > 0 {
                     tracing::info!(%tenant, retired, elapsed_ms = started.elapsed().as_millis() as u64, "multi-record receipts retired");
                 }
-                if retired == tiangz_dbproxy_storage::OPERATION_RETIREMENT_BATCH_SIZE {
-                    Duration::from_secs(1)
-                } else {
-                    Duration::from_secs(60)
-                }
+                retired == full
             }
             Err(error) => {
                 metrics.operation_retirement_completed(None);
                 tracing::warn!(%tenant, %error, "multi-record receipt retirement failed; retry in 60 seconds");
-                Duration::from_secs(60)
+                false
             }
+        };
+        let started = std::time::Instant::now();
+        let purged_full = match backend
+            .receipt_cleanup
+            .purge_retired_operations(marker_retention)
+            .await
+        {
+            Ok(purged) => {
+                metrics.operation_marker_purge_completed(Some(purged));
+                if purged > 0 {
+                    tracing::info!(%tenant, purged, elapsed_ms = started.elapsed().as_millis() as u64, "retired operation markers deleted");
+                }
+                purged == full
+            }
+            Err(error) => {
+                metrics.operation_marker_purge_completed(None);
+                tracing::warn!(%tenant, %error, "retired operation marker purge failed; retry in 60 seconds");
+                false
+            }
+        };
+        let delay = if retired_full || purged_full {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(60)
         };
         tokio::select! {
             _ = sleep(delay) => {},

@@ -401,7 +401,7 @@ cargo test -p tiangz-dbproxy-server --test receipt_cleanup_worker --locked -- --
   - 单记录事务 `dbproxy_transactions` 和交易表不在本次范围。
 - 保留期：`storage.operationReceiptRetentionDays`，默认 30 天，取值 1–3650。按服务端认领时间 `dbproxy_operation_claims.claimed_at` 计算，从不使用客户端填的 `updated_at_unix_ms`。
 - 退休：删除事务头，回执记录随外键级联删除；在 `dbproxy_operation_claims.retired_at` 写上退休时间。操作号这一行保留，是“这个号用过”的证据（约 175 字节/操作，含索引）。业务快照不受影响。
-- 退休以后：
+- 退休以后（标记还在时）：
   - `LoadMultiTransaction` 返回 `OPERATION_EXPIRED`，不返回“查无回执”；
   - 用这个操作号提交（原字节重提，或者内容不同），一律返回 `OPERATION_EXPIRED`，不会重新执行，也不会落到 CAS 冲突；
   - 从没用过的操作号，查询仍然返回“没有”。
@@ -410,6 +410,11 @@ cargo test -p tiangz-dbproxy-server --test receipt_cleanup_worker --locked -- --
   - 迁移 016 增加的部分索引 `dbproxy_operation_claims_multi_retention` 负责找到待退休的操作号；删除事务头和更新标记都按主键数组定位，避免整表哈希连接。
   - 实测：30 万个事务头、30 万个操作号时，一批 500 个约 15 ms，全部走索引。
 - 指标：`dbproxy_operation_retirement_batches_total`、`_retired_total`、`_failures_total`。
+- 标记删除（第二级保留期，0.7.6 起，见 `RELEASE-v0.7.6.md`）：退休满 `storage.retiredOperationRetentionDays`（默认 7 天，取值 1–3650）后删除操作号这一行。
+  - 按服务端退休时间 `retired_at` 计算；同一个后台任务每轮先退休、再删标记，任一步满批停 1 秒，否则停 60 秒。每批最多 500，`FOR UPDATE SKIP LOCKED`，语句超时 5 秒、锁超时 100 ms。
+  - 迁移 017 增加部分索引 `dbproxy_operation_claims_retired_purge(retired_at, operation_id) WHERE retired_at IS NOT NULL AND operation_kind = 'multi'`。
+  - 标记删掉以后，这个操作号就和从没用过一样：`LoadMultiTransaction` 返回“没有回执”，用它提交按新操作处理。带期望版本号的提交（多记录事务都带）在记录已经变化后会得到版本冲突，不会重复写入；记录在这期间一直没变时，重提会再执行一次。所以第二级保留期必须长于调用方可能重发旧操作号的最长时间。
+  - 指标：`dbproxy_operation_marker_purge_batches_total`、`_deleted_total`、`_failures_total`。
 
 ### 并发顺序
 
@@ -420,9 +425,12 @@ cargo test -p tiangz-dbproxy-server --test receipt_cleanup_worker --locked -- --
 
 不会出现“事务头刚删、重提当成新操作执行”的情况。测试 `batches_are_bounded_and_skip_a_claim_held_by_a_replay` 覆盖了这一点。
 
+删除标记也用 `FOR UPDATE SKIP LOCKED`：正被重提持有的标记这一批跳过，重提照样得到 `OPERATION_EXPIRED`。标记删掉之后才到的重提，按上面的规则当作新操作。测试 `retired_markers_are_deleted_after_their_retention` 覆盖了到期删除、未到期保留、持有时跳过，以及删除后查询为“没有”、原字节重提被版本冲突拒绝。
+
 ### 对调用方的要求
 
 - 保留期必须长于调用方未决操作的最长存活时间。超过保留期还没处理完的操作，以后只能得到 `OPERATION_EXPIRED`，也就是结果未知。
+- 回执保留期加标记保留期，必须长于调用方可能重发同一个操作号的最长时间；超过之后重发会被当作新操作（见上文“标记删除”）。
 - 旧客户端（升级前的指纹）不认识 2007，会解成 `INTERNAL`。调用方如果把 `INTERNAL` 当结果未知，就是安全的：不会重复执行，但也得不到明确结论。新客户端可以单独识别这个码。
 
 ### 升级与回滚
@@ -430,7 +438,8 @@ cargo test -p tiangz-dbproxy-server --test receipt_cleanup_worker --locked -- --
 - **所有连接同一数据库的 DBProxy 实例必须一起升级**：先停旧实例，再启动新实例。新实例一启动就会开始退休；旧实例不认识退休标记，查不到事务头时会回答“查无回执”，调用方可能把它当成没执行过。
 - 退休一旦执行过，就**不能回滚**到旧版本，原因同上。回滚前必须确认没有任何已退休的操作号（`SELECT count(*) FROM dbproxy_operation_claims WHERE retired_at IS NOT NULL` 为 0）。
 - 从旧版本升级时，已经超过 30 天的回执会在启动后分批退休。量大时会持续一段时间，每批之间停 1 秒。
+- 升级到 0.7.6 时执行迁移 017（普通 `CREATE INDEX`，建索引期间阻塞对操作号表的写入；1000 万行约几十秒）。已经退休超过 7 天的标记会在启动后分批删除。删除标记后同样不能回滚到不认识它的旧版本：旧版本对没有标记的操作号同样回答“查无回执”，与新版本一致，但旧版本不会继续删除。
 
-### 没有解决的
+### 标记的上限
 
-操作号标记仍然随操作数线性增长，只是每个操作从约 2.5–3 KB 降到约 175 字节。要让它也有上限，需要调用方提供按主公或序号的退休水位，或者约定操作号格式，属于调用方的改动，没有做。
+0.7.6 之前操作号标记随操作数线性增长、永不删除（每个操作约 175–310 字节，含索引与更新留下的旧行；苟道三国长稳 1000 个机器人约 3.3 GB/天）。第二级保留期之后，操作号表的稳态大小约为“每天操作数 × (回执保留天数 + 标记保留天数) × 每行大小”。

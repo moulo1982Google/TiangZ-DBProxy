@@ -8,12 +8,13 @@ use tiangz_dbproxy_core::{
     TransactionalRecordWrite,
 };
 use tiangz_dbproxy_storage::{
-    DEFAULT_OPERATION_RECEIPT_RETENTION, OPERATION_RETIREMENT_BATCH_SIZE, PostgresSnapshotStore,
-    StorageError,
+    DEFAULT_OPERATION_RECEIPT_RETENTION, DEFAULT_RETIRED_OPERATION_RETENTION,
+    OPERATION_RETIREMENT_BATCH_SIZE, PostgresSnapshotStore, StorageError,
 };
 use tokio_postgres::{Client, NoTls};
 
 const RETENTION: Duration = DEFAULT_OPERATION_RECEIPT_RETENTION;
+const MARKER_RETENTION: Duration = DEFAULT_RETIRED_OPERATION_RETENTION;
 
 async fn fixture(namespace: &str) -> (PostgresSnapshotStore, PostgresSnapshotStore, Client) {
     assert_eq!(
@@ -314,4 +315,118 @@ async fn batches_are_bounded_and_skip_a_claim_held_by_a_replay() {
         .unwrap()
         .get(0);
     assert_eq!(retired, total as i64);
+}
+
+#[tokio::test]
+#[ignore = "fresh isolated PG; retired markers are deleted after their own retention"]
+async fn retired_markers_are_deleted_after_their_retention() {
+    let ns = "operation-marker-purge";
+    let (mut store, maintenance, sql) = fixture(ns).await;
+    let old = write(ns, "old", "a", 0);
+    let young = write(ns, "young", "b", 0);
+    let held = write(ns, "held", "c", 0);
+    let live = write(ns, "live", "d", 0);
+    for request in [&old, &young, &held, &live] {
+        store.apply_multi(request.clone()).await.unwrap();
+    }
+    for request in [&old, &young, &held] {
+        age(&sql, &request.operation_id, "31 days").await;
+    }
+    assert_eq!(
+        maintenance
+            .retire_expired_operations(RETENTION)
+            .await
+            .unwrap(),
+        3
+    );
+    // Age the retirement time itself: one second past the marker retention, and one hour inside it.
+    for (request, interval) in [
+        (&old, "7 days 1 second"),
+        (&held, "8 days"),
+        (&young, "6 days 23 hours"),
+    ] {
+        let changed = sql
+            .execute(
+                &format!("UPDATE dbproxy_operation_claims SET retired_at = clock_timestamp() - interval '{interval}' WHERE operation_id = $1"),
+                &[&request.operation_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    // A late replay that already found the marker holds FOR SHARE on it.
+    let (holder, connection) =
+        tokio_postgres::connect(&std::env::var("DBPROXY_TEST_POSTGRES_URL").unwrap(), NoTls)
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    holder.batch_execute("BEGIN").await.unwrap();
+    holder
+        .execute(
+            "SELECT 1 FROM dbproxy_operation_claims WHERE operation_id=$1 FOR SHARE",
+            &[&held.operation_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        maintenance
+            .purge_retired_operations(MARKER_RETENTION)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        maintenance
+            .purge_retired_operations(MARKER_RETENTION)
+            .await
+            .unwrap(),
+        0
+    );
+    holder.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(
+        maintenance
+            .purge_retired_operations(MARKER_RETENTION)
+            .await
+            .unwrap(),
+        1
+    );
+    let claim = "SELECT count(*) FROM dbproxy_operation_claims WHERE operation_id=$1";
+    assert_eq!(count(&sql, claim, &old.operation_id).await, 0);
+    assert_eq!(count(&sql, claim, &held.operation_id).await, 0);
+    // The young marker still answers "expired"; the unretired receipt is untouched.
+    assert_eq!(count(&sql, claim, &young.operation_id).await, 1);
+    let lookup = store
+        .load_multi_receipt(&young.operation_id, &[young.writes[0].record.clone()])
+        .await
+        .unwrap_err();
+    assert!(is_expired(&lookup), "{lookup:?}");
+    assert!(
+        store
+            .load_multi_receipt(&live.operation_id, &[live.writes[0].record.clone()])
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // After the marker is gone the id is unknown: a lookup finds no receipt ...
+    assert!(
+        store
+            .load_multi_receipt(&old.operation_id, &[old.writes[0].record.clone()])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // ... and an original-bytes replay is a new operation, which the expected revision rejects
+    // because the record has moved on: it is not applied a second time.
+    let replay = store.apply_multi(old.clone()).await.unwrap_err();
+    assert!(
+        matches!(
+            replay,
+            StorageError::Core(StoreError::RevisionConflict { .. })
+        ),
+        "{replay:?}"
+    );
+    assert_eq!(count(&sql, "SELECT count(*) FROM dbproxy_snapshots WHERE namespace='operation-marker-purge' AND record_key='a' AND revision=1 AND $1<>''", &old.operation_id).await, 1);
 }

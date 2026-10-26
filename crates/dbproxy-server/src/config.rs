@@ -125,6 +125,13 @@ pub enum StorageSection {
             default = "default_operation_receipt_retention_days"
         )]
         operation_receipt_retention_days: u16,
+        /// 退休标记保留天数，1..=3650，默认 7；超期删除标记，之后同号重提按新操作处理。
+        /// Retired operation marker retention days, 1..=3650, default 7; afterwards the id is unknown.
+        #[serde(
+            rename = "retiredOperationRetentionDays",
+            default = "default_retired_operation_retention_days"
+        )]
+        retired_operation_retention_days: u16,
         #[serde(
             rename = "cacheFallbackConcurrency",
             default = "default_cache_fallback_concurrency"
@@ -402,6 +409,7 @@ pub enum ResolvedStorage {
         postgres_read_connections: u8,
         receipt_retention_hours: u16,
         operation_receipt_retention_days: u16,
+        retired_operation_retention_days: u16,
         cache_fallback_concurrency: usize,
         cache_fallback_timeout_ms: u64,
         cache_operation_timeout_ms: u64,
@@ -431,6 +439,19 @@ impl ResolvedStorage {
                 ..
             } => Some(std::time::Duration::from_secs(
                 u64::from(*receipt_retention_hours) * 3600,
+            )),
+            Self::Memory { .. } => None,
+        }
+    }
+
+    /// 退休标记保留时长；内存后端没有标记。 / Retired marker retention; none for memory.
+    pub fn retired_operation_retention(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::PostgresRedis {
+                retired_operation_retention_days,
+                ..
+            } => Some(std::time::Duration::from_secs(
+                u64::from(*retired_operation_retention_days) * 86_400,
             )),
             Self::Memory { .. } => None,
         }
@@ -664,6 +685,7 @@ impl DbProxyConfig {
                 postgres_read_connections,
                 receipt_retention_hours,
                 operation_receipt_retention_days,
+                retired_operation_retention_days,
                 cache_fallback_concurrency,
                 cache_fallback_timeout_ms,
                 cache_operation_timeout_ms,
@@ -699,6 +721,17 @@ impl DbProxyConfig {
                 {
                     return Err(ConfigError(format!(
                         "storage.operationReceiptRetentionDays must be between {operation_days_min} and {operation_days_max}"
+                    )));
+                }
+                let marker_days_max =
+                    tiangz_dbproxy_storage::MAX_RETIRED_OPERATION_RETENTION.as_secs() / 86_400;
+                let marker_days_min =
+                    tiangz_dbproxy_storage::MIN_RETIRED_OPERATION_RETENTION.as_secs() / 86_400;
+                if !(marker_days_min..=marker_days_max)
+                    .contains(&u64::from(retired_operation_retention_days))
+                {
+                    return Err(ConfigError(format!(
+                        "storage.retiredOperationRetentionDays must be between {marker_days_min} and {marker_days_max}"
                     )));
                 }
                 if authoritative_read_namespaces.len() > 64
@@ -766,6 +799,7 @@ impl DbProxyConfig {
                     postgres_read_connections,
                     receipt_retention_hours,
                     operation_receipt_retention_days,
+                    retired_operation_retention_days,
                     cache_fallback_concurrency,
                     cache_fallback_timeout_ms,
                     cache_operation_timeout_ms,
@@ -898,6 +932,10 @@ const fn default_receipt_retention_hours() -> u16 {
 }
 const fn default_operation_receipt_retention_days() -> u16 {
     (tiangz_dbproxy_storage::DEFAULT_OPERATION_RECEIPT_RETENTION.as_secs() / 86_400) as u16
+}
+
+const fn default_retired_operation_retention_days() -> u16 {
+    (tiangz_dbproxy_storage::DEFAULT_RETIRED_OPERATION_RETENTION.as_secs() / 86_400) as u16
 }
 
 const fn default_storage_shards() -> usize {
@@ -1931,6 +1969,43 @@ mod tests {
         let result = load_config_with(&memory, |_| Some("0123456789abcdef".into()));
         fs::remove_file(memory).unwrap();
         assert_eq!(result.unwrap().storage.operation_receipt_retention(), None);
+    }
+
+    #[test]
+    fn retired_operation_retention_default_override_and_bounds() {
+        for (extra, expected) in [
+            ("", Some(7)),
+            (",\"retiredOperationRetentionDays\":1", Some(1)),
+            (",\"retiredOperationRetentionDays\":3650", Some(3650)),
+            (",\"retiredOperationRetentionDays\":0", None),
+            (",\"retiredOperationRetentionDays\":3651", None),
+        ] {
+            let path = write_config(&format!(
+                r#"{{"configVersion":1,"server":{{"listenAddr":"127.0.0.1:7800","authTokenEnv":"AUTH"}},"storage":{{"backend":"postgresRedis","postgresUrlEnv":"PG","redisUrlEnv":"REDIS"{extra}}}}}"#
+            ));
+            let result = load_config_with(&path, |_| Some("0123456789abcdef".into()));
+            fs::remove_file(path).unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(
+                    result.unwrap().storage.retired_operation_retention(),
+                    Some(std::time::Duration::from_secs(expected * 86_400))
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains(
+                        "storage.retiredOperationRetentionDays must be between 1 and 3650"
+                    ),
+                    "{error}"
+                );
+            }
+        }
+        let memory = write_config(
+            r#"{"configVersion":1,"server":{"listenAddr":"127.0.0.1:7800","authTokenEnv":"AUTH"},"storage":{"backend":"memory","shards":1}}"#,
+        );
+        let result = load_config_with(&memory, |_| Some("0123456789abcdef".into()));
+        fs::remove_file(memory).unwrap();
+        assert_eq!(result.unwrap().storage.retired_operation_retention(), None);
     }
 
     #[test]
